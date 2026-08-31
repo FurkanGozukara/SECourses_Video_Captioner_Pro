@@ -1,0 +1,110 @@
+{
+  "variant": "qwen3_omni_captioner_int8",
+  "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\demon_singer_audio_18_sec.mp3",
+  "attention": "sdpa",
+  "load": {
+    "seconds": 26.473280099977273,
+    "peak_vram_gb": 30.77293062210083,
+    "checkpoint_bytes": 33031350760,
+    "attention": "sdpa",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 18810,
+    "bf16_layers": 176,
+    "compile_mode": "eager",
+    "warnings": []
+  },
+  "generation": {
+    "caption": "The audio clip is a 17",
+    "input_tokens": 245,
+    "generated_tokens": 8,
+    "prefill_seconds": 6.56866748046875,
+    "generation_seconds": 7.900678000005428,
+    "prefill_tok_s": 37.298280165418944,
+    "decode_seconds": 1.3274150390625,
+    "decode_tok_s": 5.273407181633123,
+    "peak_vram_gb": 30.915414333343506
+  },
+  "module_timings": {
+    "prefill": {
+      "audio_tower": {
+        "calls": 1,
+        "cuda_ms": 1054.7896728515625,
+        "cpu_ms": 1047.2401999868453
+      },
+      "attention": {
+        "calls": 48,
+        "cuda_ms": 877.7048940658569,
+        "cpu_ms": 251.3951999717392
+      },
+      "router": {
+        "calls": 48,
+        "cuda_ms": 45.35718401521444,
+        "cpu_ms": 39.4331002025865
+      },
+      "experts": {
+        "calls": 48,
+        "cuda_ms": 4206.710165023804,
+        "cpu_ms": 4812.404499796685
+      },
+      "lm_head": {
+        "calls": 1,
+        "cuda_ms": 66.81375885009766,
+        "cpu_ms": 1.5094000264070928
+      }
+    },
+    "decode": {
+      "model_forward": {
+        "calls": 8,
+        "cuda_ms": 7672.033706665039,
+        "cpu_ms": 7566.596999997273
+      },
+      "attention": {
+        "calls": 336,
+        "cuda_ms": 535.9958080649376,
+        "cpu_ms": 237.86369967274368
+      },
+      "router": {
+        "calls": 336,
+        "cuda_ms": 148.54156711697578,
+        "cpu_ms": 43.22490032063797
+      },
+      "experts": {
+        "calls": 336,
+        "cuda_ms": 505.31411242485046,
+        "cpu_ms": 885.5895003071055
+      },
+      "lm_head": {
+        "calls": 7,
+        "cuda_ms": 5.0070080161094666,
+        "cpu_ms": 1.2425000313669443
+      }
+    }
+  },
+  "expert_dispatch": {
+    "prefill": {
+      "assignments": 1960,
+      "active_experts": 117,
+      "min": 1,
+      "median": 10.0,
+      "max": 126,
+      "experts_over_16": 35
+    },
+    "decode": {
+      "assignments": 8,
+      "active_experts": 8,
+      "min": 1,
+      "median": 1.0,
+      "max": 1,
+      "experts_over_16": 0
+    }
+  },
+  "expert_operator_profiles": {
+    "prefill": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                            aten::copy_         0.99%       1.680ms         2.97%       5.026ms      10.194us       2.369ms        26.49%       2.369ms       4.805us           0 B           0 B           0 B           0 B           493  \n                                          aten::_int_mm         0.63%       1.072ms         1.07%       1.808ms      25.824us       2.055ms        22.98%       2.055ms      29.358us           0 B           0 B      24.94 MB           0 B            70  \n_ZN7cutlass7Kernel2I76cutlass_80_wmma_tensorop_i1616...         0.00%       0.000us         0.00%       0.000us       0.000us       2.055ms        22.98%       2.055ms      29.358us           0 B           0 B           0 B           0 B            70  \n_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us       1.653ms        18.49%       1.653ms      23.615us           0 B           0 B           0 B           0 B            70  \n                                                 kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.378ms        15.41%       1.378ms       8.403us           0 B           0 B           0 B           0 B           164  \n                                              aten::mul         1.37%       2.315ms         2.57%       4.340ms      11.604us     654.088us         7.32%     654.088us       1.749us           0 B           0 B      48.02 MB      48.02 MB           374  \n                                               aten::mm         2.00%       3.386ms         2.99%       5.060ms      21.623us     618.019us         6.91%     618.019us       2.641us           0 B           0 B      10.53 MB      10.53 MB           234  \n_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us     435.109us         4.87%     435.109us       1.925us           0 B           0 B           0 B           0 B           226  \n                                       aten::index_add_         0.63%       1.058ms         1.05%       1.773ms      15.158us     396.570us         4.44%     396.570us       3.389us           0 B           0 B           0 B           0 B           117  \n                                              aten::div         0.51%     865.300us         0.95%       1.613ms      11.524us     373.443us         4.18%     373.443us       2.667us           0 B           0 B       7.40 MB       7.40 MB           140  \n_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23...         0.00%       0.000us         0.00%       0.000us       0.000us     342.880us         3.83%     342.880us       2.449us           0 B           0 B           0 B           0 B           140  \n_ZN2at6native19indexFuncSmallIndexIN3c108BFloat16Exj...         0.00%       0.000us         0.00%       0.000us       0.000us     323.230us         3.62%     323.230us       3.942us           0 B           0 B           0 B           0 B            82  \n_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us     300.801us         3.36%     300.801us       4.297us           0 B           0 B           0 B           0 B            70  \n_ZN7cutlass7Kernel2I68cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us     264.576us         2.96%     264.576us       2.384us           0 B           0 B           0 B           0 B           111  \n                                            aten::index         0.95%       1.602ms         1.55%       2.616ms      21.801us     232.188us         2.60%     232.188us       1.935us           0 B           0 B       7.69 MB       7.69 MB           120  \n                                             aten::silu         0.61%       1.036ms         1.11%       1.883ms      16.095us     220.033us         2.46%     220.033us       1.881us           0 B           0 B       2.87 MB       2.87 MB           117  \n                                             aten::amax         0.48%     811.600us         0.75%       1.273ms      18.180us     215.746us         2.41%     215.746us       3.082us           0 B           0 B      35.00 KB      35.00 KB            70  \n_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOp...         0.00%       0.000us         0.00%       0.000us       0.000us     215.746us         2.41%     215.746us       3.082us           0 B           0 B           0 B           0 B            70  \n_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us     208.385us         2.33%     208.385us       1.912us           0 B           0 B           0 B           0 B           109  \n_ZN2at6native24vectorized_gather_kernelILi16ExEEvPcS...         0.00%       0.000us         0.00%       0.000us       0.000us     191.645us         2.14%     191.645us       1.758us           0 B           0 B           0 B           0 B           109  \n_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23...         0.00%       0.000us         0.00%       0.000us       0.000us     164.671us         1.84%     164.671us       2.352us           0 B           0 B           0 B           0 B            70  \n_ZN7cutlass7Kernel2I67cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us     155.168us         1.74%     155.168us       3.103us           0 B           0 B           0 B           0 B            50  \n_ZN2at6native29vectorized_elementwise_kernelILi4EZNS...         0.00%       0.000us         0.00%       0.000us       0.000us     138.017us         1.54%     138.017us       0.986us           0 B           0 B           0 B           0 B           140  \n_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us     131.106us         1.47%     131.106us       1.873us           0 B           0 B           0 B           0 B            70  \n                                            aten::clamp         0.28%     478.400us         0.50%     845.000us      12.071us      93.091us         1.04%      93.091us       1.330us           0 B           0 B       7.36 MB       7.36 MB            70  \n_ZN2at6native29vectorized_elementwise_kernelILi4EZZZ...         0.00%       0.000us         0.00%       0.000us       0.000us      93.091us         1.04%      93.091us       1.330us           0 B           0 B           0 B           0 B            70  \n                                            aten::round         0.30%     508.400us         0.52%     877.700us      12.539us      89.982us         1.01%      89.982us       1.285us           0 B           0 B       7.36 MB       7.36 MB            70  \n_ZN2at6native29vectorized_elementwise_kernelILi4EZZZ...         0.00%       0.000us         0.00%       0.000us       0.000us      89.982us         1.01%      89.982us       1.285us           0 B           0 B           0 B           0 B            70  \n                                       cuLaunchKernelEx         0.70%       1.186ms         0.70%       1.186ms       7.229us      88.352us         0.99%      88.352us       0.539us           0 B           0 B           0 B           0 B           164  \n_ZN7cutlass7Kernel2I67cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      87.775us         0.98%      87.775us       2.743us           0 B           0 B           0 B           0 B            32  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 168.988ms\nSelf CUDA time total: 8.941ms\n",
+    "decode": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                 kernel         0.00%       0.000us         0.00%       0.000us       0.000us     126.336us        37.87%     126.336us       7.896us           0 B           0 B           0 B           0 B            16  \n                                             aten::sort         1.09%      40.900us         4.60%     173.200us     173.200us      78.144us        23.43%      81.983us      81.983us           0 B           0 B       1.00 KB         512 B             1  \n_ZN2at6native20bitonicSortKVInPlaceILin2ELin1ELi16EL...         0.00%       0.000us         0.00%       0.000us       0.000us      78.144us        23.43%      78.144us      78.144us           0 B           0 B           0 B           0 B             1  \n                                               aten::mm         6.93%     260.700us        10.09%     379.800us      23.737us      48.288us        14.48%      48.288us       3.018us           0 B           0 B      44.00 KB      44.00 KB            16  \n_ZN7cutlass7Kernel2I67cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      48.288us        14.48%      48.288us       3.018us           0 B           0 B           0 B           0 B            16  \n                                            aten::index         3.98%     149.600us         6.59%     248.000us      22.545us      26.401us         7.91%      26.401us       2.400us           0 B           0 B      33.50 KB      33.50 KB            11  \n_ZN2at6native24index_elementwise_kernelILi128ELi4EZN...         0.00%       0.000us         0.00%       0.000us       0.000us      23.169us         6.95%      23.169us       2.574us           0 B           0 B           0 B           0 B             9  \n                                              aten::mul         3.43%     129.000us         6.25%     235.200us      14.700us      21.024us         6.30%      21.024us       1.314us           0 B           0 B      44.00 KB      44.00 KB            16  \n_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22g...         0.00%       0.000us         0.00%       0.000us       0.000us      12.257us         3.67%      12.257us       1.532us           0 B           0 B           0 B           0 B             8  \n                                             aten::silu         1.99%      75.000us         3.68%     138.600us      17.325us      11.328us         3.40%      11.328us       1.416us           0 B           0 B      12.00 KB      12.00 KB             8  \n_ZN2at6native29vectorized_elementwise_kernelILi4EZZZ...         0.00%       0.000us         0.00%       0.000us       0.000us      11.328us         3.40%      11.328us       1.416us           0 B           0 B           0 B           0 B             8  \n                                       aten::index_add_         1.71%      64.400us         3.10%     116.600us      14.575us      11.072us         3.32%      11.072us       1.384us           0 B           0 B           0 B           0 B             8  \n_ZN2at6native19indexFuncSmallIndexIN3c108BFloat16Exj...         0.00%       0.000us         0.00%       0.000us       0.000us      11.072us         3.32%      11.072us       1.384us           0 B           0 B           0 B           0 B             8  \n_ZN2at6native29vectorized_elementwise_kernelILi4ENS0...         0.00%       0.000us         0.00%       0.000us       0.000us       8.767us         2.63%       8.767us       1.096us           0 B           0 B           0 B           0 B             8  \n                                            aten::copy_         0.69%      26.000us         2.97%     111.800us      27.950us       3.647us         1.09%       3.647us       0.912us           0 B           0 B           0 B           0 B             4  \n_ZN2at6native24index_elementwise_kernelILi128ELi4EZN...         0.00%       0.000us         0.00%       0.000us       0.000us       3.232us         0.97%       3.232us       1.616us           0 B           0 B           0 B           0 B             2  \n                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       3.007us         0.90%       3.007us       1.002us           0 B           0 B           0 B           0 B             3  \n                               aten::unique_consecutive         0.81%      30.300us         3.51%     132.100us     132.100us       2.272us         0.68%       3.488us       3.488us           0 B           0 B       1.00 KB        -512 B             1  \n                                           aten::arange         1.41%      53.200us        38.99%       1.467ms     366.850us       2.016us         0.60%       6.400us       1.600us           0 B           0 B       2.00 KB           0 B             4  \n_ZN50_GLOBAL__N__35dbd4de_17_RangeFactories_cu_4cc9e...         0.00%       0.000us         0.00%       0.000us       0.000us       2.016us         0.60%       2.016us       1.008us           0 B           0 B           0 B           0 B             2  \n_ZN14at_cuda_detail3cub6detail6reduce23DeviceReduceB...         0.00%       0.000us         0.00%       0.000us       0.000us       1.440us         0.43%       1.440us       1.440us           0 B           0 B           0 B           0 B             1  \n                              aten::_local_scalar_dense         0.25%       9.300us         1.87%      70.500us      70.500us       1.216us         0.36%       1.216us       1.216us           0 B           0 B           0 B           0 B             1  \n                         Memcpy DtoH (Device -> Pinned)         0.00%       0.000us         0.00%       0.000us       0.000us       1.216us         0.36%       1.216us       1.216us           0 B           0 B           0 B           0 B             1  \n                                Activity Buffer Request        15.60%     586.900us        15.60%     586.900us     586.900us       1.184us         0.35%       1.184us       1.184us           0 B           0 B           0 B           0 B             1  \n                                              aten::cat         0.36%      13.500us         0.58%      21.900us      21.900us       1.024us         0.31%       1.024us       1.024us           0 B           0 B         512 B         512 B             1  \n_ZN2at6native40_GLOBAL__N__27eda9f4_8_Shape_cu_85d9f...         0.00%       0.000us         0.00%       0.000us       0.000us       1.024us         0.31%       1.024us       1.024us           0 B           0 B           0 B           0 B             1  \n_ZN14at_cuda_detail3cub6detail4scan23DeviceCompactIn...         0.00%       0.000us         0.00%       0.000us       0.000us       0.832us         0.25%       0.832us       0.832us           0 B           0 B           0 B           0 B             1  \n                                            aten::fill_         0.19%       7.000us         0.41%      15.500us      15.500us       0.800us         0.24%       0.800us       0.800us           0 B           0 B           0 B           0 B             1  \n_ZN2at6native29vectorized_elementwise_kernelILi4ENS0...         0.00%       0.000us         0.00%       0.000us       0.000us       0.800us         0.24%       0.800us       0.800us           0 B           0 B           0 B           0 B             1  \n                       Memcpy DtoH (Device -> Pageable)         0.00%       0.000us         0.00%       0.000us       0.000us       0.640us         0.19%       0.640us       0.640us           0 B           0 B           0 B           0 B             1  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 3.763ms\nSelf CUDA time total: 333.568us\n"
+  },
+  "peak_vram_gb": 30.915414333343506,
+  "torch": "2.13.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 5090"
+}

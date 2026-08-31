@@ -1,0 +1,17 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "scheme": "int8_convrot",
+  "tokens": 1,
+  "experts": 128,
+  "active_experts": 8,
+  "iterations": 10,
+  "timings_ms": {
+    "compact_sorted_ms": 1.5056199976243079,
+    "transformers_active_loop_ms": 2.95996000058949,
+    "naive_128_loop_ms": 10.063780000200495
+  },
+  "speedup_vs_transformers_active": 1.9659409447669136,
+  "speedup_vs_naive_128": 6.68414342003956,
+  "max_abs_delta_vs_active": 0.0,
+  "max_abs_delta_vs_naive": 0.0
+}

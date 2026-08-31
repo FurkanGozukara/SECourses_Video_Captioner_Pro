@@ -1,0 +1,44 @@
+{
+  "q25": {
+    "audio": {
+      "tensors": 489,
+      "identical_across_all": 487,
+      "mismatched": 2,
+      "manifest_sha256": [
+        "238f616d65eca84f947ff75dcc87af1f3c90972c2bbb2e5f874e76a10f521421",
+        "4c3463ecd4d4a1091d07ad6258cc43985847a6cd64c918fc479f4fa9a45973f0"
+      ]
+    },
+    "visual": {
+      "tensors": 518,
+      "identical_across_all": 513,
+      "mismatched": 5,
+      "manifest_sha256": [
+        "9636cb0c9a5a2fc812070fea16505da039b509da908fc228a6366db1c84866a9",
+        "fd878b3055e2031c4328563f0a4ca627e81b4e5b4a9844fd46c31881c5a1d849"
+      ]
+    }
+  },
+  "q3": {
+    "audio": {
+      "tensors": 525,
+      "identical_across_all": 46,
+      "mismatched": 479,
+      "manifest_sha256": [
+        "64699cbcb5e56bc46804ab96f2fa702e19346e679d0fd95ac7702bf5a7d513ed",
+        "05bfa85d6741884cbc58430fe13bd479c2bff715a4ec916f3764d4facc14d201",
+        "5018ed83344f7993d7de2b1e67a89d8cdd7abcc7903933fff8b88959ad1e9ae9"
+      ]
+    },
+    "visual": {
+      "tensors": 351,
+      "identical_across_all": 63,
+      "mismatched": 288,
+      "manifest_sha256": [
+        "18cab50408d99d7a94cf9f4404f033d3c800058f00e08a1764dcf0e35246dd23",
+        "f9d44839bfc6163db1ed11e38a30c740ce01afd1ce67437879008d9cb862c39c",
+        "c63130d7dff0dcd70cbca18cb038b63cceb6f32849a51db2f11fea9ee3a29748"
+      ]
+    }
+  }
+}

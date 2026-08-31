@@ -1,0 +1,21 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "scheme": "int8_convrot",
+  "tokens": 245,
+  "experts": 128,
+  "active_experts": 8,
+  "iterations": 30,
+  "timings_ms": {
+    "compact_sorted_ms": 0.7595133346815904,
+    "transformers_active_loop_ms": 51.85735000025792,
+    "naive_128_loop_ms": 49.7790966668011
+  },
+  "speedup_vs_transformers_active": 68.27707642815513,
+  "speedup_vs_naive_128": 65.5407803836254,
+  "max_abs_delta_vs_active": 0.625,
+  "mean_abs_delta_vs_active": 0.05273795500397682,
+  "relative_l2_delta_vs_active": 0.009193978272378445,
+  "max_abs_delta_vs_naive": 0.625,
+  "mean_abs_delta_vs_naive": 0.05273795500397682,
+  "relative_l2_delta_vs_naive": 0.009193978272378445
+}
