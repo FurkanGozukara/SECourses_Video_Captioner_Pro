@@ -277,6 +277,7 @@ class OutputSpec:
     save_processed_files: bool = False
     save_clips: bool = False
     recursive: bool = False
+    limit_items: int = 0
 
     def __post_init__(self) -> None:
         selected = str(self.kind).casefold()
@@ -288,6 +289,7 @@ class OutputSpec:
             object.__setattr__(self, "batch_output_dir", os.fspath(self.batch_output_dir))
         if self.source_root is not None:
             object.__setattr__(self, "source_root", os.fspath(self.source_root))
+        object.__setattr__(self, "limit_items", max(0, int(self.limit_items)))
 
 
 @dataclass(frozen=True)

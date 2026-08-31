@@ -64,6 +64,9 @@ from .registry import (
 
 ProgressCallback = Callable[..., None]
 HF_RESOLVE_ROOT = "https://huggingface.co"
+GGUF_MIRRORS: tuple[tuple[str, str], ...] = (
+    ("MonsterMMORPG/Wan_GGUF", "{folder_name}/{filename}"),
+)
 DEFAULT_CONTEXT_SIZE = 32_768
 DEFAULT_STARTUP_TIMEOUT_S = 900.0
 
@@ -290,44 +293,67 @@ def _hf_download(
     progress_cb: ProgressCallback | None,
     cancel: object | None,
 ) -> Path:
-    label = f"{variant.gguf_repo}/{filename}"
     target = folder / filename
-    _emit(progress_cb, f"Downloading {label} with Hugging Face resumable cache")
+    sources = [(str(variant.gguf_repo), filename)]
+    sources.extend(
+        (repo_id, path_template.format(folder_name=variant.folder_name, filename=filename))
+        for repo_id, path_template in GGUF_MIRRORS
+    )
     try:
         from huggingface_hub import hf_hub_download
-
-        downloaded = Path(
-            hf_hub_download(
-                repo_id=str(variant.gguf_repo),
-                filename=filename,
-                revision="main",
-                local_dir=folder,
-                user_agent="SECourses-Video-Captioner-Pro/1.0",
-                force_download=bool(target.is_file() and expected_size and target.stat().st_size != expected_size),
-                tqdm_class=_hf_tqdm_class(progress_cb, cancel, label),
-            )
-        ).resolve(strict=True)
     except ImportError:
-        encoded_name = quote(filename, safe="/")
-        url = f"{HF_RESOLVE_ROOT}/{variant.gguf_repo}/resolve/main/{encoded_name}?download=true"
-        downloaded = download_resumable(
-            url,
-            target,
-            expected_size=expected_size,
-            expected_sha256=expected_sha256,
-            progress_cb=progress_cb,
-            cancel=cancel,
-            label=label,
-        )
-        return downloaded
-    if expected_size is not None and downloaded.stat().st_size != expected_size:
-        raise RuntimeError(
-            f"Incomplete download for {filename}: got {downloaded.stat().st_size}, expected {expected_size} bytes"
-        )
-    _verify_file(downloaded, expected_sha256, progress_cb, cancel)
-    target.with_name(target.name + ".part").unlink(missing_ok=True)
-    _emit(progress_cb, f"Downloaded {label}", fraction=1.0, bytes_total=downloaded.stat().st_size)
-    return downloaded
+        hf_hub_download = None
+
+    for source_index, (repo_id, source_filename) in enumerate(sources):
+        label = f"{repo_id}/{source_filename}"
+        _emit(progress_cb, f"Downloading {label} with Hugging Face resumable cache")
+        try:
+            if _cancelled(cancel):
+                raise CancelledError(f"download cancelled: {label}")
+            if hf_hub_download is None:
+                encoded_name = quote(source_filename, safe="/")
+                url = f"{HF_RESOLVE_ROOT}/{repo_id}/resolve/main/{encoded_name}?download=true"
+                return download_resumable(
+                    url,
+                    target,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                    progress_cb=progress_cb,
+                    cancel=cancel,
+                    label=label,
+                )
+            downloaded = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=source_filename,
+                    revision="main",
+                    local_dir=folder,
+                    user_agent="SECourses-Video-Captioner-Pro/1.0",
+                    force_download=bool(target.is_file() and expected_size and target.stat().st_size != expected_size),
+                    tqdm_class=_hf_tqdm_class(progress_cb, cancel, label),
+                )
+            ).resolve(strict=True)
+            if downloaded != target.resolve():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(downloaded, target)
+                downloaded = target.resolve(strict=True)
+            if expected_size is not None and downloaded.stat().st_size != expected_size:
+                raise RuntimeError(
+                    f"Incomplete download for {filename}: got {downloaded.stat().st_size}, expected {expected_size} bytes"
+                )
+            _verify_file(downloaded, expected_sha256, progress_cb, cancel)
+            target.with_name(target.name + ".part").unlink(missing_ok=True)
+            _emit(progress_cb, f"Downloaded {label}", fraction=1.0, bytes_total=downloaded.stat().st_size)
+            return downloaded
+        except CancelledError:
+            raise
+        except Exception as exc:
+            if _cancelled(cancel):
+                raise CancelledError(f"download cancelled: {label}") from exc
+            _emit(progress_cb, f"Download failed from {label}: {exc}")
+            if source_index + 1 >= len(sources):
+                raise
+    raise RuntimeError(f"No download source is configured for {filename}")
 
 
 def ensure_gguf(

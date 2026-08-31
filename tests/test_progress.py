@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
+import vcap.core.progress as progress_module
 from vcap.core.progress import (
     MultiSink,
     ProgressEvent,
@@ -18,7 +21,7 @@ def test_formatters() -> None:
     assert format_duration(45) == "45s"
     assert format_duration(200) == "3m 20s"
     assert format_duration(8100) == "2h 15m"
-    assert format_eta(45) == "ETA 45s"
+    assert format_eta(45) == "45s"
     assert format_bytes(1024) == "1.0 KB"
 
 
@@ -42,6 +45,28 @@ def test_tracker_counts_fraction_eta_and_status() -> None:
     tracker.start_item(2)
     tracker.finish_item("failed", 1.0)
     assert tracker.overall_fraction == 1.0
+
+
+def test_single_item_segment_eta_uses_completed_segment_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(progress_module.time, "monotonic", lambda: now[0])
+    tracker = ProgressTracker(1, ["video"])
+    tracker.start_item(0)
+    tracker.start_segment(5)
+    now[0] += 10.0
+    tracker.finish_segment()
+
+    assert tracker.eta_seconds == pytest.approx(40.0)
+    assert tracker.to_dict()["segment_completed"] == 1
+
+    multi = ProgressTracker(2, ["one", "two"])
+    multi.start_item(0)
+    multi.start_segment(5)
+    now[0] += 10.0
+    multi.finish_segment()
+    assert multi.eta_seconds is None
 
 
 def test_speed_throttle_and_multi_sink() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -236,6 +237,7 @@ class MediaInputHandles:
     output_folder: gr.Textbox
     recursive: gr.Checkbox
     overwrite: gr.Checkbox
+    limit_items: gr.Number
     rescan: gr.Button
     scan_summary: gr.Markdown
     video: gr.Video
@@ -343,6 +345,7 @@ def _folder_scan(
     recursive: bool,
     output_folder: str = "",
     overwrite: bool = False,
+    limit_items: int | float = 0,
 ) -> tuple[list[str], str]:
     raw = str(folder or "").strip()
     if not raw:
@@ -378,7 +381,38 @@ def _folder_scan(
         f"🖼️ {counts['image']} images · {existing} already captioned in output folder. "
         f"{overwrite_hint}"
     )
+    limit = max(0, int(limit_items or 0))
+    if limit:
+        summary += f" · limiting to first {limit}"
     return [str(path) for path in found], summary
+
+
+def _resolved_after_preview_edit(
+    value: str | None,
+    current: list[str] | None,
+    input_mode: str,
+) -> list[str]:
+    """Keep folder scans authoritative while accepting single-file edits."""
+
+    selected = list(current or [])
+    if str(input_mode).casefold() == "folder" or not value:
+        return selected
+    resolved = str(normalize_path(value))
+    if selected:
+        cache_root = os.environ.get("GRADIO_TEMP_DIR")
+        if cache_root:
+            try:
+                current_path = normalize_path(selected[0])
+                cached_path = normalize_path(resolved)
+                root = normalize_path(cache_root)
+                cached_path.relative_to(root)
+                try:
+                    current_path.relative_to(root)
+                except ValueError:
+                    return selected
+            except (OSError, TypeError, ValueError):
+                pass
+    return [resolved, *selected[1:]] if selected else [resolved]
 
 
 def media_input_block(ctx: "UiContext") -> MediaInputHandles:
@@ -485,6 +519,23 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                         description="Replace existing batch captions instead of skipping them.",
                         kind="bool",
                     )
+                    limit_items = gr.Number(
+                        value=0,
+                        minimum=0,
+                        step=1,
+                        precision=0,
+                        label="Limit items (0 = all)",
+                        info="Process only the first N items that are not already captioned.",
+                    )
+                    ctx.reg(
+                        "batch_limit_items",
+                        limit_items,
+                        0,
+                        section="input",
+                        description="Maximum processable batch items after existing-caption skips.",
+                        kind="int",
+                        minimum=0,
+                    )
                     rescan = action_button("↻ Rescan", "cyan", size="md")
                 scan_summary = gr.Markdown(
                     "<span class='vc-help'>Choose a folder for a light extension scan.</span>",
@@ -540,8 +591,15 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         recursive_value: bool,
         output_value: str,
         overwrite_value: bool,
+        limit_value: int | float,
     ) -> tuple[Any, ...]:
-        selected, summary = _folder_scan(value, recursive_value, output_value, overwrite_value)
+        selected, summary = _folder_scan(
+            value,
+            recursive_value,
+            output_value,
+            overwrite_value,
+            limit_value,
+        )
         return (*_preview_updates(selected), selected, "folder", summary)
 
     upload_outputs = [*preview_outputs, resolved_state, mode_state]
@@ -578,7 +636,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         api_visibility="private",
     )
     folder_outputs = [*preview_outputs, resolved_state, mode_state, scan_summary]
-    folder_inputs = [folder, recursive, output_folder, overwrite]
+    folder_inputs = [folder, recursive, output_folder, overwrite, limit_items]
     folder_tab.select(
         scan_folder,
         inputs=folder_inputs,
@@ -587,7 +645,14 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         show_progress="hidden",
         api_visibility="private",
     )
-    for trigger in (folder.change, recursive.change, output_folder.change, overwrite.change, rescan.click):
+    for trigger in (
+        folder.change,
+        recursive.change,
+        output_folder.change,
+        overwrite.change,
+        limit_items.change,
+        rescan.click,
+    ):
         trigger(
             scan_folder,
             inputs=folder_inputs,
@@ -597,18 +662,19 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
             api_visibility="private",
         )
 
-    def accept_editor_value(value: str | None, current: list[str] | None) -> tuple[Any, ...]:
-        selected = list(current or [])
-        if value:
-            resolved = str(normalize_path(value))
-            selected = [resolved, *selected[1:]] if selected else [resolved]
+    def accept_editor_value(
+        value: str | None,
+        current: list[str] | None,
+        input_mode: str,
+    ) -> tuple[Any, ...]:
+        selected = _resolved_after_preview_edit(value, current, input_mode)
         updates = _preview_updates(selected)
         return selected, updates[3], updates[4], updates[5], updates[6]
 
     editor_outputs = [resolved_state, info, gallery, modality_state, duration_state]
     video.change(
         accept_editor_value,
-        inputs=[video, resolved_state],
+        inputs=[video, resolved_state, mode_state],
         outputs=editor_outputs,
         queue=False,
         show_progress="hidden",
@@ -616,7 +682,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
     )
     audio.change(
         accept_editor_value,
-        inputs=[audio, resolved_state],
+        inputs=[audio, resolved_state, mode_state],
         outputs=editor_outputs,
         queue=False,
         show_progress="hidden",
@@ -624,7 +690,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
     )
     image.change(
         accept_editor_value,
-        inputs=[image, resolved_state],
+        inputs=[image, resolved_state, mode_state],
         outputs=editor_outputs,
         queue=False,
         show_progress="hidden",
@@ -638,6 +704,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         output_folder,
         recursive,
         overwrite,
+        limit_items,
         rescan,
         scan_summary,
         video,
@@ -799,8 +866,20 @@ def replace_words_editor() -> ReplaceWordsHandles:
             label="Regex",
             info="Interpret each find value as a regular expression.",
         )
+    def render_chips(value: str) -> str:
+        return replace_pairs_to_html_chips(parse_replace_pairs(value))
+
     text.input(
-        lambda value: replace_pairs_to_html_chips(parse_replace_pairs(value)),
+        render_chips,
+        inputs=text,
+        outputs=chips,
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    text.change(
+        render_chips,
         inputs=text,
         outputs=chips,
         queue=False,

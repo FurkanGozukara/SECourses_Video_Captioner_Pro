@@ -7,6 +7,7 @@ from vcap.core.captions_post import (
     Segment,
     apply_replacements,
     caption_stats,
+    clamp_segments_to_window,
     diff_html,
     finalize_caption,
     format_replace_pairs,
@@ -52,6 +53,33 @@ def test_finalize_order_subtitles_stats_and_diff() -> None:
     assert "<del" in difference and "<ins" in difference and "&lt;" in difference
 
 
+def test_subtitle_cues_are_clamped_to_their_absolute_clip_window() -> None:
+    clamped = clamp_segments_to_window(
+        [
+            Segment(4.0, 7.0, "starts early"),
+            Segment(5.0, 5.0, "zero at start"),
+            Segment(8.0, 15.0, "ends late"),
+            Segment(8.0, 8.0, "zero duration"),
+            Segment(9.8, 9.7, "cannot repair"),
+            Segment(10.0, 12.0, "starts after clip"),
+        ],
+        5.0,
+        10.0,
+    )
+
+    assert clamped == [
+        Segment(5.0, 7.0, "starts early"),
+        Segment(5.0, 5.5, "zero at start"),
+        Segment(8.0, 10.0, "ends late"),
+        Segment(8.0, 8.5, "zero duration"),
+    ]
+    srt = to_srt(clamped)
+    vtt = to_vtt(clamped)
+    assert "00:00:10,000" in srt
+    assert "00:00:10.000" in vtt
+    assert "00:00:12" not in srt + vtt
+
+
 def test_caption_output_writer(tmp_path: Path) -> None:
     written = write_caption_outputs(
         tmp_path,
@@ -65,4 +93,3 @@ def test_caption_output_writer(tmp_path: Path) -> None:
     assert set(written) == {"txt", "json", "srt", "vtt", "jsonl", "reasoning"}
     assert "kadın" in written["json"].read_text(encoding="utf-8")
     assert json.loads(written["jsonl"].read_text(encoding="utf-8")) == {"caption": "kadın"}
-

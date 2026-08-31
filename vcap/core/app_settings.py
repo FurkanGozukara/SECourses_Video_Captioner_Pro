@@ -13,7 +13,13 @@ from .paths import normalize_path
 
 APP_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "app_settings.json"
 _PATH_KEYS = ("outputs_dir", "temp_dir", "models_dir")
-_BOOL_KEYS = ("save_processed_files", "scan_subfolders")
+_BOOL_KEYS = (
+    "save_processed_files",
+    "scan_subfolders",
+    "desktop_notification_on_finish",
+    "play_sound_on_finish",
+    "open_output_folder_on_single_finish",
+)
 
 
 def _settings_path(path: str | os.PathLike[str] | None) -> Path:

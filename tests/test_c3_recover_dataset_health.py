@@ -51,6 +51,42 @@ def test_recover_folder_resolves_and_only_returns_present_keys(tmp_path: Path) -
     assert model_only == {"model_key": "qwen"}
 
 
+def test_recover_maps_runtime_compile_and_recursive_settings_to_ui_controls() -> None:
+    registry = SettingsRegistry()
+    registry.register(
+        "torch_compile_mode",
+        object(),
+        "default",
+        section="runtime",
+        kind="str",
+        choices=["default", "max-autotune-no-cudagraphs"],
+    )
+    registry.register(
+        "batch_recursive",
+        object(),
+        False,
+        section="input",
+        kind="bool",
+    )
+
+    values, warnings = present_recovery_settings(
+        {
+            "settings": {
+                "compile_mode": "max-autotune-no-cudagraphs",
+                "recursive": True,
+            }
+        },
+        registry,
+        available_gpu_indices=[],
+    )
+
+    assert values == {
+        "torch_compile_mode": "max-autotune-no-cudagraphs",
+        "batch_recursive": True,
+    }
+    assert warnings == []
+
+
 def test_trainer_clip_suggestion_surfaces_frames_seconds_fps_and_valid_values() -> None:
     text, seconds = trainer_clip_suggestion("wan")
 

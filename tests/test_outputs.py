@@ -70,3 +70,17 @@ def test_run_log_attaches_and_detaches(tmp_path: Path) -> None:
     after = (run_dir / "run_log.txt").read_text(encoding="utf-8")
     assert "inside-run-log" in before
     assert after == before
+
+
+def test_run_log_deduplicates_only_adjacent_persisted_messages(tmp_path: Path) -> None:
+    log = get_log()
+    run_dir = tmp_path / "deduped"
+    marker = "Splitting clip 1/5 (20.0%)"
+    with RunLog(run_dir):
+        log.log(marker, scope="split", console=False)
+        log.log(marker, scope="split", console=False)
+        log.log("another message", scope="split", console=False)
+        log.log(marker, scope="split", console=False)
+
+    lines = (run_dir / "run_log.txt").read_text(encoding="utf-8").splitlines()
+    assert sum(marker in line for line in lines) == 2

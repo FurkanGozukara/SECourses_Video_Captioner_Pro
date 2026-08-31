@@ -25,9 +25,9 @@ def format_duration(seconds: float | int | None) -> str:
 
 
 def format_eta(seconds: float | int | None) -> str:
-    """Format an ETA label, including the unknown state."""
+    """Format an ETA value without adding a display label."""
 
-    return f"ETA {format_duration(seconds)}"
+    return format_duration(seconds)
 
 
 def format_bytes(value: float | int | None) -> str:
@@ -62,6 +62,9 @@ class ProgressTracker:
         self._step_index: int | None = None
         self._statuses: dict[int, str] = {}
         self._durations: list[float] = []
+        self._segment_total: int | None = None
+        self._segment_completed = 0
+        self._segments_started_at: float | None = None
 
     def start_item(self, i: int, label: str | None = None) -> None:
         """Begin a zero-based item and reset its active step state."""
@@ -82,6 +85,28 @@ class ProgressTracker:
             self._step_fraction = 0.0
             self._step_total = None
             self._step_index = None
+            self._segment_total = None
+            self._segment_completed = 0
+            self._segments_started_at = None
+
+    def start_segment(self, total_segments: int) -> None:
+        """Start or continue the known segment plan for a single item."""
+
+        with self._lock:
+            self._segment_total = max(1, int(total_segments))
+            if self._segments_started_at is None:
+                self._segments_started_at = time.monotonic()
+
+    def finish_segment(self) -> None:
+        """Record one completed segment in the active plan."""
+
+        with self._lock:
+            if self._segment_total is None:
+                return
+            self._segment_completed = min(
+                self._segment_total,
+                self._segment_completed + 1,
+            )
 
     def set_step(
         self,
@@ -161,8 +186,20 @@ class ProgressTracker:
         """Estimate remaining time from completed non-skipped item durations."""
 
         with self._lock:
-            if not self._durations or self.remaining <= 0:
-                return 0.0 if self.remaining <= 0 else None
+            remaining = self.remaining
+            if remaining <= 0:
+                return 0.0
+            if (
+                self.total_items == 1
+                and self._segment_total is not None
+                and self._segment_completed >= 1
+                and self._segments_started_at is not None
+            ):
+                elapsed = max(0.0, time.monotonic() - self._segments_started_at)
+                segment_remaining = max(0, self._segment_total - self._segment_completed)
+                return (elapsed / self._segment_completed) * segment_remaining
+            if not self._durations:
+                return None
             return (sum(self._durations) / len(self._durations)) * self.remaining
 
     @property
@@ -207,7 +244,7 @@ class ProgressTracker:
         rate = terminal_non_skipped / max(self.elapsed, 1e-9)
         third = (
             f"Total {self.processed}/{self.total_items} processed, {self.skipped} skipped, "
-            f"{self.failed} failed, {self.remaining} remaining. {format_eta(eta)}. "
+            f"{self.failed} failed, {self.remaining} remaining. ETA {format_eta(eta)}. "
             f"Finish {finish}."
         )
         fourth = f"Elapsed {format_duration(self.elapsed)}. Rate {rate:.2f} items/s."
@@ -228,6 +265,8 @@ class ProgressTracker:
                 "elapsed": self.elapsed,
                 "elapsed_s": self.elapsed,
                 "item_elapsed_s": self.item_elapsed,
+                "segment_completed": self._segment_completed,
+                "segment_total": self._segment_total,
                 "eta_seconds": self.eta_seconds,
                 "eta_s": self.eta_seconds,
                 "processed": self.processed,

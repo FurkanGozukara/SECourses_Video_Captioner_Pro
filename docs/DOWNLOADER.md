@@ -25,16 +25,24 @@ By default key `K` installs under
 `SECourses_Video_Captioner_Pro/models/K/`. `VCAP_MODELS_DIR` or
 `--target-root` replaces the models root, and the key is still appended.
 
-Every required path is discovered dynamically with
+Every regular model folder is stored at the Hugging Face repository root, so
+its catalog key is also its `path_in_repo`. Required paths are discovered
+dynamically with
 `HfApi.list_repo_tree(..., path_in_repo=<model-subfolder>, recursive=True)`.
-The complete listing, sizes, pinned commit, and published LFS SHA-256/Git blob
-digests are cached in `download_cache/remote_index_<key>.json` for 24 hours.
+If that listing returns 404, the downloader probes the alternate layout once:
+`<key>` and `Video_Captioner_Pro/<key>` are alternate forms. The complete
+listing, sizes, pinned commit, and published LFS SHA-256/Git blob digests are
+cached in `download_cache/remote_index_<key>.json` for 24 hours. A fresh cache
+entry for either form is accepted, and the form that succeeded is stored.
 `--refresh-index` forces a fresh listing.
 
-The six GGUF entries are resolved from the non-gated third-party repositories
-pinned in `vcap.models.registry` and are downloaded through
-`vcap.models.llamacpp_backend.ensure_gguf`. They never use the
-`MonsterMMORPG/Wan_GGUF` model tree.
+The six GGUF entries are resolved first from the non-gated third-party
+repositories pinned in `vcap.models.registry` and are downloaded through
+`vcap.models.llamacpp_backend.ensure_gguf`. If a primary transfer fails, the
+backend tries the data-driven mirror chain, currently
+`MonsterMMORPG/Wan_GGUF/<variant-folder>/<filename>`, and normalizes the
+download into the flat local model folder. GGUF files do not use remote-index
+tree discovery.
 
 ## Exact ready rule
 

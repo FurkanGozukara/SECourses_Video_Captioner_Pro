@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -12,6 +13,7 @@ import numpy as np
 
 from vcap.core.media import VideoFrames
 from vcap.core.subprocess_runner import CancelToken
+from vcap.models import llamacpp_backend
 from vcap.models.base import Callbacks, GenParams, MediaInput, PreprocessParams
 from vcap.models.llamacpp_backend import (
     LlamaCppCaptioner,
@@ -53,6 +55,45 @@ def test_registry_gguf_repos_files_sizes_and_vram_tiers() -> None:
     assert "qwen3_omni_instruct_gguf_q4" in tier_24
     assert "qwen3_omni_instruct_gguf_q8" not in tier_24
     assert "qwen3_omni_instruct_gguf_q8" in tier_32
+
+
+def test_gguf_download_falls_back_to_mirror_and_flattens_file(monkeypatch, tmp_path: Path) -> None:
+    variant = get_variant("qwen3_omni_captioner_gguf_q4")
+    filename = variant.gguf_files[0]
+    payload = b"byte-identical mirror fixture"
+    folder = tmp_path / variant.folder_name
+    folder.mkdir()
+    calls: list[tuple[str, str]] = []
+
+    def fake_hf_hub_download(**kwargs):
+        calls.append((kwargs["repo_id"], kwargs["filename"]))
+        if len(calls) == 1:
+            raise OSError("primary unavailable")
+        downloaded = Path(kwargs["local_dir"]) / Path(kwargs["filename"])
+        downloaded.parent.mkdir(parents=True, exist_ok=True)
+        downloaded.write_bytes(payload)
+        return str(downloaded)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_hub_download)
+
+    downloaded = llamacpp_backend._hf_download(
+        variant,
+        filename,
+        folder,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+        None,
+        None,
+    )
+    target = folder / filename
+
+    assert calls == [
+        (variant.gguf_repo, filename),
+        ("MonsterMMORPG/Wan_GGUF", f"{variant.folder_name}/{filename}"),
+    ]
+    assert downloaded == target.resolve()
+    assert target.read_bytes() == payload
+    assert not (folder / variant.folder_name / filename).exists()
 
 
 def test_message_building_audio_uses_base64_wav(monkeypatch, tmp_path: Path) -> None:

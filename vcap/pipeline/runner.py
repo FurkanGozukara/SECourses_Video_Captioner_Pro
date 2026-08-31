@@ -19,6 +19,7 @@ from vcap.core import console_progress, gpu
 from vcap.core.captions_post import (
     Segment,
     apply_replacements,
+    clamp_segments_to_window,
     finalize_caption,
     write_caption_outputs,
 )
@@ -114,6 +115,8 @@ class _Emitter:
             "total": snapshot["total_items"],
             "elapsed_s": snapshot["elapsed_s"],
             "eta_s": snapshot["eta_s"],
+            "segment_completed": snapshot["segment_completed"],
+            "segment_total": snapshot["segment_total"],
             "item_index": event_index,
             "item_elapsed_s": snapshot["item_elapsed_s"],
             "status_line": self.tracker.status_line(),
@@ -197,6 +200,31 @@ class _Emitter:
         )
         self._emit_running_item(message, event_index, payload)
         self._console_status(message, payload)
+
+    def start_segment(self, total_segments: int) -> None:
+        """Start timing a known per-item segment plan."""
+
+        self.tracker.start_segment(total_segments)
+
+    def finish_segment(
+        self,
+        tracker_index: int,
+        event_index: int,
+        segment_index: int,
+        total_segments: int,
+        message: str,
+    ) -> None:
+        """Complete one segment and publish its single-item ETA."""
+
+        self.tracker.finish_segment()
+        self.progress(
+            tracker_index,
+            event_index,
+            message,
+            0.56 + 0.30 * segment_index / max(1, total_segments),
+            step_index=6,
+            data={"segment_index": segment_index, "total_segments": total_segments},
+        )
 
     def phase_progress(
         self,
@@ -521,6 +549,23 @@ def _apply_batch_skip(spec: JobSpec, resolved: list[_ResolvedInput]) -> None:
             entry.message = f"Caption already exists: {target}"
 
 
+def _apply_batch_limit(spec: JobSpec, resolved: list[_ResolvedInput]) -> None:
+    """Keep only the first N pending batch entries after existing-output skips."""
+
+    limit = spec.output.limit_items
+    if spec.output.kind != "batch" or limit <= 0:
+        return
+    selected = 0
+    for entry in resolved:
+        if entry.status != "pending":
+            continue
+        if selected < limit:
+            selected += 1
+            continue
+        entry.status = "skipped"
+        entry.message = f"Excluded by batch limit of {limit} item(s)."
+
+
 def _allocate_job_dir(spec: JobSpec) -> Path:
     override = spec.internal.get("run_dir")
     if override:
@@ -556,13 +601,19 @@ def _metadata_finish_reason(items: Sequence[ItemResult]) -> str | list[str] | No
     return reasons[0] if len(reasons) == 1 else reasons
 
 
-def _write_batch_summary(run_dir: Path, items: Sequence[ItemResult], elapsed: float) -> Path:
+def _write_batch_summary(
+    run_dir: Path,
+    items: Sequence[ItemResult],
+    elapsed: float,
+    limit_items: int = 0,
+) -> Path:
     counts = _status_counts(items)
     summary = {
         "counts": {
             key: int(counts.get(key, 0))
             for key in ("total", "done", "skipped", "failed", "unsupported", "cancelled")
         },
+        "limit_items": max(0, int(limit_items)),
         "processing_time_seconds": max(0.0, float(elapsed)),
         "items": [
             {
@@ -620,12 +671,13 @@ def _write_metadata(
         context_carry_over=bool(spec.context_carry_over),
         source_root=str(source_root) if source_root is not None else None,
         processing_time_seconds=max(0.0, float(elapsed)),
+        batch_limit_items=spec.output.limit_items,
     )
     if builder.data is not None:
         builder.data.update(explicit_metadata)
     builder.write(target)
     if spec.output.kind == "batch" and target.name.casefold() == "metadata.json":
-        _write_batch_summary(run_dir, items, elapsed)
+        _write_batch_summary(run_dir, items, elapsed, spec.output.limit_items)
     return target
 
 
@@ -1462,6 +1514,7 @@ def _process_item(
         )
         for source_position, segment in enumerate(sources):
             _check_cancel(cancel)
+            emitter.start_segment(total_sources)
             record: dict[str, Any] = {
                 "index": segment.index,
                 "start_s": trim_offset + segment.start_s,
@@ -1501,6 +1554,13 @@ def _process_item(
                         f"Rejected clip {segment.index}: {', '.join(reasons)}",
                         "warning",
                         "fitness",
+                    )
+                    emitter.finish_segment(
+                        entry.tracker_index,
+                        entry.result_index,
+                        segment.index,
+                        total_sources,
+                        f"Rejected clip {segment.index}/{total_sources}",
                     )
                     continue
             emitter.progress(
@@ -1550,6 +1610,14 @@ def _process_item(
             ]
             if not local_cues and final_text and segment.duration_s > 0:
                 local_cues = [Segment(0.0, segment.duration_s, _finalize_cue_text(spec, raw_caption_text))]
+            if segment.duration_s > 0:
+                local_cues = clamp_segments_to_window(
+                    local_cues,
+                    0.0,
+                    segment.duration_s,
+                )
+            else:
+                local_cues = []
             cue_offset = trim_offset + segment.start_s
             combined_cues.extend(
                 Segment(cue_offset + cue.start_s, cue_offset + cue.end_s, cue.text)
@@ -1598,6 +1666,13 @@ def _process_item(
             )
             accepted.append(record)
             previous_final_text = final_text
+            emitter.finish_segment(
+                entry.tracker_index,
+                entry.result_index,
+                segment.index,
+                total_sources,
+                f"Captioned clip {segment.index}/{total_sources}",
+            )
 
         done_records = [record for record in accepted if record.get("status") == "done"]
         if not done_records:
@@ -1702,6 +1777,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         else:
             _probe_and_classify(spec, resolved, model)
             _apply_batch_skip(spec, resolved)
+            _apply_batch_limit(spec, resolved)
 
         actionable: list[_ResolvedInput] = []
         for entry in resolved:
@@ -1915,8 +1991,30 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         _assign_single_outputs(run_dir, expanded)
     else:
         _assign_batch_outputs(spec, expanded)
+    pre_results: list[ItemResult] = []
+    partition_entries = expanded
+    if spec.output.kind == "batch" and spec.output.limit_items > 0:
+        try:
+            limit_model = MODEL_SPECS[variant_to_family(spec.model.variant_key)]
+            _probe_and_classify(spec, expanded, limit_model)
+        except KeyError:
+            pass
+        _apply_batch_skip(spec, expanded)
+        _apply_batch_limit(spec, expanded)
+        pre_results = [
+            ItemResult(
+                entry.result_index,
+                str(entry.path or entry.item.path),
+                entry.kind,
+                entry.status,
+                entry.message,
+            )
+            for entry in expanded
+            if entry.status != "pending"
+        ]
+        partition_entries = [entry for entry in expanded if entry.status == "pending"]
     gpu_indices = tuple(spec.runtime.gpu_indices)
-    partitions = _round_robin_partitions(expanded, len(gpu_indices))
+    partitions = _round_robin_partitions(partition_entries, len(gpu_indices))
     messages: Queue[tuple[int, str, Any]] = Queue()
     workers: dict[int, WorkerProcess] = {}
     threads: list[threading.Thread] = []
@@ -1982,7 +2080,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         )
         threads.append(thread)
         thread.start()
-    result_items: list[ItemResult] = []
+    result_items: list[ItemResult] = list(pre_results)
     failures: dict[int, str] = {}
     finished: set[int] = set()
     cancel_sent_at: float | None = None

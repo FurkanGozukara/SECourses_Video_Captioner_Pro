@@ -16,6 +16,9 @@ def test_app_settings_unicode_round_trip_and_corrupt_fallback(tmp_path: Path) ->
         "models_dir": tmp_path / "mödels",
         "save_processed_files": True,
         "scan_subfolders": True,
+        "desktop_notification_on_finish": True,
+        "play_sound_on_finish": True,
+        "open_output_folder_on_single_finish": True,
     }
 
     assert save_app_settings(values, settings_path) == normalize_path(settings_path)
@@ -26,6 +29,9 @@ def test_app_settings_unicode_round_trip_and_corrupt_fallback(tmp_path: Path) ->
         "models_dir": str(normalize_path(values["models_dir"])),
         "save_processed_files": True,
         "scan_subfolders": True,
+        "desktop_notification_on_finish": True,
+        "play_sound_on_finish": True,
+        "open_output_folder_on_single_finish": True,
     }
     assert not list(settings_path.parent.glob("*.tmp"))
 

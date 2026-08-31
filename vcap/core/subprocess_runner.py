@@ -80,6 +80,22 @@ def build_child_env(
                 env.pop(str(key), None)
             else:
                 env[str(key)] = str(value)
+    if os.name == "nt":
+        for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            value = env.get(key)
+            if value is None:
+                continue
+            tokens = [
+                token.strip()
+                for token in value.split(",")
+                if token.strip()
+                and token.replace(" ", "").casefold()
+                != "expandable_segments:true"
+            ]
+            if tokens:
+                env[key] = ",".join(tokens)
+            else:
+                env.pop(key, None)
     return env
 
 

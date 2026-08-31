@@ -44,3 +44,5 @@ Hands-on verification of every feature area of SECourses Video Captioner Pro aga
 - The Gradio dropdown option list fades out slowly after a selection (cosmetic, Gradio 6 behaviour).
 - TimeChat timestamps inside very short clips can exceed the clip length (model behaviour); SRT cues are offset per clip but not clamped.
 - BF16 Qwen3-Omni (63 GB) is not runnable on a single 32 GB GPU and remains unmeasured.
+
+Superseded by QA_VERIFICATION_v1.2.0.md after the Hugging Face upload completed; the empty-folder limitation is resolved.

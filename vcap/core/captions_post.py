@@ -202,6 +202,45 @@ def _segments(values: Iterable[Segment | Sequence[Any]]) -> list[Segment]:
     return result
 
 
+def clamp_segments_to_window(
+    values: Iterable[Segment | Sequence[Any]],
+    start_s: float,
+    end_s: float,
+    *,
+    min_duration_s: float = 0.5,
+) -> list[Segment]:
+    """Clamp subtitle cues to one clip window and discard impossible cues."""
+
+    window_start = float(start_s)
+    window_end = float(end_s)
+    minimum = max(0.0, float(min_duration_s))
+    if window_end <= window_start:
+        return []
+    result: list[Segment] = []
+    for value in values:
+        if isinstance(value, Segment):
+            segment = value
+        else:
+            if len(value) < 3:
+                continue
+            segment = Segment(float(value[0]), float(value[1]), str(value[2]))
+        if (
+            segment.start_s >= window_end
+            or segment.end_s < window_start
+            or (segment.end_s == window_start and segment.start_s < window_start)
+        ):
+            continue
+        cue_start = max(window_start, segment.start_s)
+        cue_end = min(window_end, segment.end_s)
+        if cue_end <= cue_start:
+            repaired_end = cue_start + minimum
+            if minimum <= 0 or repaired_end > window_end:
+                continue
+            cue_end = repaired_end
+        result.append(Segment(cue_start, cue_end, segment.text))
+    return result
+
+
 def to_srt(segments: Iterable[Segment | Sequence[Any]]) -> str:
     """Serialize timestamped segments as SubRip UTF-8 text."""
 
@@ -324,6 +363,7 @@ __all__ = [
     "Segment",
     "apply_replacements",
     "caption_stats",
+    "clamp_segments_to_window",
     "diff_html",
     "finalize_caption",
     "format_replace_pairs",

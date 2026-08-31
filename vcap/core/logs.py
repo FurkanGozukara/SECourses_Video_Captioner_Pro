@@ -100,6 +100,7 @@ class AppLog:
             self._lines: deque[tuple[int, str]] = deque(maxlen=5000)
             self._revision = 0
             self._files: dict[Path, TextIO] = {}
+            self._file_last_messages: dict[Path, str] = {}
             self._initialized = True
 
     @property
@@ -134,9 +135,13 @@ class AppLog:
                     console_progress.log(line)
                 stale: list[Path] = []
                 for path, handle in self._files.items():
+                    persisted_message = line.split("] ", 1)[-1]
+                    if self._file_last_messages.get(path) == persisted_message:
+                        continue
                     try:
                         handle.write(line + "\n")
                         handle.flush()
+                        self._file_last_messages[path] = persisted_message
                     except (OSError, ValueError):
                         stale.append(path)
                 for path in stale:
@@ -173,11 +178,21 @@ class AppLog:
             if target in self._files:
                 return target
             target.parent.mkdir(parents=True, exist_ok=True)
+            last_message = ""
+            try:
+                lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+                if lines:
+                    last_message = lines[-1].split("] ", 1)[-1]
+            except OSError:
+                pass
             self._files[target] = target.open("a", encoding="utf-8", newline="\n")
+            if last_message:
+                self._file_last_messages[target] = last_message
         return target
 
     def _close_attached(self, target: Path) -> None:
         handle = self._files.pop(target, None)
+        self._file_last_messages.pop(target, None)
         if handle is not None:
             try:
                 handle.close()

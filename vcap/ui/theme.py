@@ -325,6 +325,53 @@ HOTKEYS_HEAD = r"""
   }
   window.__secoursesApplyThemeMode = applyThemeMode;
 
+  let completionAudioContext = null;
+  function prepareCompletionSound() {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return null;
+    try {
+      if (!completionAudioContext) completionAudioContext = new AudioContext();
+    } catch (_error) {
+      return null;
+    }
+    if (completionAudioContext.state === 'suspended') {
+      completionAudioContext.resume().catch(function () {});
+    }
+    return completionAudioContext;
+  }
+  function playCompletionSound() {
+    const context = prepareCompletionSound();
+    if (!context) return;
+    const now = context.currentTime + 0.02;
+    [[523.25, 0], [659.25, 0.16]].forEach(function (tone) {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const start = now + tone[1];
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(tone[0], start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.12, start + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.22);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.start(start);
+      oscillator.stop(start + 0.23);
+    });
+  }
+  window.__vcapPrepareCompletionSound = prepareCompletionSound;
+  const primeCompletionSound = function () { prepareCompletionSound(); };
+  document.addEventListener('pointerdown', primeCompletionSound, {once: true, passive: true});
+  document.addEventListener('keydown', primeCompletionSound, {once: true});
+  window.__vcapNotifyJobDone = function (message, desktopEnabled, soundEnabled) {
+    const text = String(message || 'Caption job finished');
+    if (desktopEnabled && 'Notification' in window && Notification.permission === 'granted') {
+      try {
+        new Notification('SECourses Video Captioner Pro', {body: text});
+      } catch (_error) {}
+    }
+    if (soundEnabled) playCompletionSound();
+  };
+
   function applyStoredTheme() {
     let stored = localStorage.getItem('secourses_theme_mode');
     if (stored !== 'dark' && stored !== 'light' && stored !== 'system') {

@@ -265,7 +265,7 @@ def test_downloader_verify_falls_back_to_local_presence(tmp_path: Path, monkeypa
         "load_remote_index",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             module.DownloadError(
-                "remote model folder MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/timechat_bf16 is not available yet"
+                "remote model folder MonsterMMORPG/Wan_GGUF/timechat_bf16 is not available yet"
             )
         ),
     )
@@ -276,5 +276,5 @@ def test_downloader_verify_falls_back_to_local_presence(tmp_path: Path, monkeypa
 
     assert module.verify_model(key, tmp_path, DummyDownloader()) is True
     output = capsys.readouterr().out
-    assert "Remote folder Video_Captioner_Pro/timechat_bf16 is not published yet" in output
+    assert "Remote folder timechat_bf16 is not published yet" in output
     assert "cannot be verified against published digests" in output

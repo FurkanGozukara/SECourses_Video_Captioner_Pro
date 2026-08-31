@@ -88,6 +88,13 @@ if TYPE_CHECKING:
 
 _INITIAL_VARIANT = "qwen3_omni_instruct_int8"
 _INITIAL_MODALITY = "video_audio"
+_PRIMARY_PROMPT_MODALITIES = {
+    "timechat": "video_audio",
+    "avocado": "video_audio",
+    "qwen3_omni_instruct": "video",
+    "qwen3_omni_thinking": "video",
+    "qwen3_omni_captioner": "audio",
+}
 _COMPILE_PROBE_CACHE = TEMP_DIR / "compile_probe.json"
 _COMPILE_PROBE_TTL_S = 24 * 60 * 60
 _COMPILE_PROBE_LOCK = threading.Lock()
@@ -177,6 +184,51 @@ def _prompt_choices(family: str, modality: str) -> list[tuple[str, str]]:
         (f"{preset.group} · {_display(preset.label)}", preset.id)
         for preset in list_presets(family, modality)
     ]
+
+
+def _resolve_prompt_preset(
+    variant_key: str,
+    modality: str,
+    current_preset_id: str | None,
+) -> tuple[str, list[tuple[str, str]], Any | None]:
+    """Resolve one compatible prompt selection for a model and modality."""
+
+    family = variant_to_family(variant_key)
+    presets = list_presets(family, modality)
+    choices = _prompt_choices(family, modality)
+    by_id = {preset.id: preset for preset in presets}
+    selected = by_id.get(str(current_preset_id or ""))
+    if selected is None:
+        try:
+            selected = by_id.get(default_preset_for(family, modality).id)
+        except KeyError:
+            selected = None
+        if selected is None:
+            selected = presets[0] if presets else None
+    return family, choices, selected
+
+
+def _effective_prompt_modality(
+    variant_key: str,
+    modality: str,
+    use_audio_in_video: bool,
+    *,
+    has_inputs: bool = True,
+) -> str:
+    """Match prompt filtering to the modality the pipeline will actually use."""
+
+    family = variant_to_family(variant_key)
+    if not has_inputs or not str(modality or "").strip() or modality == "unknown":
+        return _PRIMARY_PROMPT_MODALITIES[family]
+    if modality == "video_audio" and not use_audio_in_video:
+        return "video"
+    if modality == "video" and use_audio_in_video:
+        try:
+            if MODEL_SPECS[family].limits.requires_audio_track:
+                return "video_audio"
+        except KeyError:
+            pass
+    return modality
 
 
 def _prompt_variables(values: Iterable[Any]) -> dict[str, Any]:
@@ -413,6 +465,7 @@ class CaptionTabHandles:
     reasoning_tab: gr.Tab
     clips: gr.Gallery
     last_outputs_state: gr.State
+    job_done_hook: gr.HTML
 
 
 def build(ctx: "UiContext") -> CaptionTabHandles:
@@ -429,6 +482,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     detected_tier = auto_tier(gpu_total) if gpu_total else 32
     ctx.states["gpu_index_default"] = gpu_default
     ctx.states["gpu_index"] = gr.State(gpu_default)
+    prompt_context_state = gr.State([initial_family, _INITIAL_MODALITY])
 
     with gr.Row(equal_height=False):
         with gr.Column(scale=5, min_width=500):
@@ -1269,6 +1323,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 )
 
     last_outputs_state = gr.State({})
+    job_done_hook = gr.HTML("", visible=False, elem_id="vcap-job-done-hook")
     ctx.states["last_outputs"] = last_outputs_state
 
     handles = CaptionTabHandles(
@@ -1292,6 +1347,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         reasoning_tab=reasoning_tab,
         clips=clips,
         last_outputs_state=last_outputs_state,
+        job_done_hook=job_done_hook,
     )
     ctx.caption_handles = handles
 
@@ -1689,10 +1745,21 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         show_progress="hidden",
         api_visibility="private",
     )
+
+    def describe_prompt(
+        preset_id: str,
+        variant_key: str,
+        modality: str,
+        include_audio: bool,
+    ) -> tuple[str, list[str]]:
+        description = _display(get_preset(str(preset_id)).description) if preset_id else ""
+        effective_modality = _effective_prompt_modality(variant_key, modality, include_audio)
+        return description, [variant_to_family(variant_key), effective_modality]
+
     prompt_preset.change(
-        lambda preset_id: _display(get_preset(str(preset_id)).description) if preset_id else "",
-        inputs=prompt_preset,
-        outputs=prompt_description,
+        describe_prompt,
+        inputs=[prompt_preset, model_key, media.modality_state, use_audio],
+        outputs=[prompt_description, prompt_context_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -1707,32 +1774,91 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             api_visibility="private",
         )
 
-    def filter_prompts(variant_key: str, modality: str, *values: Any) -> tuple[Any, str, str, str]:
-        family = variant_to_family(variant_key)
-        choices = _prompt_choices(family, modality)
-        try:
-            preset = default_preset_for(family, modality)
-        except KeyError:
-            presets = list_presets(family, modality)
-            if not presets:
-                return gr.update(choices=[], value=None), "<span class='vc-warn'>No compatible task preset for this model and modality.</span>", "", ""
-            preset = presets[0]
-        system, user = render_prompt(preset, _prompt_variables(values))
-        return gr.update(choices=choices, value=preset.id), _display(preset.description), system or "", user
+    def sync_prompt_context(
+        variant_key: str,
+        modality: str,
+        include_audio: bool,
+        selected_inputs: list[str] | None,
+        current_preset_id: str,
+        previous_context: list[str] | tuple[str, str] | None,
+        *values: Any,
+    ) -> tuple[Any, str, Any, Any, list[str]]:
+        effective_modality = _effective_prompt_modality(
+            variant_key,
+            modality,
+            include_audio,
+            has_inputs=bool(selected_inputs),
+        )
+        family, choices, preset = _resolve_prompt_preset(
+            variant_key,
+            effective_modality,
+            current_preset_id,
+        )
+        context = [family, effective_modality]
+        if preset is None:
+            return (
+                gr.update(choices=[], value=None),
+                "<span class='vc-warn'>No compatible task preset for this model and modality.</span>",
+                "",
+                "",
+                context,
+            )
+        same_context = list(previous_context or []) == context
+        if same_context and preset.id == str(current_preset_id or ""):
+            system: Any = gr.skip()
+            user: Any = gr.skip()
+        else:
+            rendered_system, rendered_user = render_prompt(preset, _prompt_variables(values))
+            system = rendered_system or ""
+            user = rendered_user
+        return (
+            gr.update(choices=choices, value=preset.id),
+            _display(preset.description),
+            system,
+            user,
+            context,
+        )
 
+    prompt_sync_inputs = [
+        model_key,
+        media.modality_state,
+        use_audio,
+        media.resolved_state,
+        prompt_preset,
+        prompt_context_state,
+        *variable_components,
+    ]
+    prompt_sync_outputs = [
+        prompt_preset,
+        prompt_description,
+        system_prompt,
+        user_prompt,
+        prompt_context_state,
+    ]
     model_key.input(
-        filter_prompts,
-        inputs=[model_key, media.modality_state, *variable_components],
-        outputs=[prompt_preset, prompt_description, system_prompt, user_prompt],
+        sync_prompt_context,
+        inputs=prompt_sync_inputs,
+        outputs=prompt_sync_outputs,
         queue=False,
+        trigger_mode="always_last",
         show_progress="hidden",
         api_visibility="private",
     )
     media.modality_state.change(
-        filter_prompts,
-        inputs=[model_key, media.modality_state, *variable_components],
-        outputs=[prompt_preset, prompt_description, system_prompt, user_prompt],
+        sync_prompt_context,
+        inputs=prompt_sync_inputs,
+        outputs=prompt_sync_outputs,
         queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    use_audio.change(
+        sync_prompt_context,
+        inputs=prompt_sync_inputs,
+        outputs=prompt_sync_outputs,
+        queue=False,
+        trigger_mode="always_last",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2031,6 +2157,53 @@ def _result_summary(result: JobResult) -> tuple[str, str, str, str]:
     )
 
 
+def _job_done_message(result: JobResult) -> str:
+    """Build the concise browser notification for a terminal caption job."""
+
+    counts = result.counts
+    done = int(counts.get("done", 0))
+    failed = int(counts.get("failed", 0)) + int(counts.get("unsupported", 0))
+    cancelled = int(counts.get("cancelled", 0))
+    if cancelled:
+        return f"Job cancelled: {done} done, {failed} failed"
+    if not done and failed:
+        return f"Job failed: {done} done, {failed} failed"
+    return f"Caption job finished: {done} done, {failed} failed"
+
+
+def _job_done_payload(message: str, settings: dict[str, Any]) -> str:
+    """Serialize one completion hook payload without firing it on page load."""
+
+    return json.dumps(
+        {
+            "message": message,
+            "desktop": bool(settings.get("desktop_notification_on_finish", False)),
+            "sound": bool(settings.get("play_sound_on_finish", False)),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _should_auto_open_output(
+    result: JobResult,
+    items: list[InputItem],
+    output_kind: str,
+    enabled: bool,
+) -> bool:
+    """Return whether a successful single-file run should reveal its folder."""
+
+    counts = result.counts
+    return (
+        bool(enabled)
+        and output_kind == "single"
+        and len(items) == 1
+        and bool(items[0].path)
+        and int(counts.get("done", 0)) >= 1
+        and int(counts.get("failed", 0)) == 0
+        and int(counts.get("cancelled", 0)) == 0
+    )
+
+
 def wire(ctx: "UiContext") -> None:
     """Wire registry-wide start/cancel/preset-safe events after every tab is built."""
 
@@ -2052,6 +2225,7 @@ def wire(ctx: "UiContext") -> None:
         handles.reasoning_tab,
         handles.clips,
         handles.last_outputs_state,
+        handles.job_done_hook,
         handles.cancel,
     ]
 
@@ -2060,6 +2234,7 @@ def wire(ctx: "UiContext") -> None:
         settings = registry.values_to_dict(args[:value_count])
         resolved = [str(value) for value in (args[value_count] or [])]
         input_mode = str(args[value_count + 1] or "upload")
+        input_modality = str(args[value_count + 2] or "unknown")
         token = CancelToken()
         ctx.activate_cancel(token)
         ctx.states["caption_job_token"] = token
@@ -2075,6 +2250,7 @@ def wire(ctx: "UiContext") -> None:
                     "**Speed:** —",
                     [],
                     *[gr.skip() for _ in range(7)],
+                    "",
                     gr.update(value="⏹ Cancel", interactive=False),
                 )
                 ctx.clear_active_cancel(token)
@@ -2082,6 +2258,42 @@ def wire(ctx: "UiContext") -> None:
                     ctx.states["caption_job_token"] = None
                 return
             items = [InputItem(path="", kind="text", text_prompt_only=True, text=str(settings.get("user_prompt") or ""))]
+
+        prompt_modality = (
+            "text"
+            if items[0].text_prompt_only
+            else _effective_prompt_modality(
+                str(settings.get("model_key", _INITIAL_VARIANT)),
+                input_modality,
+                bool(settings.get("use_audio_in_video", True)),
+            )
+        )
+        _, _, resolved_prompt = _resolve_prompt_preset(
+            str(settings.get("model_key", _INITIAL_VARIANT)),
+            prompt_modality,
+            str(settings.get("prompt_preset_id") or ""),
+        )
+        if (
+            resolved_prompt is not None
+            and resolved_prompt.id != str(settings.get("prompt_preset_id") or "")
+        ):
+            settings["prompt_preset_id"] = resolved_prompt.id
+            prompt_values = (
+                settings.get("trigger_word"),
+                settings.get("language"),
+                settings.get("source_language"),
+                settings.get("target_language"),
+                settings.get("caption_length"),
+                settings.get("avoid_list"),
+                settings.get("subject_class"),
+                settings.get("extra_instructions"),
+            )
+            rendered_system, rendered_user = render_prompt(
+                resolved_prompt,
+                _prompt_variables(prompt_values),
+            )
+            settings["system_prompt"] = rendered_system or ""
+            settings["user_prompt"] = rendered_user
 
         segment_mode = str(settings.get("segment_mode") or "whole")
         if segment_mode == "scenes" and not bool(settings.get("scene_detect_enabled")):
@@ -2103,6 +2315,7 @@ def wire(ctx: "UiContext") -> None:
             "save_processed_files": bool(settings.get("save_processed_files", False)),
             "save_clips": bool(settings.get("save_clips", False)),
             "recursive": bool(settings["recursive"]),
+            "limit_items": max(0, int(settings.get("batch_limit_items", 0) or 0)),
         }
         if output_kind == "batch" and str(settings.get("batch_input_folder") or "").strip():
             output_kwargs["source_root"] = str(normalize_path(settings["batch_input_folder"]))
@@ -2168,6 +2381,7 @@ def wire(ctx: "UiContext") -> None:
             gr.update(visible=False),
             [],
             {},
+            "",
             gr.update(value="⏹ Cancel", interactive=True),
         )
         finished = False
@@ -2242,7 +2456,7 @@ def wire(ctx: "UiContext") -> None:
                     f"**ETA:** {last_eta}",
                     f"**Speed:** {last_speed}",
                     item_rows,
-                    *[gr.skip() for _ in range(8)],
+                    *[gr.skip() for _ in range(9)],
                 )
             thread.join()
             if "error" in terminal:
@@ -2250,6 +2464,15 @@ def wire(ctx: "UiContext") -> None:
             result: JobResult = terminal["result"]
             final_caption, structured, srt_text, reasoning_text, gallery, state = _result_payload(result)
             terminal_label, message, status_class, eta_text = _result_summary(result)
+            if _should_auto_open_output(
+                result,
+                items,
+                output_kind,
+                bool(settings.get("open_output_folder_on_single_finish", False)),
+            ):
+                opened, open_message = open_in_file_manager(result.run_dir)
+                if not opened:
+                    ctx.app_log.warn(open_message, scope="outputs")
             yield (
                 render_progress_html(1, terminal_label, message),
                 f"<span class='{status_class}'>**Status:** {html.escape(message)}</span>",
@@ -2263,6 +2486,7 @@ def wire(ctx: "UiContext") -> None:
                 gr.update(visible=bool(reasoning_text)),
                 gallery,
                 state,
+                _job_done_payload(_job_done_message(result), settings),
                 gr.update(value="⏹ Cancel", interactive=False),
             )
         except (CancelledError, KeyboardInterrupt) as exc:
@@ -2273,7 +2497,9 @@ def wire(ctx: "UiContext") -> None:
                 "**ETA:** cancelled",
                 f"**Speed:** {last_speed}",
                 item_rows,
-                *[gr.skip() for _ in range(7)],
+                *[gr.skip() for _ in range(6)],
+                gr.skip(),
+                _job_done_payload("Job cancelled", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
             )
         except BaseException as exc:
@@ -2285,6 +2511,7 @@ def wire(ctx: "UiContext") -> None:
                 f"**Speed:** {last_speed}",
                 item_rows,
                 *[gr.skip() for _ in range(7)],
+                _job_done_payload("Job failed", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
             )
         finally:
@@ -2292,8 +2519,13 @@ def wire(ctx: "UiContext") -> None:
             if ctx.states.get("caption_job_token") is token:
                 ctx.states["caption_job_token"] = None
 
-    run_inputs = [*registry_components, handles.media.resolved_state, handles.media.mode_state]
-    handles.start.click(
+    run_inputs = [
+        *registry_components,
+        handles.media.resolved_state,
+        handles.media.mode_state,
+        handles.media.modality_state,
+    ]
+    start_event = handles.start.click(
         run_caption,
         inputs=run_inputs,
         outputs=output_components,
@@ -2304,7 +2536,7 @@ def wire(ctx: "UiContext") -> None:
         show_progress="hidden",
         api_visibility="public",
     )
-    handles.hotkey_start.click(
+    hotkey_start_event = handles.hotkey_start.click(
         run_caption,
         inputs=run_inputs,
         outputs=output_components,
@@ -2313,6 +2545,29 @@ def wire(ctx: "UiContext") -> None:
         show_progress="hidden",
         api_visibility="private",
     )
+    notify_js = """
+    (payload) => {
+      if (!payload) return [];
+      let data = payload;
+      if (typeof payload === 'string') {
+        try { data = JSON.parse(payload); } catch (_error) { return []; }
+      }
+      if (data && data.message && window.__vcapNotifyJobDone) {
+        window.__vcapNotifyJobDone(data.message, Boolean(data.desktop), Boolean(data.sound));
+      }
+      return [];
+    }
+    """
+    for event in (start_event, hotkey_start_event):
+        event.then(
+            fn=None,
+            inputs=handles.job_done_hook,
+            outputs=[],
+            js=notify_js,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     def cancel_job() -> tuple[Any, str]:
         token = ctx.states.get("caption_job_token")

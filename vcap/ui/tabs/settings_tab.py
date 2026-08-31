@@ -115,6 +115,45 @@ def build(ctx: "UiContext") -> None:
                 description="Default recursive folder scanning preference.",
                 kind="bool",
             )
+            desktop_notification = gr.Checkbox(
+                value=bool(persisted.get("desktop_notification_on_finish", False)),
+                label="Desktop notification when a job finishes",
+            )
+            ctx.reg(
+                "desktop_notification_on_finish",
+                desktop_notification,
+                bool(persisted.get("desktop_notification_on_finish", False)),
+                section="global",
+                description="Show a browser desktop notification after caption jobs finish.",
+                kind="bool",
+                in_preset=False,
+            )
+            completion_sound = gr.Checkbox(
+                value=bool(persisted.get("play_sound_on_finish", False)),
+                label="Play sound when a job finishes",
+            )
+            ctx.reg(
+                "play_sound_on_finish",
+                completion_sound,
+                bool(persisted.get("play_sound_on_finish", False)),
+                section="global",
+                description="Play a browser-generated chime after caption jobs finish.",
+                kind="bool",
+                in_preset=False,
+            )
+            open_output_on_finish = gr.Checkbox(
+                value=bool(persisted.get("open_output_folder_on_single_finish", False)),
+                label="Open output folder when a single job finishes",
+            )
+            ctx.reg(
+                "open_output_folder_on_single_finish",
+                open_output_on_finish,
+                bool(persisted.get("open_output_folder_on_single_finish", False)),
+                section="global",
+                description="Open the run folder after a successful single-file caption job.",
+                kind="bool",
+                in_preset=False,
+            )
             gr.Markdown(
                 "**Telemetry-free.** Captioning, presets, logs, and model checks stay on this machine. "
                 "Gradio analytics are disabled by the application entry point.",
@@ -140,6 +179,9 @@ def build(ctx: "UiContext") -> None:
         models_value: str,
         save_files: bool,
         recursive: bool,
+        notify_desktop: bool,
+        play_sound: bool,
+        open_single_output: bool,
     ) -> tuple[Any, ...]:
         try:
             if not all(str(value or "").strip() for value in (outputs_value, temp_value, models_value)):
@@ -155,6 +197,9 @@ def build(ctx: "UiContext") -> None:
                     "models_dir": normalized_models,
                     "save_processed_files": bool(save_files),
                     "scan_subfolders": bool(recursive),
+                    "desktop_notification_on_finish": bool(notify_desktop),
+                    "play_sound_on_finish": bool(play_sound),
+                    "open_output_folder_on_single_finish": bool(open_single_output),
                 },
                 APP_SETTINGS_PATH,
             )
@@ -175,7 +220,16 @@ def build(ctx: "UiContext") -> None:
 
     save_global.click(
         save_globals,
-        inputs=[outputs_dir, temp_dir, models_dir, save_processed, scan_subfolders],
+        inputs=[
+            outputs_dir,
+            temp_dir,
+            models_dir,
+            save_processed,
+            scan_subfolders,
+            desktop_notification,
+            completion_sound,
+            open_output_on_finish,
+        ],
         outputs=[outputs_dir, temp_dir, models_dir, save_status],
         queue=False,
         show_progress="hidden",
@@ -187,6 +241,30 @@ def build(ctx: "UiContext") -> None:
         inputs=theme_mode,
         outputs=[],
         js=THEME_CHANGE_JS,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    desktop_notification.input(
+        fn=None,
+        inputs=desktop_notification,
+        outputs=[],
+        js=(
+            "(enabled) => { if (enabled && 'Notification' in window "
+            "&& Notification.permission === 'default') Notification.requestPermission(); return []; }"
+        ),
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    completion_sound.input(
+        fn=None,
+        inputs=completion_sound,
+        outputs=[],
+        js=(
+            "(enabled) => { if (enabled && window.__vcapPrepareCompletionSound) "
+            "window.__vcapPrepareCompletionSound(); return []; }"
+        ),
         queue=False,
         show_progress="hidden",
         api_visibility="private",

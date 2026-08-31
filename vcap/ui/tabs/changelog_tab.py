@@ -12,6 +12,26 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.2.0",
+        "2026-09-01",
+        """
+### Verified downloads and workflow polish
+
+- Repair fresh-install model downloads by using the uploaded folders at the `MonsterMMORPG/Wan_GGUF` repository root, probing the alternate prefixed layout, and verifying every file by size and SHA-256. A live clean download of TimeChat INT4 sustained up to 178 MB/s, passed verification, loaded, and completed a caption.
+- Add `MonsterMMORPG/Wan_GGUF` as a fallback mirror for Qwen3-Omni GGUF files, normalize mirrored files into the expected flat layout, and preserve resume and cancellation support.
+- Check free disk space before Hugging Face and GGUF downloads with 5% headroom, and report clear `VCAP_STATUS` errors before transfer begins.
+- Keep the task preset, rendered prompts, and description synchronized when model variants change, including family changes and the no-input state.
+- Keep scanned source paths authoritative for batch jobs and mirror nested Unicode source folders into the selected batch output folder.
+- Clamp SRT and WebVTT cues to each clip's real time window while preserving a minimum cue duration.
+- Add per-segment ETA to single-file jobs, remove the repeated `ETA:` prefix, and deduplicate consecutive `run_log.txt` lines.
+- Add optional desktop completion notifications and a chime, optional automatic opening of the output folder after single-file jobs, and a batch `Limit items` dry-run control.
+- Preview word-replacement chips immediately while typing.
+- Remove the unsupported `expandable_segments` allocator flag on Windows and strip it automatically from child-worker environments.
+- Restore compile mode and recursive batch scanning through Recover Settings without unknown-key warnings.
+- Complete end-to-end Chrome verification on an RTX 5090 across every model family and quantization path, including all six Qwen3 GGUF Q4/Q8 variants (121 GB downloaded) and 63.4 GB Qwen3 BF16 checkpoints under automatic CPU offload.
+""".strip(),
+    ),
+    (
         "v1.1.0",
         "2026-08-31",
         """

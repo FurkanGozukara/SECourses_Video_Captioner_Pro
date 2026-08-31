@@ -4,6 +4,9 @@ import json
 import sys
 import time
 
+import pytest
+
+import vcap.core.subprocess_runner as subprocess_runner
 from vcap.core.subprocess_runner import CancelToken, WorkerProcess, build_child_env, iter_json_lines
 
 
@@ -55,3 +58,19 @@ def test_kill_tree_and_cancel_token(tmp_path) -> None:
     assert token.is_cancelled() and not token.is_armed()
     token.reset()
     assert not token.is_cancelled()
+
+
+def test_windows_child_env_removes_expandable_segments_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subprocess_runner.os, "name", "nt")
+    monkeypatch.setenv(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,garbage_collection_threshold:0.8",
+    )
+    env = build_child_env(
+        extra={"PYTORCH_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True"}
+    )
+
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "garbage_collection_threshold:0.8"
+    assert env["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:512"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import gradio as gr
 import pytest
@@ -11,8 +12,16 @@ from vcap.core.logs import get_log
 from vcap.core.presets import PresetStore
 from vcap.core.registry import SettingsRegistry
 from vcap.pipeline.client import PipelineClient
+from vcap.pipeline.job import InputItem, JobResult, JobSpec, OutputSpec
+from vcap.pipeline.runner import (
+    _apply_batch_limit,
+    _assign_batch_outputs,
+    _resolve_inputs,
+    _write_batch_summary,
+)
+from vcap.prompts.presets import TEMPLATE_VARIABLES, render_prompt
 from vcap.ui.app import UiContext
-from vcap.ui.components import _folder_scan
+from vcap.ui.components import _folder_scan, _resolved_after_preview_edit
 from vcap.ui.tabs import caption_tab
 
 
@@ -43,6 +52,169 @@ def test_folder_scan_counts_mirrored_output_sidecars(tmp_path: Path) -> None:
     assert selected == [str(source / "nested" / "clip.mp4")]
     assert "1 already captioned in output folder" in summary
     assert "will be skipped" in summary
+    _, limited_summary = _folder_scan(str(source), True, str(output), False, 2)
+    assert "limiting to first 2" in limited_summary
+
+
+def test_folder_preview_edit_never_replaces_scanned_source_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "nested" / "clip.mp4"
+    cached = tmp_path / "gradio" / "hash" / "clip.mp4"
+    uploaded = tmp_path / "gradio" / "original" / "clip.mp4"
+    source.parent.mkdir(parents=True)
+    cached.parent.mkdir(parents=True)
+    uploaded.parent.mkdir(parents=True)
+    source.write_bytes(b"")
+    cached.write_bytes(b"")
+    uploaded.write_bytes(b"")
+    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "gradio"))
+
+    assert _resolved_after_preview_edit(str(cached), [str(source)], "folder") == [str(source)]
+    assert _resolved_after_preview_edit(str(cached), [str(source)], "upload") == [str(source)]
+    assert _resolved_after_preview_edit(str(cached), [str(uploaded)], "upload") == [str(cached)]
+
+
+def test_nested_unicode_batch_output_is_mirrored_from_source_root(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    nested = source / "g\u00f6lge_\u0432\u0438\u0434\u0435\u043e"
+    media = nested / "clip.mp4"
+    output = tmp_path / "captions"
+    nested.mkdir(parents=True)
+    media.write_bytes(b"")
+    spec = JobSpec(
+        inputs=[InputItem(media)],
+        output=OutputSpec(
+            kind="batch",
+            batch_output_dir=output,
+            source_root=source,
+            recursive=True,
+        ),
+    )
+
+    resolved = _resolve_inputs(spec)
+    _assign_batch_outputs(spec, resolved)
+
+    assert resolved[0].path == media
+    assert resolved[0].out_dir == output / nested.name
+
+
+def test_batch_limit_applies_after_existing_caption_skips() -> None:
+    entries = [
+        SimpleNamespace(status="skipped", message="already captioned"),
+        SimpleNamespace(status="pending", message=""),
+        SimpleNamespace(status="pending", message=""),
+        SimpleNamespace(status="pending", message=""),
+    ]
+    spec = JobSpec(output=OutputSpec(kind="batch", limit_items=2))
+
+    _apply_batch_limit(spec, entries)
+
+    assert [entry.status for entry in entries] == [
+        "skipped",
+        "pending",
+        "pending",
+        "skipped",
+    ]
+    assert "limit of 2" in entries[-1].message
+
+
+def test_batch_summary_records_dry_run_limit(tmp_path: Path) -> None:
+    summary_path = _write_batch_summary(tmp_path, [], 1.25, limit_items=3)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["limit_items"] == 3
+
+
+def test_prompt_resolution_keeps_valid_presets_and_replaces_invalid_ones() -> None:
+    family, choices, preset = caption_tab._resolve_prompt_preset(
+        "avocado_int8",
+        "video_audio",
+        "timechat_flatten_wan",
+    )
+    assert family == "avocado"
+    assert preset is not None and preset.id == "avocado_av_aligned"
+    assert preset.id in {key for _, key in choices}
+
+    _, _, shared = caption_tab._resolve_prompt_preset(
+        "qwen3_omni_instruct_int4",
+        "video_audio",
+        "wan22_t2v_dense",
+    )
+    assert shared is not None and shared.id == "wan22_t2v_dense"
+    assert (
+        caption_tab._effective_prompt_modality(
+            "qwen3_omni_instruct_int4",
+            "video_audio",
+            False,
+        )
+        == "video"
+    )
+    assert (
+        caption_tab._effective_prompt_modality(
+            "timechat_int4",
+            "video",
+            True,
+        )
+        == "video_audio"
+    )
+
+
+def test_model_change_without_inputs_uses_family_default_prompt() -> None:
+    cases = {
+        "timechat_int4": ("video_audio", "timechat_flatten_wan"),
+        "avocado_int8": ("video_audio", "avocado_av_aligned"),
+        "qwen3_omni_instruct_int4": ("video", "wan22_t2v_dense"),
+        "qwen3_omni_thinking_int8": ("video", "wan22_t2v_dense"),
+        "qwen3_omni_captioner_int4": ("audio", "qwen3_captioner_promptfree"),
+    }
+    variables = {name: data["default"] for name, data in TEMPLATE_VARIABLES.items()}
+
+    for variant_key, (expected_modality, expected_preset) in cases.items():
+        modality = caption_tab._effective_prompt_modality(
+            variant_key,
+            "video_audio",
+            False,
+            has_inputs=False,
+        )
+        _, choices, preset = caption_tab._resolve_prompt_preset(
+            variant_key,
+            modality,
+            "incompatible_previous_family_preset",
+        )
+
+        assert modality == expected_modality
+        assert choices
+        assert preset is not None and preset.id == expected_preset
+        rendered_user = render_prompt(preset, variables)[1]
+        if variant_key.startswith("qwen3_omni_captioner"):
+            assert rendered_user == ""
+        else:
+            assert rendered_user.strip()
+
+
+def test_job_done_messages_cover_success_failure_and_cancel() -> None:
+    success = JobResult([], {"done": 5, "failed": 0}, "run", "metadata", 1.0)
+    failed = JobResult([], {"done": 0, "failed": 1}, "run", "metadata", 1.0)
+    cancelled = JobResult([], {"done": 2, "cancelled": 1}, "run", "metadata", 1.0)
+
+    assert caption_tab._job_done_message(success) == "Caption job finished: 5 done, 0 failed"
+    assert caption_tab._job_done_message(failed) == "Job failed: 0 done, 1 failed"
+    assert caption_tab._job_done_message(cancelled) == "Job cancelled: 2 done, 0 failed"
+    payload = json.loads(
+        caption_tab._job_done_payload(
+            "done",
+            {
+                "desktop_notification_on_finish": True,
+                "play_sound_on_finish": False,
+            },
+        )
+    )
+    assert payload == {"message": "done", "desktop": True, "sound": False}
+    one_file = [InputItem("clip.mp4")]
+    assert caption_tab._should_auto_open_output(success, one_file, "single", True)
+    assert not caption_tab._should_auto_open_output(failed, one_file, "single", True)
+    assert not caption_tab._should_auto_open_output(success, one_file, "batch", True)
 
 
 def test_compile_probe_refreshes_stale_cache_without_blocking(
@@ -88,10 +260,24 @@ def test_caption_tab_action_button_hues_are_distinct() -> None:
         assert entries["gpu_indices"].kind == "list"
         assert entries["gpu_indices"].in_preset is False
         assert entries["gpu_indices"].in_metadata is True
+        assert entries["batch_limit_items"].default == 0
+        assert entries["batch_limit_items"].kind == "int"
         assert entries["trigger_mode"].default == "none"
         assert entries["save_reasoning"].default is True
         assert entries["context_carry_over"].default is False
         config = demo.get_config_file()
+        replacement = next(
+            component
+            for component in config["components"]
+            if component.get("props", {}).get("label") == "Word replacements"
+        )
+        replacement_events = {
+            event
+            for dependency in config["dependencies"]
+            for component_id, event in dependency.get("targets", [])
+            if component_id == replacement["id"]
+        }
+        assert {"input", "change"} <= replacement_events
         cancel_components = [
             component
             for component in config["components"]

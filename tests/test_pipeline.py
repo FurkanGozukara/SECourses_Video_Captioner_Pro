@@ -229,6 +229,71 @@ def test_per_item_error_continues(tmp_path: Path, fake_model: list[str]) -> None
     assert "RuntimeError" in failed.traceback_tail
 
 
+def test_batch_limit_counts_only_items_without_existing_captions(
+    tmp_path: Path,
+    fake_model: list[str],
+) -> None:
+    source = tmp_path / "inputs"
+    output_dir = tmp_path / "captions"
+    source.mkdir()
+    output_dir.mkdir()
+    paths = []
+    for name in ("clip1.txt", "clip2.txt", "clip3.txt", "clip4.txt"):
+        path = source / name
+        path.write_text(name, encoding="utf-8")
+        paths.append(InputItem(path))
+    (output_dir / "clip1.txt").write_text("existing", encoding="utf-8")
+    spec = JobSpec.from_settings(
+        _settings(overwrite_existing=False, batch_limit_items=2),
+        paths,
+        OutputSpec(
+            kind="batch",
+            outputs_root=tmp_path / "runs",
+            batch_output_dir=output_dir,
+            source_root=source,
+            limit_items=2,
+        ),
+    )
+
+    result = run_job(spec, RecordingSink(), CancelToken())
+
+    assert result.counts["done"] == 2
+    assert result.counts["skipped"] == 2
+    assert fake_model == ["clip2.txt", "clip3.txt"]
+    summary = json.loads(Path(result.run_dir, "summary.json").read_text(encoding="utf-8"))
+    assert summary["limit_items"] == 2
+    metadata = json.loads(Path(result.metadata_path).read_text(encoding="utf-8"))
+    assert metadata["batch_limit_items"] == 2
+
+
+def test_batch_sidecar_mirrors_nested_unicode_source_path(
+    tmp_path: Path,
+    fake_model: list[str],
+) -> None:
+    source = tmp_path / "source"
+    nested = source / "g\u00f6lge_\u0432\u0438\u0434\u0435\u043e"
+    media = nested / "clip.txt"
+    output_dir = tmp_path / "captions"
+    nested.mkdir(parents=True)
+    media.write_text("source", encoding="utf-8")
+    spec = JobSpec.from_settings(
+        _settings(),
+        [InputItem(media)],
+        OutputSpec(
+            kind="batch",
+            outputs_root=tmp_path / "runs",
+            batch_output_dir=output_dir,
+            source_root=source,
+        ),
+    )
+
+    result = run_job(spec, RecordingSink(), CancelToken())
+
+    assert result.items[0].path == str(media)
+    assert Path(result.items[0].outputs["txt"]) == output_dir / nested.name / "clip.txt"
+    assert (output_dir / nested.name / "clip.txt").is_file()
+
+
 def test_scene_split_captions_and_combined_srt_offsets(
     tmp_path: Path, fake_model: list[str]
 ) -> None:

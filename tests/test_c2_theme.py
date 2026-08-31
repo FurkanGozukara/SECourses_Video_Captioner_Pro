@@ -12,6 +12,10 @@ def test_head_script_has_dark_default_and_three_mode_theme_logic() -> None:
     assert "url.searchParams.set('__theme', effective)" in HOTKEYS_HEAD
     assert "document.body.classList.toggle('dark', effective === 'dark')" in HOTKEYS_HEAD
     assert "['dark', 'light', 'system']" in THEME_CHANGE_JS
+    assert "window.__vcapNotifyJobDone" in HOTKEYS_HEAD
+    assert "SECourses Video Captioner Pro" in HOTKEYS_HEAD
+    assert "new Notification" in HOTKEYS_HEAD
+    assert "createOscillator" in HOTKEYS_HEAD
 
 
 def test_hotkeys_are_scoped_and_editor_save_allows_textarea_focus() -> None:
@@ -39,4 +43,3 @@ def test_light_mode_css_covers_native_controls_log_tabs_and_focus() -> None:
     assert "body:not(.dark) #vc-main-tabs > .tab-wrapper > .tab-container" in css
     assert "body:not(.dark) .vcap-replace-arrow" in css
     assert "body:not(.dark) .vc-btn:focus-visible" in css
-

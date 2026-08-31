@@ -43,6 +43,10 @@ _OPTIONAL_PATH_KEYS = {
     "batch_output_folder",
 }
 _GPU_KEYS = {"gpu_index", "gpu_indices"}
+_RECOVERY_KEY_MAP = {
+    "compile_mode": "torch_compile_mode",
+    "recursive": "batch_recursive",
+}
 
 
 def recent_metadata_paths(outputs_dir: str | Path, limit: int = 40) -> list[Path]:
@@ -97,6 +101,21 @@ def extract_metadata_settings(metadata: Mapping[str, Any]) -> dict[str, Any]:
     return settings
 
 
+def _map_recovery_keys(
+    settings: Mapping[str, Any],
+    registry: "SettingsRegistry",
+) -> dict[str, Any]:
+    """Map runtime metadata aliases back to their registered UI controls."""
+
+    mapped = dict(settings)
+    registered = set(registry.keys())
+    for stored_key, ui_key in _RECOVERY_KEY_MAP.items():
+        if stored_key in mapped and stored_key not in registered and ui_key in registered:
+            mapped.setdefault(ui_key, mapped[stored_key])
+            del mapped[stored_key]
+    return mapped
+
+
 def present_recovery_settings(
     metadata: str | Path | Mapping[str, Any],
     registry: "SettingsRegistry",
@@ -130,7 +149,7 @@ def _recovery_settings_details(
     """Return selected values, coercion warnings, and explicitly skipped keys."""
 
     document = _metadata_document(metadata)
-    source = extract_metadata_settings(document)
+    source = _map_recovery_keys(extract_metadata_settings(document), registry)
     coerced, warnings = registry.coerce(source)
     allowed = {
         entry.key
@@ -201,7 +220,7 @@ def build_recovery_diff_table(
     """Build a pure key/saved/current/difference table for tests and UI styling."""
 
     document = _metadata_document(metadata)
-    raw_saved = extract_metadata_settings(document)
+    raw_saved = _map_recovery_keys(extract_metadata_settings(document), registry)
     saved, _ = registry.coerce(raw_saved)
     if current_values is None:
         current = registry.defaults()

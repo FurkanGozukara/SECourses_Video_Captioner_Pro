@@ -1,6 +1,6 @@
 # Benchmarks
 
-Updated: 2026-08-31
+Updated: 2026-09-01
 
 ## Test system and method
 
@@ -80,3 +80,31 @@ These are the automatic production choices encoded in `vcap/models/vram_presets.
 - [Quantization verification and quality](QUANT_REPORT.md)
 - [Qwen3-Omni ConvRot performance](QUANT_PERF.md)
 - [Qwen3-Omni GGUF backend](GGUF_BACKEND.md)
+
+## v1.2.0 live matrix (2026-09-01)
+
+These end-to-end application runs used physical GPU 0, an NVIDIA GeForce RTX 5090, and were driven through Google Chrome. Times include model loading unless the result states otherwise. Generation stopped at EOS except where noted. This newer availability matrix supersedes the earlier "not downloaded" annotations above.
+
+| Variant | Input | Result |
+|---|---|---|
+| `timechat_bf16` | 20 s video | 1,119 tokens at 33.7 tok/s; peak 16.7 GiB |
+| `timechat_int8` | 20 s video, scene split into 5 clips | About 26 tok/s; SRT, clips, and sidecars verified |
+| `timechat_int4` | 20 s video after a fresh-install download | About 25 tok/s |
+| `avocado_bf16` | 20 s video, whole-file mode | 249 tokens at 30 tok/s |
+| `avocado_int8` | 20 s video, whole-file mode | 330 tokens at 22 tok/s |
+| `avocado_int4` | Video trimmed to 5-15 s and split into 3 clips | About 25 tok/s; trim preserved in metadata and timestamps |
+| `qwen3_omni_instruct_bf16` (63.4 GB) | Image | Loaded through Accelerate CPU offload in 97.5 s; peak 51.6 GiB with WDDM spill; 0.42 tok/s; stopped at the configured length cap |
+| `qwen3_omni_instruct_int8` | Image | 234 tokens at 4.3 tok/s; peak 30.2 GiB |
+| `qwen3_omni_instruct_int4` | Unicode mixed batch: 2 videos, image, and WAV in a subfolder; sidecar excluded | 4/4 completed in 100.7 s with per-modality prompt adaptation; rerun skipped all 4 in 0.09 s |
+| `qwen3_omni_instruct_gguf_q4` | 20 s video split into 5 clips | 30.6 s total; about 270 tok/s decode |
+| `qwen3_omni_instruct_gguf_q8` | 20 s video, whole-file mode | Server completed in 15.5 s; peak 28.0 GiB; 9.6 tok/s |
+| `qwen3_omni_thinking_int8` | Image | 497 tokens at 4.6 tok/s; separate reasoning file verified |
+| `qwen3_omni_thinking_int4` | Image | 725 tokens at 12.4 tok/s; 2.4 KB reasoning file |
+| `qwen3_omni_thinking_gguf_q4` | 20 s video | 784 tokens at 163 tok/s; reasoning verified |
+| `qwen3_omni_thinking_gguf_q8` | 20 s video | 1,281 tokens at 26.5 tok/s; reasoning verified |
+| `qwen3_omni_captioner_bf16` (63.4 GB) | 15 s MP3 | EOS after more than 450 tokens at about 0.5 tok/s; 1,347.7 s total including the CPU-offload load; audio tower functional under CPU offload |
+| `qwen3_omni_captioner_int8` | 15 s MP3 | 492 tokens at 4.5 tok/s |
+| `qwen3_omni_captioner_int4` | 15 s MP3 with prefix, suffix, replacement, and all 5 output formats | TXT, JSON, JSONL, SRT, and VTT verified with post-processing applied |
+| `qwen3_omni_captioner_gguf_q4` | 15 s MP3 | 447 tokens at 300 tok/s |
+| `qwen3_omni_captioner_gguf_q8` | 15 s MP3 | 481 tokens at 41.5 tok/s |
+| `qwen3_omni_thinking_bf16` | Not run | Skipped because it uses the same proven 63.4 GB loader/offload path as Instruct BF16, while its reasoning path was covered by INT4, INT8, and both GGUF variants |

@@ -17,7 +17,7 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Chat through the shared resident worker with streamed Qwen3-Omni multimodal multi-turn history or single-turn TimeChat/AVoCaDO video Q&A, then save the conversation as JSON and Markdown.
 - Use protected shipped presets, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
 - Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention and offload plans, recover from supported OOM cases, inspect live VRAM/RAM and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
-- Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and six Qwen3-Omni GGUF variants with resumable progress; GGUF runs through a private `llama-server` backend.
+- Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server`, while 63.4 GB Qwen3 BF16 checkpoints can use automatic CPU offload on smaller GPUs.
 
 ## Requirements
 
@@ -147,7 +147,7 @@ Sizes are decimal GB from the produced/downloaded folders. GGUF totals include t
 | Qwen3-Omni 30B-A3B Thinking | Video, video+audio, audio, image, text; separate reasoning output | `qwen3_omni_thinking_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_thinking_int8` — INT8 ConvRot — 33.031 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_thinking_int4` — INT4 ConvRot W4A8 — 17.780 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_thinking_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_thinking_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 | Qwen3-Omni 30B-A3B Captioner | One audio file, prompt-free; up to 30 seconds | `qwen3_omni_captioner_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_captioner_int8` — INT8 ConvRot — 33.041 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_captioner_int4` — INT4 ConvRot W4A8 — 17.790 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_captioner_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_captioner_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 
-Qwen3 BF16: 63.4 GB — does not fit a single 32 GB GPU; skipped (text-only logits reference was measured with CPU offload).
+Qwen3 BF16 checkpoints are 63.4 GB and do not fit wholly in 32 GB VRAM. Automatic CPU offload was verified with Instruct and Captioner on an RTX 5090, at substantially lower throughput than resident variants.
 
 ## Model Credits and Licenses
 
