@@ -157,3 +157,19 @@ checkpoint: staging the prefill-only towers prevents pathological WDDM paging bu
 adds load/prefill transfer time. Further gains would require a fused attention
 projection/attention stack beyond QKV fusion, a paged KV cache, or a runtime designed
 for batched MoE inference rather than more expert-loop work.
+
+## C6 EOS benchmark addendum
+
+The post-EOS-fix benchmark used the application's production 32 GB profile on the
+20 s lightning video, with Thinking enabled, sampling defaults, and a 2,048-token
+ceiling. Each value is a three-generation mean; all six generations stopped at EOS.
+
+| Thinking variant | Load s | Peak GiB | Prefill tok/s | Decode tok/s | Generated tokens | Wall s/clip |
+|---|---:|---:|---:|---:|---:|---:|
+| INT8 ConvRot | 34.85 | 33.07 | 90.41 | 3.90 | 577.7 | 211.86 |
+| INT4 ConvRot W4A8 | 21.17 | 18.87 | 4,451.80 | 6.97 | 525.7 | 80.61 |
+
+Both variants used Flash Attention 2 and the profile's 42 GPU layers. INT8 paged
+under WDDM at a 33.07 GiB allocator high-water mark; INT4 avoided that pressure and
+completed a real clip 2.63x faster. Raw per-run results are in
+`tools/bench/results/c6_qwen3_thinking_{int8,int4}.json`.

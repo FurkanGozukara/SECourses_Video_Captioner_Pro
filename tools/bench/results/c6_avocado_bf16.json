@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-08-31T15:13:57.839838+03:00",
+  "summary": {
+    "variant": "avocado_bf16",
+    "checkpoint_gb": 17.863790832,
+    "load_s": 24.207583100069314,
+    "peak_vram_gib": 20.45356845855713,
+    "prefill_tok_s_mean": 6554.052276708069,
+    "decode_tok_s_mean": 36.03000454949118,
+    "generated_tokens_mean": 272,
+    "wall_clock_s_mean": 13.895151766676767,
+    "finish_reason": "eos",
+    "caption_preview": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headli",
+    "runs": 3
+  },
+  "configuration": {
+    "variant": "avocado_bf16",
+    "family": "avocado",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 3,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "all",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": false
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 2048,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 256,
+      "sampling_strategy": "fps",
+      "max_pixels": 401408,
+      "min_pixels": 100352,
+      "use_audio_in_video": true,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 24.207583100069314,
+    "peak_vram_gb": 16.693537712097168,
+    "checkpoint_bytes": 17863790832,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 0,
+    "bf16_layers": 618,
+    "compile_mode": "eager",
+    "warnings": []
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 10196,
+      "generated_tokens": 272,
+      "finish_reason": "eos",
+      "prefill_s": 2.0893799000186846,
+      "decode_s": 7.530533000011928,
+      "prefill_tok_s": 4879.916763777052,
+      "decode_tok_s": 35.98682855510636,
+      "generation_s": 9.619912900030613,
+      "wall_clock_s": 14.680340299964882,
+      "peak_vram_gib": 20.453484535217285,
+      "caption_chars": 1387,
+      "caption_preview": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headli",
+      "caption": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headlights and taillights move through the intersection, their lights creating streaks of white and red. In the distance, a tall, thin tower with red lights at its peak stands out against the dark sky. The audio is filled with the powerful and immersive sounds of a thunderstorm. It begins with the low, continuous rumble of distant thunder, creating a sense of anticipation. The sky suddenly illuminates with a bright, flashes of lightning, briefly lighting up the entire scene before fading back to darkness. This is soon overlaid with the sharp, crackling sound of lightning striking, which echoes and reverberates with a deep, resonant boom. The rain is visible, creating wet, reflective surfaces on the road where the lights from the cars and street lamps are distorted into shimmering pools of color. The thunder continues to rumble and roll in the background, a constant and powerful presence, punctuated by the steady, pattering sound of rain falling. The cars continue to drive through the intersection, their headlights cutting through the dark, rainy atmosphere. The camera remains stationary throughout the clip, maintaining its high-angle perspective on the wet, dark city street.",
+      "reasoning_chars": 0,
+      "warnings": []
+    },
+    {
+      "run": 2,
+      "seed": 1235,
+      "prompt_tokens": 10196,
+      "generated_tokens": 272,
+      "finish_reason": "eos",
+      "prefill_s": 1.3566483999602497,
+      "decode_s": 7.52706960006617,
+      "prefill_tok_s": 7515.580308279395,
+      "decode_tok_s": 36.00338702828225,
+      "generation_s": 8.88371800002642,
+      "wall_clock_s": 13.520810700021684,
+      "peak_vram_gib": 20.45356845855713,
+      "caption_chars": 1387,
+      "caption_preview": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headli",
+      "caption": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headlights and taillights move through the intersection, their lights creating streaks of white and red. In the distance, a tall, thin tower with red lights at its peak stands out against the dark sky. The audio is filled with the powerful and immersive sounds of a thunderstorm. It begins with the low, continuous rumble of distant thunder, creating a sense of anticipation. The sky suddenly illuminates with a bright, flashes of lightning, briefly lighting up the entire scene before fading back to darkness. This is soon overlaid with the sharp, crackling sound of lightning striking, which echoes and reverberates with a deep, resonant boom. The rain is visible, creating wet, reflective surfaces on the road where the lights from the cars and street lamps are distorted into shimmering pools of color. The thunder continues to rumble and roll in the background, a constant and powerful presence, punctuated by the steady, pattering sound of rain falling. The cars continue to drive through the intersection, their headlights cutting through the dark, rainy atmosphere. The camera remains stationary throughout the clip, maintaining its high-angle perspective on the wet, dark city street.",
+      "reasoning_chars": 0,
+      "warnings": []
+    },
+    {
+      "run": 3,
+      "seed": 1236,
+      "prompt_tokens": 10196,
+      "generated_tokens": 272,
+      "finish_reason": "eos",
+      "prefill_s": 1.4031206000363454,
+      "decode_s": 7.5069671999663115,
+      "prefill_tok_s": 7266.65975806776,
+      "decode_tok_s": 36.09979806508495,
+      "generation_s": 8.910087800002657,
+      "wall_clock_s": 13.484304300043732,
+      "peak_vram_gib": 20.45356845855713,
+      "caption_chars": 1387,
+      "caption_preview": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headli",
+      "caption": "A static, high-angle shot captures a dark city intersection at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights dotting the landscape. Cars with headlights and taillights move through the intersection, their lights creating streaks of white and red. In the distance, a tall, thin tower with red lights at its peak stands out against the dark sky. The audio is filled with the powerful and immersive sounds of a thunderstorm. It begins with the low, continuous rumble of distant thunder, creating a sense of anticipation. The sky suddenly illuminates with a bright, flashes of lightning, briefly lighting up the entire scene before fading back to darkness. This is soon overlaid with the sharp, crackling sound of lightning striking, which echoes and reverberates with a deep, resonant boom. The rain is visible, creating wet, reflective surfaces on the road where the lights from the cars and street lamps are distorted into shimmering pools of color. The thunder continues to rumble and roll in the background, a constant and powerful presence, punctuated by the steady, pattering sound of rain falling. The cars continue to drive through the intersection, their headlights cutting through the dark, rainy atmosphere. The camera remains stationary throughout the clip, maintaining its high-angle perspective on the wet, dark city street.",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

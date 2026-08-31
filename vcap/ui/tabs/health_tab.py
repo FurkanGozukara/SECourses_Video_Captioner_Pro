@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import importlib.metadata
 import importlib.util
 import os
@@ -13,8 +14,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import gradio as gr
 
@@ -23,15 +25,18 @@ from vcap.core.media import find_ffmpeg
 from vcap.core.paths import open_in_file_manager
 from vcap.core.subprocess_runner import build_child_env, kill_process_tree
 from vcap.models.attention import probe_available
-from vcap.models.downloads import ensure_model
+from vcap.models.downloads import _parse_status, ensure_model, format_status_line
+from vcap.models.llamacpp_install import describe_runtime, ensure_llamacpp
 from vcap.models.registry import (
     MODEL_SPECS,
     all_variant_choices,
+    get_variant,
     resolve_model_dir,
     variant_is_ready,
     variant_size_gb,
 )
-from vcap.ui.components import action_button
+from vcap.models.torch_compile import clear_inductor_caches, probe_compile_environment
+from vcap.ui.components import action_button, render_progress_html
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
@@ -180,6 +185,173 @@ def _find_downloader(ctx: "UiContext") -> Path | None:
     return next((path.resolve(strict=False) for path in candidates if path is not None and path.is_file()), None)
 
 
+def selected_model_action_key(value: Any) -> str:
+    """Validate the dropdown value received by a model action click."""
+
+    key = str(value or "").strip()
+    if not key:
+        raise ValueError("Choose a model variant first")
+    get_variant(key)
+    return key
+
+
+def _selected_status(key: str, message: str) -> str:
+    return f"Selected: {html.escape(key)}  \n{message}"
+
+
+def _cancelled(token: object | None) -> bool:
+    if token is None:
+        return False
+    for name in ("is_cancelled", "is_set"):
+        method = getattr(token, name, None)
+        if callable(method):
+            try:
+                return bool(method())
+            except Exception:
+                return False
+    return bool(getattr(token, "cancelled", False))
+
+
+def _callback(callback: Any, message: str, payload: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    for args in ((message, payload), (payload,), (message,)):
+        try:
+            callback(*args)
+            return
+        except TypeError:
+            continue
+
+
+def verify_local_files(
+    checks: Sequence[tuple[Path, int | None, str | None]],
+    progress_cb: Any = None,
+    cancel: object | None = None,
+) -> tuple[bool, str]:
+    """Verify local file sizes and SHA-256 values with five-second progress."""
+
+    normalized: list[tuple[Path, int, str | None]] = []
+    for path, expected_size, expected_sha in checks:
+        candidate = Path(path)
+        if not candidate.is_file():
+            return False, f"missing {candidate.name}"
+        actual_size = candidate.stat().st_size
+        if expected_size is not None and actual_size != int(expected_size):
+            return False, f"{candidate.name} has {actual_size} bytes; expected {int(expected_size)}"
+        normalized.append((candidate, actual_size, expected_sha))
+    total = sum(size for _, size, _ in normalized)
+    aggregate_done = 0
+    _callback(
+        progress_cb,
+        f"Verifying {len(normalized)} local file(s)",
+        {"state": "verifying", "fraction": 0.0, "bytes_done": 0, "bytes_total": total},
+    )
+    for path, size, expected_sha in normalized:
+        digest = hashlib.sha256()
+        file_done = 0
+        last_report = time.monotonic()
+        with path.open("rb") as handle:
+            while True:
+                if _cancelled(cancel):
+                    return False, "verification cancelled"
+                chunk = handle.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                file_done += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 5.0:
+                    done = aggregate_done + file_done
+                    _callback(
+                        progress_cb,
+                        f"Verifying {path.name}: {file_done * 100.0 / max(size, 1):.1f}%",
+                        {
+                            "state": "verifying",
+                            "fraction": done / max(total, 1),
+                            "bytes_done": done,
+                            "bytes_total": total,
+                        },
+                    )
+                    last_report = now
+        actual_sha = digest.hexdigest().casefold()
+        expected = str(expected_sha or "").removeprefix("sha256:").casefold()
+        if expected and actual_sha != expected:
+            return False, f"SHA-256 mismatch for {path.name}: got {actual_sha}, expected {expected}"
+        aggregate_done += size
+        _callback(
+            progress_cb,
+            f"Verified {path.name}",
+            {
+                "state": "verifying",
+                "fraction": aggregate_done / max(total, 1),
+                "bytes_done": aggregate_done,
+                "bytes_total": total,
+            },
+        )
+    return True, f"{len(normalized)} file(s), {total} bytes, size and SHA-256 verified"
+
+
+def verify_local_gguf(
+    variant_key: str,
+    progress_cb: Any = None,
+    cancel: object | None = None,
+) -> tuple[bool, str]:
+    """Verify one registered GGUF variant without invoking the HF downloader."""
+
+    variant = get_variant(variant_key)
+    if variant.backend != "llamacpp" or not variant.gguf_files:
+        raise ValueError(f"{variant_key} is not a registered GGUF variant")
+    sizes = variant.gguf_file_sizes or ()
+    hashes = variant.gguf_sha256 or ()
+    folder = resolve_model_dir(variant.key)
+    checks = [
+        (
+            folder / name,
+            sizes[index] if index < len(sizes) else None,
+            hashes[index] if index < len(hashes) else None,
+        )
+        for index, name in enumerate(variant.gguf_files)
+    ]
+    return verify_local_files(checks, progress_cb, cancel)
+
+
+def _gguf_readiness() -> str:
+    lines = []
+    for spec in MODEL_SPECS.values():
+        for variant in spec.variants:
+            if variant.backend != "llamacpp":
+                continue
+            ready, detail = variant_is_ready(variant.key)
+            lines.append(f"- `{variant.key}`: **{'ready' if ready else 'not ready'}** ({html.escape(detail)})")
+    return "\n".join(lines) or "No GGUF variants are registered."
+
+
+def _runtime_report() -> str:
+    runtime = describe_runtime()
+    version = str(runtime.get("version_output") or "not runnable").splitlines()[0]
+    return (
+        f"**Pinned:** `{runtime['pinned_tag']}` (minimum `b{runtime['minimum_build']}`)  \n"
+        f"**Install:** `{runtime['install_path']}`  \n"
+        f"**llama-server:** {'found and runnable' if runtime['runs'] else 'missing or not runnable'}  \n"
+        f"**Version:** {html.escape(version)}  \n"
+        f"**CUDA build:** {'yes' if runtime['cuda_build'] else 'no'}\n\n"
+        f"**GGUF readiness**\n{_gguf_readiness()}"
+    )
+
+
+def _compile_report(force: bool = False) -> str:
+    report = probe_compile_environment(force=force)
+    compiler = report.msvc_version or report.gcc_version or "not found"
+    notes = " | ".join(report.messages[-3:]) if report.messages else "No probe warnings."
+    return (
+        f"**Readiness:** `{report.inductor_ready}`  \n"
+        f"**C++ toolchain:** {html.escape(compiler)}  \n"
+        f"**Triton:** {'ready' if report.triton_ok else 'not ready'}"
+        + (f" (`{report.triton_version}`)" if report.triton_version else "")
+        + f"  \n{html.escape(notes)}"
+    )
+
+
 def build(ctx: "UiContext") -> None:
     """Render live health information and streaming model actions."""
 
@@ -206,6 +378,24 @@ def build(ctx: "UiContext") -> None:
             gpu_default = int(ctx.states.get("gpu_index_default", 0) or 0)
             meter = gr.HTML(gpu.render_resource_meter_html(gpu.resource_snapshot(gpu_default)))
 
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=6, min_width=520):
+            gr.Markdown("### llama.cpp runtime")
+            runtime_status = gr.Markdown(_runtime_report(), elem_classes=["vc-status"])
+            with gr.Row(elem_classes=["vc-compact-row"]):
+                install_runtime = action_button("Install / repair llama.cpp", "emerald", size="md")
+                refresh_runtime = action_button("Refresh", "amber", size="md")
+            runtime_progress = gr.HTML(render_progress_html(0.0, "Ready", "Runtime inspection complete."))
+            runtime_log = gr.Textbox(
+                value="", label="llama.cpp install log", lines=8, max_lines=12,
+                interactive=False, autoscroll=True, elem_classes=["vc-log"],
+            )
+
+        with gr.Column(scale=4, min_width=420):
+            gr.Markdown("### torch.compile toolchain")
+            compile_status = gr.Markdown(_compile_report(), elem_classes=["vc-status"])
+            clear_compile = action_button("Clear compile caches", "orange", size="md")
+
     gr.Markdown("### Models")
     initial_rows, initial_keys = model_inventory()
     model_table = gr.Dataframe(
@@ -228,6 +418,7 @@ def build(ctx: "UiContext") -> None:
         verify = action_button("🔍 Verify", "violet", size="md")
         open_models = action_button("Open models folder", "teal", size="md")
     model_status = gr.Markdown("Ready.", elem_classes=["vc-status"])
+    model_progress = gr.HTML(render_progress_html(0.0, "Ready", "Choose a model action."))
     download_log = gr.Textbox(
         value="", label="Model action log", lines=14, max_lines=18,
         interactive=False, autoscroll=True, elem_classes=["vc-log"],
@@ -253,6 +444,83 @@ def build(ctx: "UiContext") -> None:
         queue=False, show_progress="hidden", api_visibility="private",
     )
 
+    def install_runtime_handler():
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        terminal: dict[str, Any] = {}
+
+        def callback(message: Any, payload: Any = None) -> None:
+            events.put(("line", (str(message), dict(payload) if isinstance(payload, Mapping) else {})))
+
+        def work() -> None:
+            try:
+                terminal["path"] = ensure_llamacpp(progress_cb=callback)
+            except BaseException as exc:
+                terminal["error"] = exc
+            finally:
+                events.put(("terminal", None))
+
+        threading.Thread(target=work, daemon=True, name="vcap-llamacpp-install-ui").start()
+        lines = ["Starting llama.cpp install / repair"]
+        yield "\n".join(lines), render_progress_html(0.0, "Starting", lines[-1]), gr.skip()
+        while True:
+            kind, value = events.get()
+            if kind == "terminal":
+                break
+            message, payload = value
+            lines.append(message)
+            lines = lines[-300:]
+            fraction = payload.get("fraction")
+            yield (
+                "\n".join(lines),
+                render_progress_html(float(fraction or 0.0), "Installing llama.cpp", message),
+                gr.skip(),
+            )
+        if "error" in terminal:
+            message = str(terminal["error"])
+            lines.append(f"ERROR: {message}")
+            yield (
+                "\n".join(lines),
+                render_progress_html(0.0, "Failed", message),
+                f"<span class='vc-err'>{html.escape(message)}</span>\n\n{_runtime_report()}",
+            )
+            return
+        message = f"llama.cpp ready: {terminal['path']}"
+        lines.append(message)
+        yield "\n".join(lines), render_progress_html(1.0, "Ready", message), _runtime_report()
+
+    install_runtime.click(
+        install_runtime_handler,
+        outputs=[runtime_log, runtime_progress, runtime_status],
+        concurrency_id="llamacpp_install",
+        concurrency_limit=1,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    refresh_runtime.click(
+        _runtime_report,
+        outputs=runtime_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def clear_compile_handler() -> str:
+        result = clear_inductor_caches()
+        removed = len(result.get("removed") or [])
+        errors = result.get("errors") or []
+        message = f"Cleared {removed} compile cache path(s)."
+        if errors:
+            message += " " + " | ".join(str(value) for value in errors[:3])
+        return f"{_compile_report(force=True)}\n\n{html.escape(message)}"
+
+    clear_compile.click(
+        clear_compile_handler,
+        outputs=compile_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
     def select_model(evt: gr.SelectData) -> Any:
         row = int(evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index)
         _, keys = model_inventory()
@@ -262,17 +530,33 @@ def build(ctx: "UiContext") -> None:
         select_model, outputs=variant,
         queue=False, show_progress="hidden", api_visibility="private",
     )
+    variant.change(
+        lambda value: _selected_status(str(value or ""), "Ready for Download or Verify."),
+        inputs=variant,
+        outputs=model_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
 
     cancel_event = threading.Event()
+    cancel_armed = gr.State(0.0)
+    cancel_arm_timer = gr.Timer(1.0)
 
     def download_handler(key: str):
+        try:
+            key = selected_model_action_key(key)
+        except Exception as exc:
+            message = str(exc)
+            yield "", f"<span class='vc-err'>{html.escape(message)}</span>", gr.skip(), render_progress_html(0.0, "Failed", message)
+            return
         cancel_event.clear()
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         terminal: dict[str, Any] = {}
 
         def callback(message: Any, payload: Any = None) -> None:
-            del payload
-            events.put(("line", str(message)))
+            parsed = dict(payload) if isinstance(payload, Mapping) else {}
+            events.put(("line", (format_status_line(str(message), parsed), parsed)))
 
         def work() -> None:
             try:
@@ -283,50 +567,114 @@ def build(ctx: "UiContext") -> None:
                 events.put(("terminal", None))
 
         threading.Thread(target=work, daemon=True, name="vcap-model-download-ui").start()
-        lines = [f"Starting download for {key}"]
-        yield "\n".join(lines), f"Downloading `{key}`...", gr.skip()
+        lines = [f"Selected: {key}", f"Starting download for {key}"]
+        yield "\n".join(lines), _selected_status(key, "Downloading..."), gr.skip(), render_progress_html(0.0, "Starting", lines[-1])
         while True:
             kind, value = events.get()
             if kind == "terminal":
                 break
-            lines.append(str(value))
+            message, payload = value
+            lines.append(message)
             lines = lines[-500:]
-            yield "\n".join(lines), html.escape(str(value)), gr.skip()
+            fraction = payload.get("fraction")
+            state_name = str(payload.get("state") or "Downloading").replace("_", " ").title()
+            yield (
+                "\n".join(lines),
+                _selected_status(key, html.escape(message)),
+                gr.skip(),
+                render_progress_html(float(fraction or 0.0), state_name, message),
+            )
         if "error" in terminal:
             exc = terminal["error"]
             ctx.app_log.error(f"Model download failed: {exc}", scope="models")
-            yield "\n".join([*lines, f"ERROR: {exc}"]), f"<span class='vc-err'>{html.escape(str(exc))}</span>", model_inventory()[0]
+            yield "\n".join([*lines, f"ERROR: {exc}"]), _selected_status(key, f"<span class='vc-err'>{html.escape(str(exc))}</span>"), model_inventory()[0], render_progress_html(0.0, "Failed", str(exc))
             return
         ready, detail = terminal.get("result", (False, "No result"))
         message = f"{key}: {detail}"
-        yield "\n".join([*lines, message]), f"<span class='{'vc-ok' if ready else 'vc-err'}'>{html.escape(message)}</span>", model_inventory()[0]
+        yield "\n".join([*lines, message]), _selected_status(key, f"<span class='{'vc-ok' if ready else 'vc-err'}'>{html.escape(message)}</span>"), model_inventory()[0], render_progress_html(1.0 if ready else 0.0, "Ready" if ready else "Failed", message)
 
     download.click(
-        download_handler, inputs=variant, outputs=[download_log, model_status, model_table],
+        download_handler, inputs=variant, outputs=[download_log, model_status, model_table, model_progress],
         concurrency_id="model_download", concurrency_limit=1,
         show_progress="hidden", api_visibility="private",
     )
 
+    def cancel_handler(armed_at: float) -> tuple[Any, str, float]:
+        now = time.monotonic()
+        if armed_at and now - float(armed_at) <= 6.0:
+            cancel_event.set()
+            return gr.update(value="Cancel"), "Cancellation requested.", 0.0
+        return (
+            gr.update(value="Click again to confirm"),
+            "Click Cancel again within 6 seconds to stop the active model action.",
+            now,
+        )
+
     cancel.click(
-        lambda: (cancel_event.set(), "Cancellation requested.")[1], outputs=model_status,
-        queue=False, show_progress="hidden", api_visibility="private",
+        cancel_handler,
+        inputs=cancel_armed,
+        outputs=[cancel, model_status, cancel_armed],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def expire_cancel_handler(armed_at: float) -> tuple[Any, Any]:
+        if armed_at and time.monotonic() - float(armed_at) > 6.0:
+            return gr.update(value="Cancel"), 0.0
+        return gr.skip(), gr.skip()
+
+    cancel_arm_timer.tick(
+        expire_cancel_handler,
+        inputs=cancel_armed,
+        outputs=[cancel, cancel_armed],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
 
     def verify_handler(key: str):
+        try:
+            key = selected_model_action_key(key)
+        except Exception as exc:
+            message = str(exc)
+            yield "", f"<span class='vc-err'>{html.escape(message)}</span>", gr.skip(), render_progress_html(0.0, "Failed", message)
+            return
         cancel_event.clear()
+        selected_variant = get_variant(key)
         downloader = _find_downloader(ctx)
-        if downloader is None:
+        if selected_variant.backend != "llamacpp" and downloader is None:
             ready, detail = variant_is_ready(key)
-            yield f"Registry check only: {detail}", f"<span class='{'vc-ok' if ready else 'vc-err'}'>{html.escape(detail)}</span>", model_inventory()[0]
+            yield (
+                f"Registry check only: {detail}",
+                _selected_status(key, f"<span class='{'vc-ok' if ready else 'vc-err'}'>{html.escape(detail)}</span>"),
+                model_inventory()[0],
+                render_progress_html(1.0 if ready else 0.0, "Registry check", detail),
+            )
             return
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         terminal: dict[str, Any] = {}
 
         def work() -> None:
+            if selected_variant.backend == "llamacpp":
+                try:
+                    def callback(message: Any, payload: Any = None) -> None:
+                        parsed = dict(payload) if isinstance(payload, Mapping) else {}
+                        events.put(("line", (format_status_line(str(message), parsed), parsed)))
+
+                    terminal["local_result"] = verify_local_gguf(key, callback, cancel_event)
+                    if cancel_event.is_set():
+                        terminal["cancelled"] = True
+                except BaseException as exc:
+                    terminal["error"] = exc
+                finally:
+                    events.put(("terminal", None))
+                return
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             kwargs: dict[str, Any] = {} if os.name == "nt" else {"start_new_session": True}
             process: subprocess.Popen[str] | None = None
             try:
+                assert downloader is not None
                 process = subprocess.Popen(
                     [sys.executable, "-u", str(downloader), "--verify", key],
                     cwd=str(ctx.app_dir), env=build_child_env(),
@@ -364,7 +712,12 @@ def build(ctx: "UiContext") -> None:
                     if line is None:
                         break
                     if line.strip():
-                        events.put(("line", line.rstrip()))
+                        text = line.rstrip()
+                        parsed = _parse_status(text) or {}
+                        parsed_message = str(parsed.get("message") or "")
+                        if "cannot be verified against published digests" in parsed_message:
+                            terminal["verification_detail"] = parsed_message
+                        events.put(("line", (format_status_line(text, parsed), parsed)))
                 reader.join(timeout=2.0)
                 terminal["code"] = process.wait(timeout=10) if process.poll() is None else process.returncode
             except BaseException as exc:
@@ -375,32 +728,43 @@ def build(ctx: "UiContext") -> None:
                 events.put(("terminal", None))
 
         threading.Thread(target=work, daemon=True, name="vcap-model-verify-ui").start()
-        lines = [f"Verifying {key}"]
-        yield "\n".join(lines), f"Verifying `{key}`...", gr.skip()
+        lines = [f"Selected: {key}", f"Verifying {key}"]
+        yield "\n".join(lines), _selected_status(key, "Verifying..."), gr.skip(), render_progress_html(0.0, "Verifying", lines[-1])
         while True:
             kind, value = events.get()
             if kind == "terminal":
                 break
-            lines.append(str(value))
+            message, payload = value
+            lines.append(message)
             lines = lines[-500:]
-            yield "\n".join(lines), html.escape(str(value)), gr.skip()
+            fraction = payload.get("fraction")
+            yield (
+                "\n".join(lines),
+                _selected_status(key, html.escape(message)),
+                gr.skip(),
+                render_progress_html(float(fraction or 0.0), "Verifying", message),
+            )
         if terminal.get("cancelled"):
             message = "Model verification cancelled."
-            yield "\n".join([*lines, message]), message, model_inventory()[0]
+            yield "\n".join([*lines, message]), _selected_status(key, message), model_inventory()[0], render_progress_html(0.0, "Cancelled", message)
             return
         if "error" in terminal:
             message = str(terminal["error"])
-            yield "\n".join([*lines, f"ERROR: {message}"]), f"<span class='vc-err'>{html.escape(message)}</span>", model_inventory()[0]
+            yield "\n".join([*lines, f"ERROR: {message}"]), _selected_status(key, f"<span class='vc-err'>{html.escape(message)}</span>"), model_inventory()[0], render_progress_html(0.0, "Failed", message)
             return
-        ready, detail = variant_is_ready(key)
-        code = int(terminal.get("code") or 0)
-        ok = code == 0 and ready
+        if "local_result" in terminal:
+            ok, detail = terminal["local_result"]
+        else:
+            ready, registry_detail = variant_is_ready(key)
+            detail = str(terminal.get("verification_detail") or registry_detail)
+            code = int(terminal.get("code") or 0)
+            ok = code == 0 and ready
         message = f"Verification {'passed' if ok else 'failed'} for {key}: {detail}"
         ctx.app_log.log(message, scope="models")
-        yield "\n".join([*lines, message]), f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>", model_inventory()[0]
+        yield "\n".join([*lines, message]), _selected_status(key, f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"), model_inventory()[0], render_progress_html(1.0 if ok else 0.0, "Verified" if ok else "Failed", message)
 
     verify.click(
-        verify_handler, inputs=variant, outputs=[download_log, model_status, model_table],
+        verify_handler, inputs=variant, outputs=[download_log, model_status, model_table, model_progress],
         concurrency_id="model_download", concurrency_limit=1,
         show_progress="hidden", api_visibility="private",
     )
@@ -415,4 +779,11 @@ def build(ctx: "UiContext") -> None:
     )
 
 
-__all__ = ["build", "environment_report", "model_inventory"]
+__all__ = [
+    "build",
+    "environment_report",
+    "model_inventory",
+    "selected_model_action_key",
+    "verify_local_files",
+    "verify_local_gguf",
+]

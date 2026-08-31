@@ -29,10 +29,13 @@ def test_compile_probe_does_not_import_torch_in_parent_process() -> None:
     assert data["ready"] in {"full", "triton_only", "cudagraphs_only", "unavailable"}
 
 
-def test_compile_default_uses_direct_cuda_graphs() -> None:
-    from vcap.models.torch_compile import prepare_compile_env
+def test_compile_default_uses_inductor_when_available() -> None:
+    from vcap.models.torch_compile import DEFAULT_COMPILE_MODE, prepare_compile_env
 
     plan = prepare_compile_env(True)
+    assert plan.requested_mode == DEFAULT_COMPILE_MODE
     if plan.enabled:
-        assert plan.mode == "cudagraphs"
-        assert plan.torch_compile_kwargs["backend"] == "cudagraphs"
+        if plan.mode in {"full", "triton_only"}:
+            assert plan.torch_compile_kwargs["backend"] == "inductor"
+        else:
+            assert plan.mode == "cudagraphs"

@@ -85,7 +85,10 @@ def test_video_building_uses_bounded_frames_and_separate_audio(monkeypatch, tmp_
         lambda _path: SimpleNamespace(kind="video", duration=10.0, has_audio=True, has_video=True, error=None),
     )
 
+    frame_options = {}
+
     def fake_frames(_path, **kwargs):
+        frame_options.update(kwargs)
         count = kwargs["num_frames"]
         return VideoFrames(
             frames=np.zeros((count, 32, 32, 3), dtype=np.uint8),
@@ -103,13 +106,39 @@ def test_video_building_uses_bounded_frames_and_separate_audio(monkeypatch, tmp_
     )
     prepared = backend.build_messages(
         MediaInput(path=source),
-        pre=PreprocessParams(max_frames=16, max_pixels=32 * 32, min_pixels=32 * 32),
+        pre=PreprocessParams(
+            max_frames=16,
+            sampling_strategy="keyframe",
+            max_pixels=32 * 32,
+            min_pixels=32 * 32,
+        ),
     )
     types = [part["type"] for part in prepared.messages[-1]["content"]]
     assert types.count("image_url") == 8
     assert types.count("input_audio") == 1
     assert types[-1] == "text"
     assert prepared.warnings and "not interleaved" in prepared.warnings[0]
+    assert frame_options["sampling"] == "keyframe"
+    assert frame_options["target_fps"] == 2.0
+
+
+def test_captioner_gguf_ignores_supplied_prompt(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "clip.wav"
+    source.write_bytes(b"stub")
+    backend = _backend(tmp_path, "qwen3_omni_captioner")
+    monkeypatch.setattr(
+        "vcap.models.llamacpp_backend.probe_media",
+        lambda _path: SimpleNamespace(
+            kind="audio", duration=1.0, has_audio=True, has_video=False, error=None
+        ),
+    )
+    monkeypatch.setattr(
+        "vcap.models.llamacpp_backend.read_audio",
+        lambda _path: np.zeros(16_000, dtype=np.float32),
+    )
+    prepared = backend.build_messages(MediaInput(path=source, kind="audio"), "ignore me")
+    assert [part["type"] for part in prepared.messages[-1]["content"]] == ["input_audio"]
+    assert any("prompt-free; ignoring" in warning for warning in prepared.warnings)
 
 
 def test_sse_parser_and_mocked_streaming_response(monkeypatch, tmp_path: Path) -> None:

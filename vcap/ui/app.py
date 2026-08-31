@@ -36,6 +36,7 @@ from vcap.pipeline.client import PipelineClient
 from vcap.ui.components import PresetBarHandles, preset_bar, wire_preset_bar
 from vcap.ui.tabs import (
     caption_tab,
+    chat_tab,
     changelog_tab,
     dataset_tab,
     editor_tab,
@@ -66,6 +67,7 @@ class UiContext:
     states: dict[str, Any] = field(default_factory=dict)
     preset_handles: PresetBarHandles | None = None
     caption_handles: caption_tab.CaptionTabHandles | None = None
+    chat_handles: chat_tab.ChatTabHandles | None = None
     _active_cancel: CancelToken | None = field(default=None, repr=False)
     _runtime_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -171,6 +173,8 @@ def build_app() -> gr.Blocks:
         with gr.Tabs(selected="caption", elem_id="vc-main-tabs"):
             with gr.Tab("🎬 Caption", id="caption"):
                 caption_tab.build(context)
+            with gr.Tab("💬 Chat", id="chat"):
+                chat_tab.build(context)
             with gr.Tab("✏️ Caption Editor", id="editor"):
                 editor_tab.build(context)
             with gr.Tab("📦 Dataset & Export", id="dataset"):
@@ -185,18 +189,36 @@ def build_app() -> gr.Blocks:
                 changelog_tab.build(context)
 
         caption_tab.wire(context)
+        chat_tab.wire(context)
         wire_preset_bar(context, demo)
 
         theme_component = context.states["theme_component"]
+
+        def restore_theme_mode(mode: str) -> str:
+            return mode if mode in {"dark", "light", "system"} else "dark"
+
         demo.load(
-            fn=None,
+            fn=restore_theme_mode,
+            inputs=theme_component,
             outputs=theme_component,
-            js="() => [localStorage.getItem('secourses_theme_mode') === 'light' ? 'light' : 'dark']",
+            js=(
+                "() => { let mode = localStorage.getItem('secourses_theme_mode'); "
+                "if (!['dark','light','system'].includes(mode)) { mode = 'dark'; "
+                "localStorage.setItem('secourses_theme_mode', 'dark'); } return [mode]; }"
+            ),
             queue=False,
             show_progress="hidden",
             api_visibility="private",
         )
         context.states["scan_subfolders_component"].input(
+            lambda enabled: bool(enabled),
+            inputs=context.states["scan_subfolders_component"],
+            outputs=context.caption_handles.media.recursive,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+        demo.load(
             lambda enabled: bool(enabled),
             inputs=context.states["scan_subfolders_component"],
             outputs=context.caption_handles.media.recursive,

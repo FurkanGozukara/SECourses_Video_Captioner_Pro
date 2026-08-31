@@ -1,0 +1,861 @@
+"""Interactive multimodal conversation tab using the Caption model worker."""
+
+from __future__ import annotations
+
+import html
+import inspect
+import queue
+import re
+import threading
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+import gradio as gr
+
+from vcap.core.media import probe_media
+from vcap.core.paths import normalize_path
+from vcap.core.subprocess_runner import CancelToken, CancelledError
+from vcap.models.registry import MODEL_SPECS, variant_to_family
+from vcap.pipeline.chat import ChatRequest, ChatResponse, save_conversation
+from vcap.ui.components import action_button
+
+if TYPE_CHECKING:
+    from vcap.ui.app import UiContext
+
+
+_INITIAL_STATE = {
+    "messages": [],
+    "media": [],
+    "model_key": "",
+    "system_prompt": "",
+    "generation": {},
+    "last_result": {},
+}
+
+
+@dataclass
+class ChatTabHandles:
+    chatbot: gr.Chatbot
+    message: gr.Textbox
+    files: gr.File
+    path: gr.Textbox
+    attachment_status: gr.Markdown
+    model_note: gr.Markdown
+    reasoning: gr.Textbox
+    reasoning_accordion: gr.Accordion
+    status: gr.Markdown
+    tokens: gr.Markdown
+    send: gr.Button
+    stop: gr.Button
+    clear: gr.Button
+    copy_last: gr.Button
+    save: gr.Button
+    stop_timer: gr.Timer
+    conversation_state: gr.State
+    prompt_helper: gr.Dropdown
+    controls: dict[str, Any]
+
+
+def model_chat_support(variant_key: str) -> tuple[str, str]:
+    """Return the backend chat mode and its concise user-facing note."""
+
+    family = variant_to_family(str(variant_key))
+    if family in {"qwen3_omni_instruct", "qwen3_omni_thinking"}:
+        return (
+            "multi",
+            "<span class='vc-ok'>Multi-turn chat · video, audio, image, and text.</span>",
+        )
+    if family in {"timechat", "avocado"}:
+        return (
+            "single",
+            f"<span class='vc-warn'>{html.escape(MODEL_SPECS[family].label)} supports video-only, "
+            "single-turn Q&A. Each Send starts a fresh exchange.</span>",
+        )
+    return (
+        "unsupported",
+        "<span class='vc-err'>Qwen3-Omni Captioner has no chat mode. Pick Qwen3-Omni Instruct or Thinking.</span>",
+    )
+
+
+def _uploaded_paths(value: Any) -> list[str]:
+    values = value if isinstance(value, (list, tuple)) else ([] if value is None else [value])
+    result: list[str] = []
+    for item in values:
+        raw = getattr(item, "path", getattr(item, "name", item))
+        if raw:
+            result.append(str(raw))
+    return result
+
+
+def resolve_chat_attachments(files: Any, path_text: str) -> list[str]:
+    """Resolve uploaded files and one-path-per-line text into unique media paths."""
+
+    raw_paths = _uploaded_paths(files)
+    raw_paths.extend(
+        value.strip()
+        for value in re.split(r"[\r\n]+", str(path_text or ""))
+        if value.strip()
+    )
+    result: list[str] = []
+    for raw in raw_paths:
+        path = normalize_path(raw, must_exist=True)
+        if not path.is_file():
+            raise ValueError(f"Attachment is not a file: {path}")
+        info = probe_media(path)
+        if info.kind not in {"video", "video_no_audio", "audio", "image"}:
+            raise ValueError(f"Unsupported attachment {path.name}: choose video, audio, or image media.")
+        value = str(path)
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _attachment_line(files: Any, path_text: str) -> str:
+    try:
+        paths = resolve_chat_attachments(files, path_text)
+    except Exception as exc:
+        return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+    if not paths:
+        return "<span class='vc-help'>No media attached.</span>"
+    labels = [f"{html.escape(Path(value).name)} ({probe_media(value).kind})" for value in paths]
+    return f"<span class='vc-ok'>Attached: {' · '.join(labels)}</span>"
+
+
+def _chatbot_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {"role": str(item.get("role") or "assistant"), "content": str(item.get("content") or "")}
+        for item in messages
+        if str(item.get("role") or "") in {"user", "assistant"}
+    ]
+
+
+def _last_answer(history: Sequence[Mapping[str, Any]] | None) -> str:
+    for item in reversed(list(history or [])):
+        if str(item.get("role") or "") == "assistant":
+            return str(item.get("content") or "")
+    return ""
+
+
+def build(ctx: "UiContext") -> ChatTabHandles:
+    """Render chat controls and register preset-owned generation parameters."""
+
+    controls: dict[str, Any] = {}
+    initial_variant = str(getattr(ctx.caption_handles.controls["model_key"], "value", "qwen3_omni_instruct_int8"))
+    _, initial_note = model_chat_support(initial_variant)
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=6, min_width=560):
+            chatbot_kwargs: dict[str, Any] = {
+                "value": [],
+                "label": "Conversation",
+                "height": 520,
+                "buttons": ["copy", "copy_all"],
+                "feedback_options": None,
+                "placeholder": "Start a conversation with the selected model.",
+                "elem_classes": ["vc-chatbot"],
+            }
+            if "type" in inspect.signature(gr.Chatbot).parameters:
+                chatbot_kwargs["type"] = "messages"
+            chatbot = gr.Chatbot(
+                **chatbot_kwargs,
+            )
+            with gr.Accordion("Reasoning", open=False, visible=False) as reasoning_accordion:
+                reasoning = gr.Textbox(
+                    label="Reasoning",
+                    lines=10,
+                    max_lines=18,
+                    interactive=False,
+                    buttons=["copy"],
+                    elem_classes=["vc-mono"],
+                )
+            message = gr.Textbox(
+                label="Message",
+                placeholder="Ask about the attached media…",
+                info="Enter the next user turn. Qwen3-Omni can also chat without media.",
+                lines=3,
+                max_lines=8,
+                autofocus=False,
+            )
+            with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
+                send = action_button("➤ Send", "cyan", variant="primary", size="lg", scale=3)
+                stop = action_button(
+                    "⏹ Stop",
+                    "red",
+                    variant="stop",
+                    size="lg",
+                    scale=2,
+                    interactive=False,
+                )
+                clear = action_button("⌫ Clear history", "orange", size="md", scale=2)
+                copy_last = action_button("⧉ Copy last answer", "blue", size="md", scale=2)
+                save = action_button("💾 Save conversation", "green", size="md", scale=2)
+            status = gr.Markdown("<span class='vc-ok'>Ready.</span>", elem_classes=["vc-status"])
+            tokens = gr.Markdown("**Tokens:** — · **Speed:** —", elem_classes=["vc-help"])
+        with gr.Column(scale=4, min_width=420):
+            with gr.Group(elem_classes=["vc-card"]):
+                gr.Markdown("### Media", elem_classes=["vc-section-title"])
+                files = gr.File(
+                    file_count="multiple",
+                    file_types=["video", "audio", "image"],
+                    type="filepath",
+                    label="Attachments",
+                    height=112,
+                )
+                path = gr.Textbox(
+                    label="Media path",
+                    placeholder="Paste a local path; use one path per line",
+                    info="Quoted, mixed-separator, Unicode, video, audio, and image paths are supported.",
+                    lines=2,
+                )
+                attachment_status = gr.Markdown(
+                    "<span class='vc-help'>No media attached.</span>",
+                    elem_classes=["vc-help"],
+                )
+            model_note = gr.Markdown(initial_note, elem_classes=["vc-status"])
+            system_prompt = gr.Textbox(
+                value="",
+                label="System prompt",
+                info="Optional instruction applied before the conversation history.",
+                lines=4,
+                max_lines=10,
+                elem_classes=["vc-mono"],
+            )
+            controls["chat_system_prompt"] = ctx.reg(
+                "chat_system_prompt",
+                system_prompt,
+                "",
+                section="chat",
+                description="Optional system instruction for interactive chat.",
+                kind="str",
+                in_preset=True,
+                in_metadata=False,
+            )
+            prompt_helper = gr.Dropdown(
+                choices=[
+                    ("Do not insert a Caption prompt", "none"),
+                    ("Use current Caption user prompt", "caption_user"),
+                    ("Use current Caption system + user prompts", "caption_both"),
+                ],
+                value="none",
+                label="Caption prompt as first message",
+                info="Copies the current Caption-tab prompt into the chat composer.",
+            )
+            with gr.Accordion("Generation", open=True):
+                temperature = gr.Slider(
+                    0.0,
+                    2.0,
+                    value=0.2,
+                    step=0.01,
+                    label="Temperature",
+                    info="Sampling randomness; zero uses deterministic greedy decoding.",
+                )
+                controls["chat_temperature"] = ctx.reg(
+                    "chat_temperature",
+                    temperature,
+                    0.2,
+                    section="chat",
+                    description="Interactive chat sampling temperature.",
+                    kind="float",
+                    minimum=0.0,
+                    maximum=2.0,
+                    in_preset=True,
+                    in_metadata=False,
+                )
+                with gr.Row(elem_classes=["vc-compact-row"]):
+                    top_p = gr.Slider(
+                        0.0,
+                        1.0,
+                        value=0.95,
+                        step=0.01,
+                        label="Top-p",
+                        info="Nucleus probability mass used when chat sampling is active.",
+                    )
+                    top_k = gr.Slider(
+                        0,
+                        200,
+                        value=20,
+                        step=1,
+                        precision=0,
+                        label="Top-k",
+                        info="Maximum token candidates; zero leaves the candidate set unrestricted.",
+                    )
+                controls["chat_top_p"] = ctx.reg(
+                    "chat_top_p",
+                    top_p,
+                    0.95,
+                    section="chat",
+                    description="Interactive chat nucleus probability mass.",
+                    kind="float",
+                    minimum=0.0,
+                    maximum=1.0,
+                    in_preset=True,
+                    in_metadata=False,
+                )
+                controls["chat_top_k"] = ctx.reg(
+                    "chat_top_k",
+                    top_k,
+                    20,
+                    section="chat",
+                    description="Interactive chat top-k candidate limit.",
+                    kind="int",
+                    minimum=0,
+                    maximum=200,
+                    in_preset=True,
+                    in_metadata=False,
+                )
+                max_new_tokens = gr.Slider(
+                    1,
+                    8192,
+                    value=1024,
+                    step=1,
+                    precision=0,
+                    label="Maximum new tokens",
+                    info="Hard limit for the next assistant response, capped by the selected model context.",
+                )
+                controls["chat_max_new_tokens"] = ctx.reg(
+                    "chat_max_new_tokens",
+                    max_new_tokens,
+                    1024,
+                    section="chat",
+                    description="Maximum tokens generated for one chat response.",
+                    kind="int",
+                    minimum=1,
+                    maximum=32768,
+                    in_preset=True,
+                    in_metadata=False,
+                )
+                enable_thinking = gr.Checkbox(
+                    value=False,
+                    label="Enable thinking",
+                    info="Shows Qwen3-Omni Thinking reasoning separately in the collapsed Reasoning panel.",
+                    interactive=False,
+                )
+                controls["chat_enable_thinking"] = ctx.reg(
+                    "chat_enable_thinking",
+                    enable_thinking,
+                    False,
+                    section="chat",
+                    description="Allow reasoning during Qwen3-Omni Thinking chat responses.",
+                    kind="bool",
+                    in_preset=True,
+                    in_metadata=False,
+                )
+    stop_timer = gr.Timer(1.0)
+    conversation_state = gr.State(dict(_INITIAL_STATE))
+    handles = ChatTabHandles(
+        chatbot=chatbot,
+        message=message,
+        files=files,
+        path=path,
+        attachment_status=attachment_status,
+        model_note=model_note,
+        reasoning=reasoning,
+        reasoning_accordion=reasoning_accordion,
+        status=status,
+        tokens=tokens,
+        send=send,
+        stop=stop,
+        clear=clear,
+        copy_last=copy_last,
+        save=save,
+        stop_timer=stop_timer,
+        conversation_state=conversation_state,
+        prompt_helper=prompt_helper,
+        controls=controls,
+    )
+    ctx.chat_handles = handles
+
+    for event in (files.change, path.change):
+        event(
+            _attachment_line,
+            inputs=[files, path],
+            outputs=attachment_status,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+
+    caption_model = ctx.caption_handles.controls["model_key"]
+
+    def change_model(variant_key: str) -> tuple[Any, ...]:
+        mode, note = model_chat_support(variant_key)
+        family = variant_to_family(str(variant_key))
+        thinking = family == "qwen3_omni_thinking"
+        cap = MODEL_SPECS[family].limits.max_new_tokens_cap
+        return (
+            note,
+            gr.update(interactive=thinking),
+            # Never shrink the ceiling below a stored value (Gradio rejects such inputs);
+            # the backend clamps to the family cap, so only the hint changes.
+            gr.update(info=f"Hard limit for the next assistant response; {MODEL_SPECS[family].label} caps it at {cap} tokens."),
+            [],
+            dict(_INITIAL_STATE),
+            "",
+            gr.update(visible=False),
+            (
+                "<span class='vc-ok'>Ready.</span>"
+                if mode != "unsupported"
+                else note
+            ),
+        )
+
+    caption_model.change(
+        change_model,
+        inputs=caption_model,
+        outputs=[
+            model_note,
+            enable_thinking,
+            max_new_tokens,
+            chatbot,
+            conversation_state,
+            reasoning,
+            reasoning_accordion,
+            status,
+        ],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def insert_caption_prompt(
+        selection: str,
+        caption_user: str,
+        caption_system: str,
+    ) -> tuple[Any, Any]:
+        if selection == "caption_user":
+            return str(caption_user or ""), gr.skip()
+        if selection == "caption_both":
+            return str(caption_user or ""), str(caption_system or "")
+        return gr.skip(), gr.skip()
+
+    prompt_helper.change(
+        insert_caption_prompt,
+        inputs=[
+            prompt_helper,
+            ctx.caption_handles.controls["user_prompt"],
+            ctx.caption_handles.controls["system_prompt"],
+        ],
+        outputs=[message, system_prompt],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    return handles
+
+
+def wire(ctx: "UiContext") -> None:
+    """Wire streaming send/stop/history/save events after the registry is complete."""
+
+    handles = ctx.chat_handles
+    if handles is None:
+        raise RuntimeError("chat_tab.build() must run before wire()")
+    registry = ctx.settings_registry
+    components = registry.components()
+    value_count = len(components)
+    outputs = [
+        handles.chatbot,
+        handles.message,
+        handles.status,
+        handles.tokens,
+        handles.reasoning,
+        handles.reasoning_accordion,
+        handles.conversation_state,
+        handles.stop,
+    ]
+
+    def response_display(messages: list[dict[str, Any]], text: str) -> list[dict[str, str]]:
+        display = _chatbot_messages(messages)
+        if text:
+            display.append({"role": "assistant", "content": text})
+        return display
+
+    def send_message(*args: Any):
+        settings = registry.values_to_dict(args[:value_count])
+        state = dict(args[value_count] or _INITIAL_STATE)
+        files = args[value_count + 1]
+        path_text = str(args[value_count + 2] or "")
+        message = str(args[value_count + 3] or "").strip()
+        model_key = str(settings.get("model_key") or "qwen3_omni_instruct_int8")
+        mode, model_note = model_chat_support(model_key)
+        if mode == "unsupported":
+            yield (
+                gr.skip(),
+                gr.skip(),
+                model_note,
+                "**Tokens:** — · **Speed:** —",
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+            return
+        if not message:
+            yield (
+                gr.skip(),
+                gr.skip(),
+                "<span class='vc-warn'>Enter a message before sending.</span>",
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+            return
+        try:
+            selected_media = resolve_chat_attachments(files, path_text)
+        except Exception as exc:
+            yield (
+                gr.skip(),
+                gr.skip(),
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+            return
+        previous_messages = list(state.get("messages") or [])
+        if str(state.get("model_key") or "") not in {"", model_key}:
+            previous_messages = []
+            state = dict(_INITIAL_STATE)
+        if mode == "single":
+            previous_messages = []
+        prior_media = [str(value) for value in state.get("media") or []]
+        if previous_messages:
+            media = prior_media
+            attachment_note = (
+                " Attachments remain fixed to the first turn; clear history to replace them."
+                if selected_media and selected_media != prior_media
+                else ""
+            )
+        else:
+            media = selected_media
+            attachment_note = ""
+        if mode == "single":
+            if len(media) != 1 or probe_media(media[0]).kind not in {"video", "video_no_audio"}:
+                yield (
+                    gr.skip(),
+                    gr.skip(),
+                    f"<span class='vc-warn'>{html.escape(MODEL_SPECS[variant_to_family(model_key)].label)} "
+                    "chat requires exactly one video attachment.</span>",
+                    gr.skip(),
+                    gr.skip(),
+                    gr.skip(),
+                    gr.skip(),
+                    gr.update(value="⏹ Stop", interactive=False),
+                )
+                return
+        history = [
+            {"role": str(item.get("role")), "content": str(item.get("content") or "")}
+            for item in previous_messages
+            if str(item.get("role")) in {"user", "assistant"}
+        ]
+        history.append({"role": "user", "content": message})
+        generation = {
+            "temperature": float(settings.get("chat_temperature", 0.2)),
+            "top_p": float(settings.get("chat_top_p", 0.95)),
+            "top_k": int(settings.get("chat_top_k", 20)),
+            "max_new_tokens": int(settings.get("chat_max_new_tokens", 1024)),
+            "enable_thinking": bool(settings.get("chat_enable_thinking", False)),
+        }
+        request = ChatRequest.from_dict(
+            {
+                "settings": settings,
+                "history": history,
+                "media": media,
+                "generation": generation,
+                "system_prompt": str(settings.get("chat_system_prompt") or ""),
+            }
+        )
+        set_mode = ctx.states.get("set_subprocess_mode")
+        if callable(set_mode):
+            set_mode(bool(settings.get("subprocess_mode", True)))
+        token = CancelToken()
+        ctx.activate_cancel(token)
+        ctx.states["chat_job_token"] = token
+        events: queue.Queue[dict[str, Any]] = queue.Queue()
+        terminal: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                terminal["result"] = ctx.pipeline_client.chat(request, events.put, token)
+            except BaseException as exc:
+                terminal["error"] = exc
+            finally:
+                events.put({"ev": "terminal"})
+
+        thread = threading.Thread(target=work, name="vcap-chat-ui", daemon=True)
+        thread.start()
+        current_text = ""
+        current_reasoning = ""
+        current_status = f"Starting chat.{attachment_note}"
+        token_line = "**Tokens:** generating · **Speed:** —"
+        yield (
+            response_display(history, ""),
+            "",
+            f"<span class='vc-ok'>{html.escape(current_status)}</span>",
+            token_line,
+            "",
+            gr.update(visible=False),
+            state,
+            gr.update(value="⏹ Stop", interactive=True),
+        )
+        last_emit = 0.0
+        try:
+            while True:
+                event = events.get()
+                kind = str(event.get("ev") or "")
+                if kind == "terminal":
+                    break
+                if kind == "delta":
+                    current_text = str(event.get("text") or current_text)
+                    current_reasoning = str(event.get("reasoning") or current_reasoning)
+                elif kind == "status":
+                    current_status = str(event.get("message") or current_status)
+                    data = dict(event.get("data") or {})
+                    new_tokens = data.get("new_tokens")
+                    speed = data.get("tok_per_s", data.get("tokens_per_second"))
+                    token_text = str(new_tokens) if new_tokens is not None else "generating"
+                    try:
+                        speed_text = f"{float(speed):.2f} tok/s" if speed is not None else "—"
+                    except (TypeError, ValueError):
+                        speed_text = "—"
+                    token_line = f"**Tokens:** {token_text} · **Speed:** {speed_text}"
+                elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
+                    current_status = str(event.get("text") or current_status)
+                now = time.monotonic()
+                if now - last_emit < 0.05 and kind == "delta":
+                    continue
+                last_emit = now
+                yield (
+                    response_display(history, current_text),
+                    "",
+                    f"<span class='vc-ok'>{html.escape(current_status)}</span>",
+                    token_line,
+                    current_reasoning,
+                    gr.update(visible=bool(current_reasoning)),
+                    state,
+                    gr.update(value="⏹ Stop", interactive=True),
+                )
+            thread.join()
+            if "error" in terminal:
+                raise terminal["error"]
+            result: ChatResponse = terminal["result"]
+            current_text = result.text
+            current_reasoning = result.reasoning
+            saved_messages = list(history)
+            if current_text:
+                saved_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": current_text,
+                        "reasoning": current_reasoning,
+                        "result": result.to_dict(),
+                    }
+                )
+            new_state = {
+                "messages": saved_messages,
+                "media": media,
+                "model_key": model_key,
+                "system_prompt": request.system_prompt,
+                "generation": generation,
+                "outputs_root": str(settings.get("outputs_dir") or ctx.outputs_dir),
+                "last_result": result.to_dict(),
+            }
+            warning = " ".join(result.warnings)
+            trim_note = (
+                f" Context trimmed {result.dropped_turns} oldest turn(s)."
+                if result.dropped_turns
+                else ""
+            )
+            status_class = "vc-warn" if result.cancelled else "vc-ok"
+            final_status = (
+                f"{'Stopped' if result.cancelled else 'Complete'}: {result.new_tokens} tokens, "
+                f"{result.tokens_per_s:.2f} tok/s, finish={result.finish_reason}.{trim_note} {warning}"
+            ).strip()
+            yield (
+                response_display(history, current_text),
+                "",
+                f"<span class='{status_class}'>{html.escape(final_status)}</span>",
+                f"**Tokens:** {result.new_tokens} · **Speed:** {result.tokens_per_s:.2f} tok/s",
+                current_reasoning,
+                gr.update(visible=bool(current_reasoning)),
+                new_state,
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+        except (CancelledError, KeyboardInterrupt) as exc:
+            yield (
+                response_display(history, current_text),
+                "",
+                f"<span class='vc-warn'>{html.escape(str(exc))}</span>",
+                token_line,
+                current_reasoning,
+                gr.update(visible=bool(current_reasoning)),
+                state,
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+        except BaseException as exc:
+            ctx.app_log.exception(f"Chat failed: {exc}", scope="chat")
+            yield (
+                response_display(history, current_text),
+                "",
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+                token_line,
+                current_reasoning,
+                gr.update(visible=bool(current_reasoning)),
+                state,
+                gr.update(value="⏹ Stop", interactive=False),
+            )
+        finally:
+            ctx.clear_active_cancel(token)
+            if ctx.states.get("chat_job_token") is token:
+                ctx.states["chat_job_token"] = None
+
+    run_inputs = [
+        *components,
+        handles.conversation_state,
+        handles.files,
+        handles.path,
+        handles.message,
+    ]
+    for trigger in (handles.send.click, handles.message.submit):
+        trigger(
+            send_message,
+            inputs=run_inputs,
+            outputs=outputs,
+            concurrency_id="gpu_queue",
+            concurrency_limit=1,
+            show_progress="hidden",
+            api_name="chat" if trigger == handles.send.click else False,
+            api_description=(
+                "Send one multimodal conversation turn with the Caption tab's selected model and runtime settings."
+                if trigger == handles.send.click
+                else None
+            ),
+            api_visibility="public" if trigger == handles.send.click else "private",
+        )
+
+    def stop_chat() -> tuple[Any, str]:
+        token = ctx.states.get("chat_job_token")
+        if token is None or token.is_cancelled():
+            return gr.update(value="⏹ Stop", interactive=False), "<span class='vc-help'>No chat response is running.</span>"
+        if not token.is_armed():
+            token.arm_confirmation(window_s=6)
+            return (
+                gr.update(value="⚠ Click again to confirm stop", interactive=True),
+                "<span class='vc-warn'>Click Stop again within 6 seconds to stop generation.</span>",
+            )
+        token.cancel()
+        ctx.pipeline_client.cancel(force=False)
+        return (
+            gr.update(value="Stopping…", interactive=False),
+            "<span class='vc-warn'>Cooperative stop requested; the loaded model will be retained.</span>",
+        )
+
+    handles.stop.click(
+        stop_chat,
+        outputs=[handles.stop, handles.status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def refresh_stop() -> Any:
+        token = ctx.states.get("chat_job_token")
+        if token is None or token.is_cancelled():
+            return gr.update(value="⏹ Stop", interactive=False)
+        if token.is_armed():
+            return gr.skip()
+        return gr.update(value="⏹ Stop", interactive=True)
+
+    handles.stop_timer.tick(
+        refresh_stop,
+        outputs=handles.stop,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def clear_history() -> tuple[Any, ...]:
+        token = ctx.states.get("chat_job_token")
+        if token is not None and not token.is_cancelled():
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                "<span class='vc-warn'>Stop the running response before clearing history.</span>",
+            )
+        return [], dict(_INITIAL_STATE), "", gr.update(visible=False), "<span class='vc-ok'>Conversation cleared.</span>"
+
+    handles.clear.click(
+        clear_history,
+        outputs=[
+            handles.chatbot,
+            handles.conversation_state,
+            handles.reasoning,
+            handles.reasoning_accordion,
+            handles.status,
+        ],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    handles.copy_last.click(
+        lambda history: (
+            "<span class='vc-ok'>Copied the last answer.</span>"
+            if _last_answer(history)
+            else "<span class='vc-warn'>No assistant answer is available.</span>"
+        ),
+        inputs=handles.chatbot,
+        outputs=handles.status,
+        js=(
+            "(history) => { const rows = Array.isArray(history) ? history : []; "
+            "const item = [...rows].reverse().find(x => x && x.role === 'assistant'); "
+            "if (item && item.content) navigator.clipboard.writeText(String(item.content)); "
+            "return [history]; }"
+        ),
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def save_history(state: Mapping[str, Any]) -> str:
+        messages = list((state or {}).get("messages") or [])
+        if not messages:
+            return "<span class='vc-warn'>No conversation is available to save.</span>"
+        model_key = str((state or {}).get("model_key") or "qwen3_omni_instruct")
+        metadata = {
+            "system_prompt": str((state or {}).get("system_prompt") or ""),
+            "media": list((state or {}).get("media") or []),
+            "generation": dict((state or {}).get("generation") or {}),
+            "last_result": dict((state or {}).get("last_result") or {}),
+        }
+        run_dir = save_conversation(
+            messages,
+            model_key=model_key,
+            metadata=metadata,
+            outputs_root=str((state or {}).get("outputs_root") or ctx.outputs_dir),
+        )
+        return f"<span class='vc-ok'>Saved conversation to {html.escape(str(run_dir))}</span>"
+
+    handles.save.click(
+        save_history,
+        inputs=handles.conversation_state,
+        outputs=handles.status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+
+__all__ = [
+    "ChatTabHandles",
+    "build",
+    "model_chat_support",
+    "resolve_chat_attachments",
+    "wire",
+]

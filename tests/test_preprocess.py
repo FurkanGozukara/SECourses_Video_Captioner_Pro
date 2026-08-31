@@ -34,6 +34,7 @@ def quality_media(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     root = tmp_path_factory.mktemp("quality")
     black = root / "black_silent.mp4"
     visual = root / "visual_no_audio.mp4"
+    audio = root / "tone.wav"
     _run(
         [
             ffmpeg,
@@ -77,7 +78,21 @@ def quality_media(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
             str(visual),
         ]
     )
-    return {"black": black, "visual": visual}
+    _run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=2",
+            str(audio),
+        ]
+    )
+    return {"black": black, "visual": visual, "audio": audio}
 
 
 def test_frame_plan_resize_and_token_budget() -> None:
@@ -138,3 +153,26 @@ def test_quality_rejection_and_model_normalization(quality_media: dict[str, Path
     ensured = ensure_audio_track(quality_media["visual"], tmp_path / "ensured.mp4")
     assert probe_media(ensured).has_audio
 
+
+def test_audio_only_quality_uses_duration_and_silence_without_visual_rules(
+    quality_media: dict[str, Path],
+) -> None:
+    quality = analyze_clip_quality(
+        quality_media["audio"],
+        start_s=0.5,
+        end_s=1.25,
+    )
+    assert quality.has_audio and not quality.has_video
+    assert quality.duration == pytest.approx(0.75)
+    rejected, reasons = should_reject(
+        quality,
+        AutoRejectRules(
+            min_duration_s=0.5,
+            max_black_ratio=-1.0,
+            max_static_score=10_000.0,
+            min_sharpness=10_000.0,
+            max_silence_ratio=0.9,
+        ),
+    )
+    assert not rejected
+    assert reasons == []

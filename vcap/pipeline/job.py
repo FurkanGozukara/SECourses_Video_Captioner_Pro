@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -91,7 +92,7 @@ def _gpu_indices(value: Any, fallback: int) -> tuple[int, ...]:
     if value is None or value == "":
         return (int(fallback),)
     if isinstance(value, str):
-        raw: Sequence[Any] = [part for part in value.replace(";", ",").split(",") if part.strip()]
+        raw: Sequence[Any] = [part for part in re.split(r"[\s,;]+", value.strip()) if part]
     elif isinstance(value, Sequence):
         raw = value
     else:
@@ -270,6 +271,7 @@ class OutputSpec:
     kind: Literal["single", "batch"] = "single"
     outputs_root: str | os.PathLike[str] = field(default_factory=lambda: str(OUTPUTS_DIR))
     batch_output_dir: str | os.PathLike[str] | None = None
+    source_root: str | os.PathLike[str] | None = None
     mirror_names: bool = True
     overwrite: bool = False
     save_processed_files: bool = False
@@ -284,6 +286,8 @@ class OutputSpec:
         object.__setattr__(self, "outputs_root", os.fspath(self.outputs_root))
         if self.batch_output_dir is not None:
             object.__setattr__(self, "batch_output_dir", os.fspath(self.batch_output_dir))
+        if self.source_root is not None:
+            object.__setattr__(self, "source_root", os.fspath(self.source_root))
 
 
 @dataclass(frozen=True)
@@ -317,6 +321,7 @@ class JobSpec:
     split: SplitSpec = field(default_factory=SplitSpec)
     post: PostSpec = field(default_factory=PostSpec)
     runtime: RuntimeSpec = field(default_factory=RuntimeSpec)
+    context_carry_over: bool = False
     settings: dict[str, Any] = field(default_factory=dict)
     internal: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -547,6 +552,7 @@ class JobSpec:
             split=split,
             post=post,
             runtime=runtime,
+            context_carry_over=_bool(_setting(source, "context_carry_over", default=False), False),
             settings=_json_safe(source),
         )
 
@@ -586,6 +592,7 @@ class JobSpec:
             split=SplitSpec(**dict(data.get("split") or {})),
             post=PostSpec(**post_data),
             runtime=RuntimeSpec(**runtime_data),
+            context_carry_over=_bool(data.get("context_carry_over"), False),
             settings=dict(data.get("settings") or {}),
             internal=dict(data.get("internal") or {}),
         )

@@ -184,3 +184,48 @@ Order: T1,T2,T4(start conversions early),T9 in parallel → T3,T5 → T6,T7,T8 �
 
 ## 9. torch.compile (addendum)
 `vcap/models/torch_compile.py` (T3) provides robust C++ toolchain detection and graceful fallback, ported from Ultimate Image Captioner `joycaption/torch_compile.py` + `torch_compile_workers.py` and Upscaler `runner.py:1491-1615` (`_find_vcvars`/`_capture_vcvars_env`) and Musubi's MSVC handling: probe `cl.exe` → vswhere → vcvars64.bat env capture (cached); Linux gcc/g++ probe. Fallback ladder when C++ tools are missing: full Inductor (MSVC/gcc) → Triton-only Inductor (log "C++ build tools not found — Triton-only fallback") → `backend="cudagraphs"` → eager with a clear reason. Compile only the resident text decoder; never compile offloaded/block-swapped layers; numerics guards on; `TORCHINDUCTOR_WORKER_START=spawn` on Windows; UI shows the probe status next to the toggle plus a compile-mode dropdown and "Clear compile caches" button; worker applies the captured env (never the Gradio parent).
+
+## 10. Interactive chat
+The Chat tab uses the Caption tab's registered model, GPU, VRAM, attention, offload, compile, and model-lifetime settings. `PipelineClient.chat()` sends full text history plus first-turn media through the persistent worker's `chat` command, so captioning and chat share the same one-model cache. Qwen3-Omni Instruct/Thinking support streamed multimodal multi-turn chat; TimeChat and AVoCaDO are limited to single-turn video Q&A; the prompt-free Captioner is not exposed as a chat model. Conversation context is rendered with the native chat template and oldest middle turns are removed above 90% of the model window while retaining the first media turn. Saved conversations use `outputs/NNNN_chat_<model_short>/conversation.json` and `conversation.md`.
+
+## 11. Post-release fixes (v1.1.0)
+
+### 11.1 Settings and persistence contracts
+
+- Caption registry additions are `show_all_variants: bool`, `gpu_indices: list[int]`, `sampling_strategy: "fps" | "uniform" | "keyframe" | "adaptive"`, and `context_carry_over: bool`. `gpu_index` and `gpu_indices` remain machine-specific and are excluded from universal presets; `gpu_indices` remains available to metadata.
+- Chat registry additions are `chat_system_prompt: str`, `chat_temperature: float`, `chat_top_p: float`, `chat_top_k: int`, `chat_max_new_tokens: int`, and `chat_enable_thinking: bool`. They are preset-owned but omitted from caption-run metadata.
+- Global registry additions are `theme_mode`, `outputs_dir`, `temp_dir`, `models_dir`, `save_processed_files`, and `scan_subfolders`. Theme is browser-local (`dark | light | system`) and excluded from presets/metadata. The other five values are written atomically as UTF-8 to repository-root `app_settings.json`; `VCAP_OUTPUTS_DIR`, `VCAP_TEMP_DIR`, and `VCAP_MODELS_DIR` retain environment-variable precedence.
+- Protected presets are read only from `presets_default/`; writable presets and `.last_used_preset.txt` live in `presets/`. Saving or loading updates the last-used marker, and application startup resolves last-used, shipped default, then first available preset.
+
+### 11.2 Worker chat protocol
+
+The persistent JSON-lines worker accepts:
+
+```json
+{"cmd":"chat","payload":{"settings":{},"history":[],"media":[],"generation":{},"system_prompt":""}}
+```
+
+It streams `log`, `status`, and `delta` events. A `delta` includes incremental `delta` and `reasoning_delta` text plus full `text` and `reasoning` snapshots. The terminal response is `{"ev":"chat_result","result":{...}}`; the result includes token counts, `finish_reason`, prefill/decode/total timing, token rate, peak VRAM, cancellation state, warnings, dropped-turn count, context-token count, and retained history. Cooperative chat cancellation stops only the active generation and retains the resident model/worker.
+
+### 11.3 Downloader status protocol
+
+The distribution-level downloader emits one UTF-8 line per state/progress update:
+
+```text
+VCAP_STATUS {"key":"timechat_int4","state":"downloading","fraction":0.423,"bytes_done":2735890432,"bytes_total":6467930328,"message":"Downloading model.safetensors"}
+```
+
+`state` is `downloading | verifying | ready | error | skipped | missing`; progress fields may be `null`. The bridge accepts this JSON protocol, the legacy text protocol, and plain-percent lines. Both the console and Gradio consume the same normalized progress payload. The catalog also exposes six third-party Qwen3-Omni GGUF Q4/Q8 entries through the same menu, status, ensure, and verify commands.
+
+### 11.4 Pipeline and metadata contracts
+
+- `OutputSpec.source_root: str | None` is serialized under `output.source_root`. Batch layout computes each media file's safe relative parent from this root so recursive outputs and skip checks mirror the input tree; true same-parent stem collisions still receive numeric suffixes.
+- `PreprocessSpec.sampling_strategy` reaches `PreprocessParams.sampling_strategy` and survives OOM retries. `JobSpec.context_carry_over` appends at most the last 60 words of the previous final segment only for AVoCaDO and Qwen3-Omni Instruct/Thinking.
+- `TokenUsage.finish_reason` and each segment's serialized `usage.finish_reason` are exactly `eos | length | cancelled`. Top-level metadata also exposes the distinct finish reason(s), sampling strategy, context-carry flag, normalized source root, and `processing_time_seconds`.
+- Progress payloads preserve existing fields and add processed/remaining/total counts plus job/item elapsed time and ETA. Batch completion also writes compact one-line `summary.json` item/count data.
+
+### 11.5 torch.compile runtime recovery
+
+- The user-facing mode registry defaults to Inductor `default` and offers `max-autotune-no-cudagraphs`; direct `cudagraphs` and `reduce-overhead` are hidden because token-by-token `DynamicCache` mutation is not replay-safe.
+- A Dynamo, Inductor, or CUDA-graph error restores every compiled decoder forward to its original eager callable without reloading weights. The pipeline clears CUDA caches and retries the same segment once from fresh model inputs.
+- A failed `(model family, requested mode)` pair is process-local disabled after recovery, so later segments and model reuse remain eager. Toolchain discovery still degrades from full Inductor through Triton-only and CUDA-graphs compatibility paths to eager.

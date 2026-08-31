@@ -12,6 +12,34 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.1.0",
+        "2026-08-31",
+        """
+### Post-release fixes and workflow expansion
+
+- Stop Transformers and GGUF generation on the correct EOS tokens and record whether each result ended at EOS, hit its length limit, or was cancelled.
+- Apply model-family generation defaults consistently while preserving user sampling overrides and separate Thinking reasoning.
+- Ignore prompt text safely for the prompt-free Qwen3-Omni Captioner and show a clear warning instead of failing.
+- Add target-FPS, uniform, keyframe, and adaptive frame-sampling strategies with accurate trimmed-range timing.
+- Use real SageAttention and xFormers integrations when compatible, with automatic SDPA fallback for unsupported calls or Flash Attention failures.
+- Preserve recursive batch folder structure, exclude caption sidecars from folder input, and keep true filename collisions distinct.
+- Improve audio-only quality checks, batch trim guidance, temporary clip cleanup, subtitle post-processing, and per-item error continuation.
+- Show processed and remaining counts, item and job elapsed time, ETA, token rate, downloads, and model loading in both Gradio and the console without duplicate worker logs.
+- Add optional previous-segment context for long AVoCaDO and Qwen3 Instruct/Thinking jobs.
+- Add data-parallel folder batches with one isolated worker per selected GPU and round-robin item assignment.
+- Record sampling, context, source-root, finish-reason, timing, and compact batch-summary data in run metadata.
+- Add Dark, Light, and System themes, persistent global paths/preferences, tier-filtered model choices, and a cached compile readiness probe.
+- Replace one-click Caption cancellation with a six-second arm-and-confirm flow and scope Caption and Editor keyboard shortcuts to the active tab.
+- Protect shipped presets, keep user presets separate, auto-load the last-used preset, and make trigger/reasoning defaults explicit.
+- Repair Caption Editor autosave, regeneration, Unicode folder scans, metadata-backed media previews, zero-limit filters, and caption-only export accounting.
+- Expand Dataset & Export with synchronized trainer suggestions, crop/pad geometry, safe timestamped fitness plans, and deduplicated sub-split progress.
+- Harden Recover Settings by excluding machine/theme directories, validating GPU choices, and requiring an opt-in before restoring source paths.
+- Add human-readable model health status, local verification progress, and six Qwen3-Omni GGUF Q4/Q8 entries to the downloader menu.
+- Add streamed interactive Chat with shared model reuse, multimodal history, cooperative stop, reasoning display, and JSON/Markdown transcript saves.
+- Refresh the EOS-aware speed, latency, quality, and VRAM comparison with new AVoCaDO and Qwen3-Omni Thinking measurements.
+""".strip(),
+    ),
+    (
         "v1.0.0",
         "2026-08-31",
         """

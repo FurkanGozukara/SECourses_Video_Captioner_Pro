@@ -6,17 +6,18 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 
 ## Features
 
-- Caption video, audio, images, and text with TimeChat, AVoCaDO, and Qwen3-Omni Instruct, Thinking, and Captioner models.
-- Run single files or resilient recursive batches through the same subprocess pipeline with live progress, ETA, cancellation, per-item errors, and versioned metadata.
-- Trim and sample media; detect scenes; split around model and trainer limits; sub-split with overlap; and reject clips that are too short, black, static, blurry, or silent.
-- Produce UTF-8 TXT, structured JSON, SRT, VTT, JSONL, optional reasoning, run logs, and collision-safe output directories.
-- Review captions beside their source media with autosave, filters, approval flags, regeneration diffs, find/replace, bulk edits, and approved-only export.
-- Analyze trainer frame fitness, preview resolution buckets, and export Kohya/Musubi dataset TOML for video and image datasets.
-- Save universal presets, restore the complete UI from `metadata.json`, and start from a broad library of model-native, training-caption, ASR, translation, lyrics, OCR, and audio-analysis prompts.
-- Select any installed GPU for Transformers or GGUF workers, use tier-aware attention/offload defaults, recover automatically from some OOMs, and inspect live VRAM/RAM and model health.
-- Keep models loaded between jobs and, when compilation is enabled, default to conservative CUDA graphs or opt into full `torch.compile` with an automatic fallback ladder.
-- Download and verify BF16/ConvRot variants with resumable range downloads; run Qwen3-Omni GGUF through a private, cancellable `llama-server` backend.
-- Handle mixed-modality batches with per-item prompt adaptation, silent-video fallbacks, first-click cancellation, deduplicated worker logs, and clear caption-only/text-only preview states.
+- Use TimeChat for audiovisual video, AVoCaDO for visual or audiovisual video, Qwen3-Omni Instruct or Thinking for video, audio, images, and text, and the prompt-free Qwen3-Omni Captioner for one audio file up to 30 seconds.
+- Run single inputs or recursive mixed-media folders through the same pipeline, mirror batch subfolders, skip completed files, continue after per-item failures, and write versioned metadata plus compact batch summaries.
+- Trim media, sample video by target FPS, uniform timestamps, keyframes, or adaptive visual change, detect scenes, enforce model duration limits, sub-split with overlap, and optionally reject short, black, static, blurry, or silent clips.
+- Carry the last 60 words from one generated segment into the next for long AVoCaDO and Qwen3 Instruct/Thinking jobs, while keeping TimeChat and Captioner prompt behavior model-native.
+- Stop generation at the model EOS token and record `finish_reason`, token counts, prefill/decode timing, tokens per second, processing time, and peak VRAM in run results and metadata.
+- Produce UTF-8 TXT, structured JSON, SRT, VTT, JSONL, optional Thinking reasoning, `run_log.txt`, and collision-safe single or batch output directories.
+- Review source-backed or caption-only items in the Caption Editor with autosave, filters, approval flags, regeneration diffs, find/replace, bulk edits, and approved-only export with explicit no-media counts.
+- Use Dataset & Export for trainer frame-fit suggestions, crop/pad bucket previews, timestamped fitness plans, an overlap-aware video sub-split tool, and Kohya/Musubi TOML generation.
+- Chat through the shared resident worker with streamed Qwen3-Omni multimodal multi-turn history or single-turn TimeChat/AVoCaDO video Q&A, then save the conversation as JSON and Markdown.
+- Use protected shipped presets, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
+- Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention and offload plans, recover from supported OOM cases, inspect live VRAM/RAM and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
+- Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and six Qwen3-Omni GGUF variants with resumable progress; GGUF runs through a private `llama-server` backend.
 
 ## Requirements
 
@@ -59,6 +60,7 @@ chmod +x RunPod_Install_SECourses_Video_Captioner_Pro.sh
 Start it later with:
 
 ```bash
+export HF_HOME="/workspace"
 cd /workspace/SECourses_Video_Captioner_Pro
 source venv/bin/activate
 unset LD_LIBRARY_PATH
@@ -83,7 +85,7 @@ unset LD_LIBRARY_PATH
 python secourses_app.py --share
 ```
 
-Both shell installers use `apt-get` for missing Git/FFmpeg when root or `sudo` is available, install Python 3.12 through `uv`, and create `SECourses_Video_Captioner_Pro/venv`.
+Both shell installers use `apt-get` for missing Git, FFmpeg, CMake, and a C++ build toolchain when root or `sudo` is available, install Python 3.12 through `uv`, and create `SECourses_Video_Captioner_Pro/venv`. They preserve an existing `HF_HOME`; otherwise RunPod uses `/workspace` and Massed Compute/local Linux uses a `huggingface_cache` folder beside the installer.
 
 ## First Run and Models
 
@@ -101,7 +103,37 @@ On Linux/cloud, the equivalent menu is:
 SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py
 ```
 
+The downloader menu includes Qwen3-Omni Instruct, Thinking, and Captioner in both GGUF Q4_K_M and Q8_0 forms. On Linux the model files can be downloaded from this menu, but the pinned `llama-server` runtime must be built with CMake and a C++ compiler and selected with `VCAP_LLAMACPP_SERVER`; see [docs/GGUF_BACKEND.md](docs/GGUF_BACKEND.md).
+
 The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, attention, and CPU-offload plan.
+
+## Presets and Persistence
+
+- `presets_default/` contains shipped read-only presets; the UI refuses to overwrite or delete them.
+- `presets/` contains user presets and the last-used marker; saving or loading a preset marks it as last used, and startup loads it automatically.
+- `app_settings.json` stores the outputs, temporary, and models directories plus the save-processed-files and recursive-scan preferences; environment variables still take precedence for application directories.
+- Recover Settings reads `metadata.json` and restores compatible controls, while source paths require an explicit opt-in and unavailable GPU indices are skipped.
+
+## Theme
+
+Dark is the default. Global Settings offers Dark, Light, and System; the choice is stored in the browser, applies immediately, and System follows live operating-system color changes. Theme choice is intentionally excluded from presets and run metadata.
+
+## Keyboard Shortcuts
+
+Shortcuts are scoped to the active tab.
+
+| Tab | Shortcut | Action |
+|---|---|---|
+| Caption | `F9` | Start captioning. |
+| Caption | `Esc` | Arm cancellation for six seconds; press again to confirm while a caption job is active. |
+| Caption Editor | `←` / `→` | Previous / next item when focus is outside a text field. |
+| Caption Editor | `Ctrl+S` | Save the current caption, including while editing its textbox. |
+| Caption Editor | `Ctrl+Enter` | Approve the current item. |
+| Caption Editor | `Ctrl+Delete` | Reject the current item. |
+
+## Console and UI Progress
+
+Captioning, preprocessing, model downloads, and model loading report through both the terminal and Gradio. Running status includes processed/total counts, elapsed item and job time, remaining items, ETA when available, and generation tokens per second; console status is rate-limited while the UI continues to refresh.
 
 ## Model Variants
 
@@ -110,9 +142,9 @@ Sizes are decimal GB from the produced/downloaded folders. GGUF totals include t
 | Family | Modality support | Variants, size, and recommended VRAM tier |
 |---|---|---|
 | TimeChat Captioner GRPO 7B | Video with audio; silent video receives a synthetic silent track | `timechat_bf16` — BF16 — 17.880 GB — 24 GB<br>`timechat_int8` — INT8 ConvRot — 10.275 GB — 12 GB (16 GB fully resident)<br>`timechat_int4` — INT4 ConvRot W4A8 — 6.468 GB — 6 GB (10 GB fully resident) |
-| AVoCaDO | Video; audiovisual video | `avocado_bf16` — BF16 — 17.880 GB — 24 GB<br>`avocado_int8` — INT8 ConvRot — 10.275 GB — 12 GB (16 GB fully resident)<br>`avocado_int4` — INT4 ConvRot W4A8 — 6.468 GB — 6 GB (10 GB fully resident) |
+| AVoCaDO | Video; audiovisual video | `avocado_bf16` — BF16 — 17.864 GB — 24 GB<br>`avocado_int8` — INT8 ConvRot — 10.275 GB — 12 GB (16 GB fully resident)<br>`avocado_int4` — INT4 ConvRot W4A8 — 6.452 GB — 6 GB (10 GB fully resident) |
 | Qwen3-Omni 30B-A3B Instruct | Video, video+audio, audio, image, text | `qwen3_omni_instruct_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_instruct_int8` — INT8 ConvRot — 33.041 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_instruct_int4` — INT4 ConvRot W4A8 — 17.790 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_instruct_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_instruct_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
-| Qwen3-Omni 30B-A3B Thinking | Video, video+audio, audio, image, text; separate reasoning output | `qwen3_omni_thinking_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_thinking_int8` — INT8 ConvRot — 33.041 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_thinking_int4` — INT4 ConvRot W4A8 — 17.790 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_thinking_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_thinking_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
+| Qwen3-Omni 30B-A3B Thinking | Video, video+audio, audio, image, text; separate reasoning output | `qwen3_omni_thinking_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_thinking_int8` — INT8 ConvRot — 33.031 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_thinking_int4` — INT4 ConvRot W4A8 — 17.780 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_thinking_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_thinking_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 | Qwen3-Omni 30B-A3B Captioner | One audio file, prompt-free; up to 30 seconds | `qwen3_omni_captioner_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_captioner_int8` — INT8 ConvRot — 33.041 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_captioner_int4` — INT4 ConvRot W4A8 — 17.790 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_captioner_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_captioner_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 
 Qwen3 BF16: 63.4 GB — does not fit a single 32 GB GPU; skipped (text-only logits reference was measured with CPU offload).
@@ -136,9 +168,13 @@ Fresh measurements below are three-generation means on physical GPU 0, an RTX 50
 | TimeChat BF16 | 17.880 | 9.74 | 31.52 | 212.28 | 34.44 |
 | TimeChat INT8 ConvRot | 10.275 | 7.70 | 24.40 | 1,904.59 | 34.54 |
 | TimeChat INT4 ConvRot W4A8 | 6.468 | 5.24 | 20.86 | 1,834.54 | 34.73 |
+| AVoCaDO BF16 | 17.864 | 24.21 | 20.45 | 6,554.05 | 36.03 |
 | AVoCaDO INT8 ConvRot | 10.275 | 6.77 | 35.96 | 103.52 | 31.22 |
+| AVoCaDO INT4 ConvRot W4A8 | 6.452 | 16.15 | 10.45 | 3,949.54 | 29.11 |
 | Qwen3-Omni Instruct INT8 ConvRot | 33.041 | 13.32 | 31.38 | 437.07 | 12.08 |
 | Qwen3-Omni Instruct INT4 ConvRot W4A8 | 17.790 | 16.75 | 18.84 | 5,692.81 | 17.91 |
+| Qwen3-Omni Thinking INT8 ConvRot | 33.031 | 34.85 | 33.07 | 90.41 | 3.90 |
+| Qwen3-Omni Thinking INT4 ConvRot W4A8 | 17.780 | 21.17 | 18.87 | 4,451.80 | 6.97 |
 | Qwen3-Omni Captioner INT8 ConvRot | 33.041 | 22.42 | 29.94 | 584.26 | 20.49 |
 | Qwen3-Omni Captioner INT4 ConvRot W4A8 | 17.790 | 13.93 | 16.74 | 1,188.83 | 20.13 |
 

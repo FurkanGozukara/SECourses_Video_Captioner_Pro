@@ -8,16 +8,28 @@ import math
 import queue
 import re
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 import gradio as gr
 
-from vcap.core.clip_fitness import TRAINER_TARGETS, evaluate_clip
+from vcap.core.clip_fitness import (
+    TRAINER_TARGETS,
+    evaluate_clip,
+    resolution_bucket_preview,
+    suggest_clip_length,
+)
 from vcap.core.export import discover_dataset_folders, write_kohya_musubi_toml
 from vcap.core.media import probe_media
 from vcap.core.outputs import OutputWriter
-from vcap.core.paths import collision_safe_path, list_media_files, normalize_path, open_in_file_manager
+from vcap.core.paths import (
+    collision_safe_path,
+    list_media_files,
+    normalize_path,
+    open_in_file_manager,
+    sanitize_filename,
+)
 from vcap.core.scene_split import fixed_length_segments, split_video
 from vcap.ui.components import action_button, render_progress_html
 
@@ -43,6 +55,62 @@ def _trainer_config(target: str, custom_fps: float, custom_frames: int) -> str |
         "max_frames": max(frames, 100_000),
         "recommended_frames": [frames],
     }
+
+
+def trainer_clip_suggestion(
+    target: str,
+    custom_fps: float = 24.0,
+    custom_frames: int = 81,
+) -> tuple[str, float]:
+    """Return the trainer suggestion line and matching sub-split duration."""
+
+    selected = _trainer_config(target, custom_fps, custom_frames)
+    if isinstance(selected, str):
+        config = dict(TRAINER_TARGETS[selected])
+    else:
+        config = dict(TRAINER_TARGETS["custom"])
+        config.update(selected)
+    fps = max(0.01, float(config.get("default_fps", 24.0)))
+    frames = max(1, int(config.get("default_frames", 1)))
+    valid = suggest_clip_length(config, fps)
+    valid_text = ", ".join(str(frame_count) for frame_count, _ in valid)
+    seconds = frames / fps
+    return (
+        f"**Suggested clip length: {frames} frames = {seconds:.2f} s @ {fps:g} fps "
+        f"(valid: {valid_text})**",
+        seconds,
+    )
+
+
+def _bucket_geometry(
+    width: int | None,
+    height: int | None,
+    target: str | Mapping[str, Any],
+    bucket: str,
+    policy: str,
+) -> tuple[str, dict[str, Any]]:
+    if not width or not height:
+        return "geometry unavailable", {}
+    if isinstance(target, Mapping):
+        config = dict(TRAINER_TARGETS["custom"])
+        config.update(target)
+    else:
+        config = dict(TRAINER_TARGETS[str(target)])
+    configured = config.get("buckets", {}).get(str(bucket).casefold())
+    bucket_value: str | dict[str, Any] = bucket
+    if configured:
+        bucket_value = {
+            "width": configured[0],
+            "height": configured[1],
+            "multiple": config.get("resolution_multiple", 2),
+        }
+    out_w, out_h, geometry = resolution_bucket_preview(
+        int(width), int(height), bucket_value, str(policy)  # type: ignore[arg-type]
+    )
+    crop = "/".join(str(value) for value in geometry.get("crop", (0, 0, 0, 0)))
+    pad = "/".join(str(value) for value in geometry.get("pad", (0, 0, 0, 0)))
+    operation = str(geometry.get("operation") or policy).replace("_", " ")
+    return f"{out_w}×{out_h} · {operation} · crop L/T/R/B {crop} · pad L/T/R/B {pad}", geometry
 
 
 def analyze_clip_fitness(
@@ -78,7 +146,13 @@ def analyze_clip_fitness(
             else:
                 verdict = f"OK {report.suggested_frames or report.frames_needed}f"
                 ok_count += 1
-        bucket_text = f"{report.bucket[0]}×{report.bucket[1]} · {str(policy).replace('_', ' ')}"
+        bucket_text, geometry = _bucket_geometry(
+            info.width,
+            info.height,
+            selected_target,
+            bucket,
+            policy,
+        )
         relative = path.relative_to(root).as_posix()
         rows.append([
             relative,
@@ -97,6 +171,7 @@ def analyze_clip_fitness(
             "suggested_frames": report.suggested_frames,
             "verdict": verdict,
             "bucket": list(report.bucket),
+            "geometry": geometry,
             "warnings": report.warnings,
         })
     summary = (
@@ -132,6 +207,47 @@ def parse_target_frames(value: str) -> list[int]:
     return result
 
 
+def write_clip_fitness_plan(
+    plan: Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    timestamp: str | None = None,
+) -> Path:
+    """Write a collision-safe plan outside the scanned source directory."""
+
+    raw_source = str(plan.get("source_folder") or "").strip()
+    raw_output = str(output_dir or "").strip()
+    if not raw_source:
+        raise ValueError("Clip fitness plan has no source folder")
+    if not raw_output:
+        raise ValueError("Choose a plan output directory")
+    source = normalize_path(raw_source, must_exist=True)
+    destination = normalize_path(raw_output)
+    try:
+        destination.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Plan output directory must be outside the scanned source folder")
+    destination.mkdir(parents=True, exist_ok=True)
+    source_name = sanitize_filename(source.name or "clips")
+    stamp = sanitize_filename(timestamp or datetime.now().strftime("%Y%m%d_%H%M%S"))
+    target = collision_safe_path(destination / f"{source_name}_{stamp}.json")
+    return OutputWriter().write_json(target, dict(plan), pretty=True)
+
+
+def append_deduped_progress_line(lines: list[str], message: str, limit: int = 250) -> bool:
+    """Append a progress message unless it repeats the immediately preceding line."""
+
+    text = str(message).strip()
+    if not text or (lines and lines[-1] == text):
+        return False
+    lines.append(text)
+    if len(lines) > max(1, int(limit)):
+        del lines[: len(lines) - max(1, int(limit))]
+    return True
+
+
 def _auto_dataset_kind(root: Path) -> str:
     folders = discover_dataset_folders(root)
     if any(folder.kind in {"video", "mixed"} for folder in folders):
@@ -145,6 +261,7 @@ def build(ctx: "UiContext") -> None:
     """Render Dataset & Export controls and connect backend operations."""
 
     fitness_plan = gr.State({})
+    initial_suggestion, initial_target_seconds = trainer_clip_suggestion("wan", 16.0, 81)
 
     with gr.Accordion("Clip fitness checker", open=True):
         with gr.Row(elem_classes=["vc-compact-row"]):
@@ -168,7 +285,14 @@ def build(ctx: "UiContext") -> None:
                 value=81, minimum=1, precision=0, label="Frames",
                 info="Minimum frame count used only by the Custom target.", visible=False,
             )
+        fitness_suggestion = gr.Markdown(initial_suggestion, elem_classes=["vc-status"])
         with gr.Row(elem_classes=["vc-compact-row"]):
+            plan_output_dir = gr.Textbox(
+                value=str(ctx.outputs_dir / "clip_fitness"),
+                label="Plan output directory",
+                info="Plans are timestamped here and never written into the scanned source folder.",
+                scale=4,
+            )
             bucket = gr.Radio(
                 choices=["480p", "720p", "1080p"], value="720p",
                 label="Resolution bucket", info="Preview output dimensions without resizing source files.",
@@ -250,7 +374,7 @@ def build(ctx: "UiContext") -> None:
             )
         with gr.Row(elem_classes=["vc-compact-row"]):
             target_seconds = gr.Number(
-                value=5.0, minimum=0.1, step=0.1, label="Target seconds",
+                value=initial_target_seconds, minimum=0.1, step=0.1, label="Target seconds",
                 info="Maximum duration of each fixed-length segment.",
             )
             overlap = gr.Radio(
@@ -269,19 +393,41 @@ def build(ctx: "UiContext") -> None:
             interactive=False, autoscroll=True, elem_classes=["vc-log"],
         )
 
-    def target_changed(value: str) -> tuple[Any, Any, Any]:
+    def target_changed(value: str, fps_value: float, frames_value: int) -> tuple[Any, Any, str, float]:
         config = TRAINER_TARGETS.get(str(value), TRAINER_TARGETS["custom"])
         custom = str(value) == "custom"
+        selected_fps = float(fps_value or config["default_fps"]) if custom else float(config["default_fps"])
+        selected_frames = int(frames_value or config["default_frames"]) if custom else int(config["default_frames"])
+        suggestion, seconds = trainer_clip_suggestion(value, selected_fps, selected_frames)
         return (
-            gr.update(value=float(config["default_fps"]), visible=custom),
-            gr.update(value=int(config["default_frames"]), visible=custom),
-            f"Selected {config['label']} ({config['frame_rule']}).",
+            gr.update(visible=custom),
+            gr.update(visible=custom),
+            suggestion,
+            seconds,
         )
 
     target.change(
-        target_changed, inputs=target, outputs=[custom_fps, custom_frames, fitness_summary],
+        target_changed,
+        inputs=[target, custom_fps, custom_frames],
+        outputs=[custom_fps, custom_frames, fitness_suggestion, target_seconds],
         queue=False, show_progress="hidden", api_visibility="private",
     )
+
+    def custom_target_changed(value: str, fps_value: float, frames_value: int) -> tuple[Any, Any]:
+        if str(value) != "custom":
+            return gr.skip(), gr.skip()
+        suggestion, seconds = trainer_clip_suggestion(value, fps_value, frames_value)
+        return suggestion, seconds
+
+    for custom_control in (custom_fps, custom_frames):
+        custom_control.change(
+            custom_target_changed,
+            inputs=[target, custom_fps, custom_frames],
+            outputs=[fitness_suggestion, target_seconds],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     def analyze_handler(folder_value: str, target_value: str, bucket_value: str, policy_value: str, fps_value: float, frames_value: int) -> tuple[Any, ...]:
         try:
@@ -302,19 +448,18 @@ def build(ctx: "UiContext") -> None:
         show_progress="minimal", api_visibility="private",
     )
 
-    def write_plan_handler(plan: dict[str, Any]) -> str:
+    def write_plan_handler(plan: dict[str, Any], output_dir: str) -> str:
         if not plan:
             return "<span class='vc-warn'>Analyze clips before writing a plan.</span>"
         try:
-            target_path = Path(str(plan["source_folder"])) / "clip_fitness_plan.json"
-            OutputWriter().write_json(target_path, plan, pretty=True)
+            target_path = write_clip_fitness_plan(plan, output_dir)
             ctx.app_log.log(f"Wrote clip fitness plan: {target_path}", scope="dataset")
             return f"Wrote `{target_path}`."
         except Exception as exc:
             return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
 
     write_plan.click(
-        write_plan_handler, inputs=fitness_plan, outputs=fitness_summary,
+        write_plan_handler, inputs=[fitness_plan, plan_output_dir], outputs=fitness_summary,
         queue=False, show_progress="hidden", api_visibility="private",
     )
 
@@ -361,6 +506,8 @@ def build(ctx: "UiContext") -> None:
     )
 
     def open_handler(path_value: str) -> str:
+        if not str(path_value or "").strip():
+            return "<span class='vc-warn'>Generate a TOML or enter an output path first.</span>"
         target_path = normalize_path(path_value)
         directory = target_path if target_path.is_dir() else target_path.parent
         ok, message = open_in_file_manager(directory)
@@ -414,8 +561,7 @@ def build(ctx: "UiContext") -> None:
             kind, fraction, message = events.get()
             if kind == "terminal":
                 break
-            lines.append(message)
-            lines = lines[-250:]
+            append_deduped_progress_line(lines, message)
             yield render_progress_html(fraction, "Sub-splitting", message), "\n".join(lines)
         if "error" in terminal:
             exc = terminal["error"]
@@ -432,4 +578,11 @@ def build(ctx: "UiContext") -> None:
     )
 
 
-__all__ = ["analyze_clip_fitness", "build", "parse_target_frames"]
+__all__ = [
+    "analyze_clip_fitness",
+    "append_deduped_progress_line",
+    "build",
+    "parse_target_frames",
+    "trainer_clip_suggestion",
+    "write_clip_fitness_plan",
+]

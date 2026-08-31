@@ -50,6 +50,7 @@ class ClipQuality:
     sharpness: float
     silence_ratio: float
     has_audio: bool
+    has_video: bool = True
 
 
 @dataclass(frozen=True)
@@ -234,35 +235,51 @@ def _silence_ratio(samples: np.ndarray, sample_rate: int = 16000) -> float:
 
 
 def analyze_clip_quality(
-    path: str | os.PathLike[str], *, sample_frames: int = 8
+    path: str | os.PathLike[str],
+    *,
+    sample_frames: int = 8,
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> ClipQuality:
-    """Measure sampled blackness, motion, sharpness, and audio silence."""
+    """Measure visual/audio quality for a whole source or a planned time range."""
 
     source = normalize_path(path, must_exist=True)
     info = probe_media(source)
-    if not info.has_video:
-        raise MediaError(f"No video stream found in {source}")
-    count = max(1, int(sample_frames))
-    decoded = read_video_frames(
-        source,
-        sampling="uniform",
-        num_frames=count,
-        max_frames=count,
-        min_frames=1,
-        max_pixels=640 * 640,
-        min_pixels=None,
-        size_multiple=2,
-    )
+    if not info.has_video and not info.has_audio:
+        raise MediaError(f"No video or audio stream found in {source}")
+    beginning = max(0.0, float(start_s or 0.0))
+    ending = float(end_s) if end_s is not None else info.duration
+    if info.duration is not None:
+        beginning = min(beginning, float(info.duration))
+        ending = float(info.duration) if ending is None else min(max(0.0, ending), float(info.duration))
+    if ending is not None and ending <= beginning:
+        raise ValueError("end_s must be greater than start_s")
+    duration = max(0.0, float(ending) - beginning) if ending is not None else float(info.duration or 0.0)
+
     gray_frames: list[np.ndarray] = []
     luma_values: list[float] = []
     black_values: list[float] = []
     sharpness_values: list[float] = []
-    for frame in decoded.frames:
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        gray_frames.append(gray)
-        luma_values.append(float(np.mean(gray)))
-        black_values.append(float(np.mean(gray <= 16)))
-        sharpness_values.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+    if info.has_video:
+        count = max(1, int(sample_frames))
+        decoded = read_video_frames(
+            source,
+            start=beginning,
+            end=ending,
+            sampling="uniform",
+            num_frames=count,
+            max_frames=count,
+            min_frames=1,
+            max_pixels=640 * 640,
+            min_pixels=None,
+            size_multiple=2,
+        )
+        for frame in decoded.frames:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            gray_frames.append(gray)
+            luma_values.append(float(np.mean(gray)))
+            black_values.append(float(np.mean(gray <= 16)))
+            sharpness_values.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
     differences = [
         float(np.mean(cv2.absdiff(previous, current)))
         for previous, current in zip(gray_frames, gray_frames[1:])
@@ -271,17 +288,21 @@ def analyze_clip_quality(
     silence = 1.0
     if has_audio:
         try:
-            silence = _silence_ratio(read_audio(source, sample_rate=16000), 16000)
+            samples = read_audio(source, sample_rate=16000)
+            start_sample = min(samples.size, max(0, int(round(beginning * 16000))))
+            end_sample = samples.size if ending is None else min(samples.size, max(0, int(round(ending * 16000))))
+            silence = _silence_ratio(samples[start_sample:end_sample], 16000)
         except Exception:
             silence = 1.0
     return ClipQuality(
-        duration=float(info.duration or 0.0),
+        duration=duration,
         mean_luma=float(np.mean(luma_values)) if luma_values else 0.0,
-        black_ratio=float(np.mean(black_values)) if black_values else 1.0,
+        black_ratio=float(np.mean(black_values)) if black_values else 0.0,
         static_score=float(np.mean(differences)) if differences else 0.0,
         sharpness=float(np.mean(sharpness_values)) if sharpness_values else 0.0,
         silence_ratio=silence,
         has_audio=has_audio,
+        has_video=bool(info.has_video),
     )
 
 
@@ -295,15 +316,15 @@ def should_reject(
         reasons.append(
             f"too short ({quality.duration:.2f}s < {float(rules.min_duration_s):.2f}s)"
         )
-    if quality.black_ratio > float(rules.max_black_ratio):
+    if quality.has_video and quality.black_ratio > float(rules.max_black_ratio):
         reasons.append(
             f"mostly black ({quality.black_ratio:.1%} > {float(rules.max_black_ratio):.1%})"
         )
-    if rules.max_static_score >= 0 and quality.static_score <= float(rules.max_static_score):
+    if quality.has_video and rules.max_static_score >= 0 and quality.static_score <= float(rules.max_static_score):
         reasons.append(
             f"too static (frame difference {quality.static_score:.3f} <= {float(rules.max_static_score):.3f})"
         )
-    if quality.sharpness < max(0.0, float(rules.min_sharpness)):
+    if quality.has_video and quality.sharpness < max(0.0, float(rules.min_sharpness)):
         reasons.append(
             f"low sharpness ({quality.sharpness:.2f} < {float(rules.min_sharpness):.2f})"
         )
@@ -380,7 +401,18 @@ def normalize_clip_for_model(
         "yuv420p",
     ]
     if keep_audio:
-        arguments += ["-map", "1:a:0" if silent_input else "0:a:0", "-c:a", "aac", "-ac", "1", "-ar", str(max(1, int(audio_sr))), "-b:a", "128k"]
+        arguments += [
+            "-map",
+            "1:a:0" if silent_input else "0:a:0",
+            "-c:a",
+            "aac",
+            "-ac",
+            "1",
+            "-ar",
+            str(max(1, int(audio_sr))),
+            "-b:a",
+            "128k",
+        ]
         if silent_input:
             arguments += ["-shortest"]
     else:

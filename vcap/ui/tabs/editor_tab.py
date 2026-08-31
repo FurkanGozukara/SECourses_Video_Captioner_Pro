@@ -27,7 +27,14 @@ from vcap.core.captions_post import (
 from vcap.core.export import export_dataset, read_flags, write_flags
 from vcap.core.media import preview_safe_media, probe_media
 from vcap.core.outputs import OutputWriter
-from vcap.core.paths import guess_kind_by_extension, list_media_files, natural_sort_key, normalize_path
+from vcap.core.paths import (
+    guess_kind_by_extension,
+    list_media_files,
+    natural_sort_key,
+    normalize_path,
+    open_in_file_manager,
+    reveal_in_file_manager,
+)
 from vcap.models.registry import all_variant_choices, variant_to_family
 from vcap.pipeline.job import InputItem, JobSpec, OutputSpec, PostSpec
 from vcap.prompts.presets import get_preset, list_presets
@@ -66,6 +73,7 @@ _DEFAULT_FILTER = {
 
 class EditorItem(TypedDict, total=False):
     media_path: str | None
+    source_media_path: str | None
     caption_path: str
     caption: str
     caption_field: str | None
@@ -115,12 +123,28 @@ def _scan_directories(root: Path, recursive: bool) -> list[Path]:
             child
             for child in root.iterdir()
             if child.is_dir()
-            and _RUN_DIR_RE.match(child.name)
-            and (child / "metadata.json").is_file()
+            and (
+                (_RUN_DIR_RE.match(child.name) and (child / "metadata.json").is_file())
+                or _contains_caption_sidecars(child)
+            )
         )
     except (OSError, PermissionError):
         pass
     return directories
+
+
+def _contains_caption_sidecars(folder: Path) -> bool:
+    try:
+        return any(
+            path.is_file()
+            and not path.name.startswith(".")
+            and path.suffix.casefold() in CAPTION_EXTENSIONS
+            and path.name.casefold() not in _IGNORED_CAPTION_NAMES
+            and path.name.casefold() not in _IGNORED_JSON_NAMES
+            for path in folder.iterdir()
+        )
+    except (OSError, PermissionError):
+        return False
 
 
 def _walk_caption_files(root: Path, recursive: bool) -> list[Path]:
@@ -190,13 +214,14 @@ def _write_caption(path: Path, text: str, field: str | None = None) -> Path:
 
 
 def _flag_key(root: Path, item: Mapping[str, Any]) -> str | None:
-    raw = item.get("media_path") or item.get("caption_path")
-    if not raw:
-        return None
-    try:
-        return normalize_path(str(raw)).relative_to(root).as_posix()
-    except (OSError, ValueError):
-        return None
+    for raw in (item.get("media_path"), item.get("caption_path")):
+        if not raw:
+            continue
+        try:
+            return normalize_path(str(raw)).relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _failed_media(root: Path, recursive: bool) -> tuple[set[str], set[str]]:
@@ -227,6 +252,158 @@ def _failed_media(root: Path, recursive: bool) -> tuple[set[str], set[str]]:
                     paths.add(raw_path.casefold())
                 names.add(Path(raw_path).name.casefold())
     return paths, names
+
+
+def _path_values(value: Any) -> list[str]:
+    if isinstance(value, (str, os.PathLike)):
+        text = os.fspath(value).strip()
+        return [text] if text else []
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for key in ("path", "name", "input", "source", "media_path", "file"):
+            if key in value:
+                values.extend(_path_values(value[key]))
+        if not values:
+            for entry in value.values():
+                values.extend(_path_values(entry))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for entry in value:
+            values.extend(_path_values(entry))
+        return values
+    return []
+
+
+def _metadata_candidate(raw: str, metadata_path: Path) -> Path:
+    text = str(raw).strip().strip('"').strip("'")
+    direct = normalize_path(text)
+    raw_path = Path(text)
+    if raw_path.is_absolute():
+        return direct
+    relative = normalize_path(metadata_path.parent / raw_path)
+    return relative if relative.exists() or not direct.exists() else direct
+
+
+def _metadata_entries(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    entries: list[Mapping[str, Any]] = []
+    for key in ("items", "items_results"):
+        value = document.get(key)
+        if isinstance(value, list):
+            entries.extend(entry for entry in value if isinstance(entry, Mapping))
+    return entries
+
+
+def _entry_output_paths(entry: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("outputs", "output", "caption_path", "output_path"):
+        if key in entry:
+            values.extend(_path_values(entry[key]))
+    return values
+
+
+def _entry_source_paths(entry: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("input", "source", "media_path", "path", "file"):
+        if key in entry:
+            values.extend(_path_values(entry[key]))
+    return values
+
+
+def _is_caption_match(raw: str, caption_path: Path, metadata_path: Path) -> bool:
+    try:
+        candidate = _metadata_candidate(raw, metadata_path)
+    except Exception:
+        return False
+    return candidate == caption_path or (
+        candidate.stem.casefold() == caption_path.stem.casefold()
+        and candidate.suffix.casefold() in CAPTION_EXTENSIONS
+    )
+
+
+def _metadata_media_candidates(
+    document: Mapping[str, Any],
+    metadata_path: Path,
+    caption_path: Path,
+) -> list[Path]:
+    entries = _metadata_entries(document)
+    matched = [
+        entry
+        for entry in entries
+        if any(_is_caption_match(raw, caption_path, metadata_path) for raw in _entry_output_paths(entry))
+    ]
+    if not matched:
+        matched = [
+            entry
+            for entry in entries
+            if any(Path(raw).stem.casefold() == caption_path.stem.casefold() for raw in _entry_source_paths(entry))
+        ]
+    if not matched and len(entries) == 1:
+        matched = entries
+
+    raw_candidates: list[str] = []
+    for entry in matched:
+        raw_candidates.extend(_entry_source_paths(entry))
+    settings = document.get("settings")
+    settings_map = settings if isinstance(settings, Mapping) else {}
+    configured = [
+        *_path_values(settings_map.get("input_files")),
+        *_path_values(settings_map.get("input_path")),
+        *_path_values(document.get("input_files")),
+        *_path_values(document.get("input_path")),
+    ]
+    matching_configured = [
+        raw for raw in configured if Path(raw).stem.casefold() == caption_path.stem.casefold()
+    ]
+    raw_candidates.extend(matching_configured)
+    if len(configured) == 1 or caption_path.stem.casefold() == "caption":
+        raw_candidates.extend(configured)
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        try:
+            candidate = _metadata_candidate(raw, metadata_path)
+        except Exception:
+            continue
+        if guess_kind_by_extension(candidate) not in {"video", "audio", "image"}:
+            continue
+        key = str(candidate).casefold()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+    return candidates
+
+
+def resolve_media_from_metadata(
+    caption_path: str | os.PathLike[str],
+    scan_root: str | os.PathLike[str] | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Return an existing source and the best metadata path candidate for a caption."""
+
+    caption = normalize_path(caption_path)
+    root = normalize_path(scan_root) if scan_root is not None else None
+    directories = [caption.parent, *caption.parent.parents]
+    for directory in directories:
+        if root is not None:
+            try:
+                directory.relative_to(root)
+            except ValueError:
+                break
+        metadata_path = directory / "metadata.json"
+        if metadata_path.is_file():
+            try:
+                document = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                document = None
+            if isinstance(document, Mapping):
+                candidates = _metadata_media_candidates(document, metadata_path, caption)
+                existing = next((candidate for candidate in candidates if candidate.is_file()), None)
+                if existing is not None or candidates:
+                    return existing, existing or candidates[0]
+        if root is not None and directory == root:
+            break
+    return None, None
 
 
 def _item_from_pair(
@@ -340,7 +517,19 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
         if caption_path != formats[0]:
             continue
         used_captions.update(str(path.resolve(strict=False)).casefold() for path in formats)
-        items.append(_item_from_pair(None, caption_path, formats, root, flags, failed_paths, failed_names))
+        resolved_media, source_media = resolve_media_from_metadata(caption_path, root)
+        item = _item_from_pair(
+            resolved_media,
+            caption_path,
+            formats,
+            root,
+            flags,
+            failed_paths,
+            failed_names,
+        )
+        if source_media is not None:
+            item["source_media_path"] = str(source_media)
+        items.append(item)
 
     def item_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
         raw = str(item.get("media_path") or item.get("caption_path") or "")
@@ -359,7 +548,8 @@ def _optional_int(value: Any) -> int | None:
     number = float(value)
     if not math.isfinite(number):
         raise ValueError("Filter values must be finite")
-    return int(number)
+    integer = int(number)
+    return None if integer <= 0 else integer
 
 
 def _matches_filter(item: Mapping[str, Any], spec: Mapping[str, Any]) -> bool:
@@ -447,7 +637,12 @@ def _stats_markdown(item: Mapping[str, Any] | None) -> str:
     if not item:
         return "**No item selected.**"
     stats = caption_stats(str(item.get("caption") or ""))
-    raw = str(item.get("media_path") or item.get("caption_path") or "")
+    raw = str(
+        item.get("media_path")
+        or item.get("source_media_path")
+        or item.get("caption_path")
+        or ""
+    )
     duration = item.get("duration")
     duration_text = f" · {float(duration):.2f}s" if duration is not None else ""
     return f"**{stats['chars']} chars** · {stats['words']} words · ~{stats['approx_tokens']} tokens{duration_text}<br>`{html.escape(raw)}`"
@@ -480,9 +675,18 @@ def _selection_payload(
     item = state["items"][int(selected)]
     video, audio, image = gr.update(value=None, visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False)
     media_path = item.get("media_path")
+    source_media_path = item.get("source_media_path") or media_path
     placeholder = gr.update(visible=False)
     if not media_path:
-        placeholder = gr.update(value="No media available for this caption.", visible=True)
+        if source_media_path:
+            placeholder = gr.update(
+                value=f"Source media not found: {source_media_path}",
+                visible=True,
+            )
+        else:
+            placeholder = gr.update(value="No media available for this caption.", visible=True)
+    elif not Path(media_path).is_file():
+        placeholder = gr.update(value=f"Source media not found: {media_path}", visible=True)
     if load_preview and media_path and Path(media_path).is_file():
         try:
             info = probe_media(media_path)
@@ -556,6 +760,166 @@ def _prompt_choices() -> list[tuple[str, str]]:
     return [(f"{preset.group} · {preset.label}", preset.id) for preset in list_presets()]
 
 
+def _handler_error(total_outputs: int, state: Any, message: str) -> tuple[Any, ...]:
+    """Build a complete Gradio handler tuple ending in one status message."""
+
+    return state, *[gr.skip() for _ in range(max(0, total_outputs - 2))], message
+
+
+def editor_filter_handler(
+    current: EditorState,
+    values: Iterable[Any],
+    *,
+    initial_state: EditorState | None = None,
+    preview_cache: str | os.PathLike[str] = ".",
+) -> tuple[Any, ...]:
+    """Apply the editor filter and always return its complete ten outputs."""
+
+    raw = list(values)
+    if len(raw) != 8:
+        return _handler_error(10, current, "<span class='vc-err'>Invalid filter input count.</span>")
+    next_state = deepcopy(current or initial_state or new_editor_state())
+    next_state["filter"] = {
+        "search": raw[0], "regex": bool(raw[1]), "min_length": raw[2],
+        "max_length": raw[3], "min_tokens": raw[4], "max_tokens": raw[5],
+        "flag": raw[6], "status": raw[7],
+    }
+    try:
+        if next_state["filter"]["search"] and next_state["filter"]["regex"]:
+            re.compile(str(next_state["filter"]["search"]), flags=re.IGNORECASE)
+        matches = filtered_indices(next_state)
+    except (ValueError, re.error) as exc:
+        return _handler_error(
+            10,
+            current,
+            f"<span class='vc-err'>Invalid filter: {html.escape(str(exc))}</span>",
+        )
+    next_state["page"] = 1
+    next_state["selected_index"] = matches[0] if matches else None
+    rows, page_text = _page_rows(next_state)
+    return (
+        next_state,
+        rows,
+        page_text,
+        *_selection_payload(next_state, Path(preview_cache), load_preview=False),
+        f"Filter matched {len(matches)} item(s).",
+    )
+
+
+def editor_flag_handler(
+    current: EditorState,
+    flag: str,
+    *,
+    default_folder: str | os.PathLike[str] = ".",
+    preview_cache: str | os.PathLike[str] = ".",
+) -> tuple[Any, ...]:
+    """Persist an approval flag and always return its complete eleven outputs."""
+
+    next_state = deepcopy(current or new_editor_state(default_folder))
+    selected = next_state.get("selected_index")
+    if selected is None or not (0 <= int(selected) < len(next_state.get("items") or [])):
+        return _handler_error(11, next_state, "No caption is selected.")
+    indices_before = filtered_indices(next_state)
+    old_position = indices_before.index(int(selected)) if int(selected) in indices_before else 0
+    item = next_state["items"][int(selected)]
+    if next_state.get("dirty"):
+        draft = str(next_state.get("draft_caption") or "")
+        _write_caption(Path(str(item["caption_path"])), draft, item.get("caption_field"))
+        _refresh_item(item, draft)
+        next_state["dirty"], next_state["draft_caption"] = False, None
+    root = normalize_path(next_state.get("folder") or default_folder)
+    key = _flag_key(root, item)
+    if key is None:
+        return _handler_error(
+            11,
+            next_state,
+            "<span class='vc-err'>Selected item is outside the scanned folder.</span>",
+        )
+    flags = read_flags(root)
+    flags[key] = flag
+    write_flags(root, flags)
+    item["flag"] = flag
+    remaining = filtered_indices(next_state)
+    if remaining:
+        position = min(
+            len(remaining) - 1,
+            (remaining.index(int(selected)) + 1) if int(selected) in remaining else old_position,
+        )
+        next_state["selected_index"] = remaining[position]
+    rows, page_text = _page_rows(next_state)
+    message = f"Marked {Path(str(item.get('media_path') or item['caption_path'])).name} {flag}."
+    return (
+        next_state,
+        rows,
+        _counter_markdown(next_state),
+        page_text,
+        *_selection_payload(next_state, Path(preview_cache)),
+        message,
+    )
+
+
+def editor_save_handler(
+    current: EditorState,
+    text: str,
+    *,
+    initial_state: EditorState | None = None,
+    quiet: bool = False,
+) -> tuple[Any, ...]:
+    """Atomically save the selected caption and return all five UI outputs."""
+
+    next_state = deepcopy(current or initial_state or new_editor_state())
+    selected = next_state.get("selected_index")
+    if selected is None or not (0 <= int(selected) < len(next_state.get("items") or [])):
+        return next_state, gr.skip(), gr.skip(), _stats_markdown(None), "No caption is selected."
+    item = next_state["items"][int(selected)]
+    try:
+        path = Path(str(item["caption_path"]))
+        value = str(text or "")
+        _write_caption(path, value, item.get("caption_field"))
+        _refresh_item(item, value)
+        next_state["dirty"], next_state["draft_caption"] = False, None
+        rows, _ = _page_rows(next_state)
+        message = f"Saved {path}."
+        return next_state, rows, _counter_markdown(next_state), _stats_markdown(item), (gr.skip() if quiet else message)
+    except Exception as exc:
+        return (
+            next_state,
+            gr.skip(),
+            gr.skip(),
+            _stats_markdown(item),
+            f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+        )
+
+
+def editor_export_handler(
+    current: EditorState,
+    destination: str | os.PathLike[str],
+    copy_media: bool = True,
+    extension: str = ".txt",
+    include_caption_only: bool = False,
+) -> str:
+    """Export approved editor items and return a UI-ready summary."""
+
+    try:
+        report = export_dataset(
+            current.get("items") or [],
+            destination,
+            only_approved=True,
+            copy_media=bool(copy_media),
+            caption_ext=extension,
+            include_caption_only=bool(include_caption_only),
+        )
+        message = (
+            f"Exported {report.exported} approved item(s); no-media {report.no_media}; "
+            f"not-approved {report.not_approved}; errors {report.error_count}."
+        )
+        if report.errors:
+            message += " " + " | ".join(report.errors[:3])
+        return message
+    except Exception as exc:
+        return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+
+
 def build(ctx: "UiContext") -> None:
     """Render and wire the full Caption Editor tab."""
 
@@ -564,6 +928,9 @@ def build(ctx: "UiContext") -> None:
     regeneration_backup = gr.State({})
     autosave_timer = gr.Timer(0.5)
     preview_cache = ctx.temp_dir / "editor_previews"
+    registry = ctx.settings_registry
+    registry_components = registry.components()
+    model_entry = next((entry for entry in registry.entries() if entry.key == "model_key"), None)
 
     with gr.Row(elem_classes=["vc-compact-row"]):
         folder = gr.Textbox(
@@ -571,6 +938,8 @@ def build(ctx: "UiContext") -> None:
             info="Scan media/caption sidecars or SECourses run directories.", scale=7,
         )
         scan = action_button("Scan", "cyan", size="md", scale=1, min_width=92)
+        open_folder = action_button("📂 Open folder", "amber", size="md", scale=1, min_width=118)
+        reveal_selected = action_button("📍 Reveal selected file", "crimson", size="md", scale=1, min_width=158)
         recursive = gr.Checkbox(
             value=False, label="Recursive",
             info="Include nested batch folders and run clip directories.", scale=1,
@@ -594,10 +963,10 @@ def build(ctx: "UiContext") -> None:
                 value="all", label="Status", info="Show empty or failed captions only.",
             )
         with gr.Row(elem_classes=["vc-compact-row"]):
-            min_length = gr.Number(label="Min chars", precision=0, minimum=0, info="Minimum caption length.")
-            max_length = gr.Number(label="Max chars", precision=0, minimum=0, info="Maximum caption length.")
-            min_tokens = gr.Number(label="Min tokens", precision=0, minimum=0, info="Minimum approximate token count.")
-            max_tokens = gr.Number(label="Max tokens", precision=0, minimum=0, info="Maximum approximate token count.")
+            min_length = gr.Number(label="Min chars", precision=0, minimum=0, info="Minimum caption length; 0 = no limit.")
+            max_length = gr.Number(label="Max chars", precision=0, minimum=0, info="Maximum caption length; 0 = no limit.")
+            min_tokens = gr.Number(label="Min tokens", precision=0, minimum=0, info="Minimum approximate token count; 0 = no limit.")
+            max_tokens = gr.Number(label="Max tokens", precision=0, minimum=0, info="Maximum approximate token count; 0 = no limit.")
             apply_filters = action_button("Apply filters", "blue", size="md", min_width=126)
 
     status = gr.Markdown("Ready to scan.", elem_classes=["vc-status"])
@@ -642,10 +1011,10 @@ def build(ctx: "UiContext") -> None:
                 save = action_button("💾 Save", "green", size="md", scale=1)
             with gr.Row(elem_classes=["vc-compact-row"]):
                 previous_item = action_button("⬅ Prev", "violet", size="md", scale=1)
-                next_item = action_button("➡ Next", "violet", size="md", scale=1)
+                next_item = action_button("➡ Next", "slate", size="md", scale=1)
                 approve = action_button("✅ Approve", "emerald", size="md", scale=1)
                 reject = action_button("❌ Reject", "rose", size="md", scale=1)
-                gr.HTML('<span class="vc-help" title="Left/Right: previous/next; Ctrl+S: save">&#9432;</span>', min_width=24)
+                gr.HTML('<span class="vc-help" title="Left/Right: previous/next; Ctrl+S: save; Ctrl+Enter: approve; Ctrl+Delete: reject">&#9432;</span>', min_width=24)
 
     # Canonical editor hooks plus aliases consumed by T6's global shortcut map.
     hk_ed_prev = gr.Button("Editor previous", elem_id="hk_ed_prev", visible="hidden")
@@ -659,7 +1028,11 @@ def build(ctx: "UiContext") -> None:
 
     with gr.Accordion("🔁 Regenerate selected", open=False):
         variants = all_variant_choices()
-        default_variant = next((key for _, key in variants if key == "qwen3_omni_instruct_int8"), variants[0][1])
+        default_variant = (
+            str(model_entry.default)
+            if model_entry is not None
+            else next((key for _, key in variants if key == "qwen3_omni_instruct_int8"), variants[0][1])
+        )
         prompts = _prompt_choices()
         with gr.Row(elem_classes=["vc-compact-row"]):
             regen_variant = gr.Dropdown(
@@ -680,6 +1053,16 @@ def build(ctx: "UiContext") -> None:
             revert = action_button("Revert", "red", size="md")
         regen_status = gr.Markdown("No regeneration is pending.", elem_classes=["vc-status"])
         regen_diff = gr.HTML("")
+
+    if model_entry is not None:
+        model_entry.component.change(
+            lambda value: gr.update(value=value),
+            inputs=model_entry.component,
+            outputs=regen_variant,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     with gr.Accordion("🔎 Find & replace across folder", open=False):
         with gr.Row(elem_classes=["vc-compact-row"]):
@@ -723,6 +1106,11 @@ def build(ctx: "UiContext") -> None:
                 info="Approved media/caption pairs are copied here without deleting sources.", scale=5,
             )
             export_copy_media = gr.Checkbox(value=True, label="Copy media", info="Copy media files along with captions.")
+            export_caption_only = gr.Checkbox(
+                value=False,
+                label="Include caption-only items",
+                info="Export approved captions without available media as caption files only.",
+            )
             export_extension = gr.Dropdown(
                 choices=[".txt", ".json", ".srt"], value=".txt", label="Caption extension",
                 info="Extension used for exported captions.",
@@ -754,23 +1142,49 @@ def build(ctx: "UiContext") -> None:
         show_progress="minimal", api_visibility="private",
     )
 
+    def open_folder_handler(raw_folder: str) -> str:
+        if not str(raw_folder or "").strip():
+            return "<span class='vc-warn'>Enter a caption folder first.</span>"
+        ok, message = open_in_file_manager(normalize_path(raw_folder))
+        return f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"
+
+    def reveal_selected_handler(current: EditorState) -> str:
+        selected = (current or {}).get("selected_index")
+        items = (current or {}).get("items") or []
+        if selected is None or not (0 <= int(selected) < len(items)):
+            return "<span class='vc-warn'>Select a caption first.</span>"
+        item = items[int(selected)]
+        raw = item.get("media_path") or item.get("source_media_path")
+        if raw and not Path(str(raw)).is_file():
+            return f"<span class='vc-warn'>Source media not found: {html.escape(str(raw))}</span>"
+        raw = raw or item.get("caption_path")
+        ok, message = reveal_in_file_manager(str(raw or ""))
+        return f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"
+
+    open_folder.click(
+        open_folder_handler,
+        inputs=folder,
+        outputs=status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    reveal_selected.click(
+        reveal_selected_handler,
+        inputs=state,
+        outputs=status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
     def filter_handler(current: EditorState, *values: Any) -> tuple[Any, ...]:
-        next_state = deepcopy(current or initial_state)
-        next_state["filter"] = {
-            "search": values[0], "regex": bool(values[1]), "min_length": values[2],
-            "max_length": values[3], "min_tokens": values[4], "max_tokens": values[5],
-            "flag": values[6], "status": values[7],
-        }
-        try:
-            if next_state["filter"]["search"] and next_state["filter"]["regex"]:
-                re.compile(str(next_state["filter"]["search"]), flags=re.IGNORECASE)
-            matches = filtered_indices(next_state)
-        except (ValueError, re.error) as exc:
-            return current, gr.skip(), gr.skip(), *[gr.skip() for _ in range(5)], f"<span class='vc-err'>Invalid filter: {html.escape(str(exc))}</span>"
-        next_state["page"] = 1
-        next_state["selected_index"] = matches[0] if matches else None
-        rows, page_text = _page_rows(next_state)
-        return next_state, rows, page_text, *_selection_payload(next_state, preview_cache, load_preview=False), f"Filter matched {len(matches)} item(s)."
+        return editor_filter_handler(
+            current,
+            values,
+            initial_state=initial_state,
+            preview_cache=preview_cache,
+        )
 
     apply_filters.click(
         filter_handler,
@@ -823,23 +1237,19 @@ def build(ctx: "UiContext") -> None:
     )
 
     def save_handler(current: EditorState, text: str, quiet: bool = False) -> tuple[Any, ...]:
-        next_state = deepcopy(current or initial_state)
-        selected = next_state.get("selected_index")
-        if selected is None or not (0 <= int(selected) < len(next_state.get("items") or [])):
-            return next_state, gr.skip(), gr.skip(), _stats_markdown(None), "No caption is selected."
-        item = next_state["items"][int(selected)]
-        try:
-            path = Path(str(item["caption_path"]))
-            _write_caption(path, str(text or ""), item.get("caption_field"))
-            _refresh_item(item, str(text or ""))
-            next_state["dirty"], next_state["draft_caption"] = False, None
-            rows, _ = _page_rows(next_state)
-            message = f"Saved {path}."
-            ctx.app_log.log(message, scope="editor")
-            return next_state, rows, _counter_markdown(next_state), _stats_markdown(item), (gr.skip() if quiet else message)
-        except Exception as exc:
-            ctx.app_log.error(f"Caption save failed: {exc}", scope="editor")
-            return next_state, gr.skip(), gr.skip(), _stats_markdown(item), f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+        result = editor_save_handler(
+            current,
+            text,
+            initial_state=initial_state,
+            quiet=quiet,
+        )
+        message = result[-1]
+        if isinstance(message, str):
+            if "vc-err" in message:
+                ctx.app_log.error(f"Caption save failed: {message}", scope="editor")
+            elif message != "No caption is selected.":
+                ctx.app_log.log(message, scope="editor")
+        return result
 
     for trigger in (save.click, hk_ed_save.click, hk_save_alias.click):
         trigger(
@@ -847,15 +1257,32 @@ def build(ctx: "UiContext") -> None:
             queue=False, show_progress="hidden", api_visibility="private",
         )
 
-    def autosave_handler(current: EditorState, enabled: bool) -> tuple[Any, ...]:
+    def autosave_handler(current: EditorState, enabled: bool, textbox_value: str) -> tuple[Any, ...]:
         if not enabled or not current or not current.get("dirty"):
             return (gr.skip(),) * 5
         if time.monotonic() - float(current.get("last_edit") or 0.0) < 0.7:
             return (gr.skip(),) * 5
-        return save_handler(current, str(current.get("draft_caption") or ""), True)
+        saved_draft = str(current.get("draft_caption") or "")
+        result = list(save_handler(current, saved_draft, True))
+        current_text = str(textbox_value or "")
+        if current_text != saved_draft and isinstance(result[0], dict):
+            saved_state = result[0]
+            selected = saved_state.get("selected_index")
+            if selected is not None and 0 <= int(selected) < len(saved_state.get("items") or []):
+                selected_item = saved_state["items"][int(selected)]
+                _refresh_item(selected_item, current_text)
+                saved_state.update(
+                    dirty=True,
+                    draft_caption=current_text,
+                    last_edit=time.monotonic(),
+                )
+                result[1], _ = _page_rows(saved_state)
+                result[2] = _counter_markdown(saved_state)
+                result[3] = _stats_markdown(selected_item)
+        return tuple(result)
 
     autosave_timer.tick(
-        autosave_handler, inputs=[state, autosave], outputs=[state, table, counters, stats, status],
+        autosave_handler, inputs=[state, autosave, caption], outputs=[state, table, counters, stats, status],
         queue=False, show_progress="hidden", api_visibility="private",
     )
 
@@ -888,32 +1315,18 @@ def build(ctx: "UiContext") -> None:
         )
 
     def flag_handler(current: EditorState, flag: str) -> tuple[Any, ...]:
-        next_state = deepcopy(current or initial_state)
-        selected = next_state.get("selected_index")
-        if selected is None or not (0 <= int(selected) < len(next_state.get("items") or [])):
-            return next_state, gr.skip(), gr.skip(), gr.skip(), *[gr.skip() for _ in range(5)], "No caption is selected."
-        indices_before = filtered_indices(next_state)
-        old_position = indices_before.index(int(selected)) if int(selected) in indices_before else 0
-        item = next_state["items"][int(selected)]
-        if next_state.get("dirty"):
-            _write_caption(Path(str(item["caption_path"])), str(next_state.get("draft_caption") or ""), item.get("caption_field"))
-            next_state["dirty"] = False
-        root = normalize_path(next_state.get("folder") or ctx.outputs_dir)
-        key = _flag_key(root, item)
-        if key is None:
-            return next_state, gr.skip(), gr.skip(), gr.skip(), *[gr.skip() for _ in range(5)], "<span class='vc-err'>Selected item is outside the scanned folder.</span>"
-        flags = read_flags(root)
-        flags[key] = flag
-        write_flags(root, flags)
-        item["flag"] = flag
-        remaining = filtered_indices(next_state)
-        if remaining:
-            position = min(len(remaining) - 1, (remaining.index(int(selected)) + 1) if int(selected) in remaining else old_position)
-            next_state["selected_index"] = remaining[position]
-        rows, page_text = _page_rows(next_state)
-        message = f"Marked {Path(str(item.get('media_path') or item['caption_path'])).name} {flag}."
-        ctx.app_log.log(message, scope="editor")
-        return next_state, rows, _counter_markdown(next_state), page_text, *_selection_payload(next_state, preview_cache), message
+        result = editor_flag_handler(
+            current,
+            flag,
+            default_folder=ctx.outputs_dir,
+            preview_cache=preview_cache,
+        )
+        message = str(result[-1])
+        if "vc-err" in message or message == "No caption is selected.":
+            ctx.app_log.error(re.sub(r"<[^>]+>", "", message), scope="editor")
+        else:
+            ctx.app_log.log(message, scope="editor")
+        return result
 
     for trigger, flag in ((approve.click, "approved"), (hk_ed_approve.click, "approved"), (reject.click, "rejected"), (hk_ed_reject.click, "rejected")):
         trigger(
@@ -1006,23 +1419,29 @@ def build(ctx: "UiContext") -> None:
             show_progress="minimal", api_visibility="private",
         )
 
-    def export_handler(current: EditorState, destination: str, copy_media: bool, extension: str) -> str:
-        try:
-            report = export_dataset(
-                current.get("items") or [], destination, only_approved=True,
-                copy_media=bool(copy_media), caption_ext=extension,
-            )
-            message = f"Exported {report.exported} approved item(s); skipped {report.skipped}; not approved {report.rejected}."
-            if report.errors:
-                message += " " + " | ".join(report.errors[:3])
+    def export_handler(
+        current: EditorState,
+        destination: str,
+        copy_media: bool,
+        extension: str,
+        include_caption_only: bool,
+    ) -> str:
+        message = editor_export_handler(
+            current,
+            destination,
+            copy_media,
+            extension,
+            include_caption_only,
+        )
+        if "vc-err" in message:
+            ctx.app_log.error(f"Approved export failed: {message}", scope="editor")
+        else:
             ctx.app_log.log(message, scope="editor")
-            return message
-        except Exception as exc:
-            ctx.app_log.error(f"Approved export failed: {exc}", scope="editor")
-            return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+        return message
 
     export_button.click(
-        export_handler, inputs=[state, export_destination, export_copy_media, export_extension],
+        export_handler,
+        inputs=[state, export_destination, export_copy_media, export_extension, export_caption_only],
         outputs=export_result, show_progress="minimal", api_visibility="private",
     )
 
@@ -1040,7 +1459,13 @@ def build(ctx: "UiContext") -> None:
         def on_item(self, event: Any) -> None:
             self.events.put(("progress", getattr(event, "message", str(event))))
 
-    def regenerate_handler(current: EditorState, variant: str, prompt_id: str, override: str):
+    def regenerate_handler(
+        current: EditorState,
+        variant: str,
+        prompt_id: str,
+        override: str,
+        *runtime_values: Any,
+    ):
         next_state = deepcopy(current or initial_state)
         selected = next_state.get("selected_index")
         if selected is None or not (0 <= int(selected) < len(next_state.get("items") or [])):
@@ -1061,14 +1486,20 @@ def build(ctx: "UiContext") -> None:
         except OSError:
             old_raw = None
         old_field = item.get("caption_field")
-        settings: dict[str, Any] = {
-            "variant_key": variant,
-            "prompt_preset_id": prompt_id,
-            "overwrite_existing": True,
-            "output_formats": [caption_path.suffix.lstrip(".") or "txt"],
-        }
-        if str(override or "").strip():
-            settings["user_prompt"] = str(override).strip()
+        try:
+            settings = registry.values_to_dict(runtime_values)
+        except ValueError as exc:
+            yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
+            return
+        settings.update(
+            model_key=variant,
+            variant_key=variant,
+            prompt_preset_id=prompt_id,
+            system_prompt=None,
+            user_prompt=(str(override).strip() or None),
+            overwrite_existing=True,
+            output_formats=[caption_path.suffix.lstrip(".") or "txt"],
+        )
         output = OutputSpec(
             kind="batch", outputs_root=str(ctx.outputs_dir), batch_output_dir=str(caption_path.parent),
             mirror_names=False, overwrite=True,
@@ -1095,6 +1526,7 @@ def build(ctx: "UiContext") -> None:
 
         def work() -> None:
             try:
+                ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
                 terminal["result"] = ctx.pipeline.run_job(spec, _RegenerationSink(events))
             except BaseException as exc:
                 terminal["error"] = exc
@@ -1133,7 +1565,8 @@ def build(ctx: "UiContext") -> None:
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
 
     regenerate.click(
-        regenerate_handler, inputs=[state, regen_variant, regen_prompt, regen_override],
+        regenerate_handler,
+        inputs=[state, regen_variant, regen_prompt, regen_override, *registry_components],
         outputs=[regen_diff, regen_status, state, caption, stats, table, counters, regeneration_backup],
         concurrency_id="gpu_queue", concurrency_limit=1, show_progress="hidden", api_visibility="private",
     )
@@ -1185,6 +1618,10 @@ __all__ = [
     "EditorItem",
     "EditorState",
     "build",
+    "editor_export_handler",
+    "editor_filter_handler",
+    "editor_flag_handler",
+    "editor_save_handler",
     "filter_items",
     "filtered_indices",
     "find_replace_preview",
@@ -1192,5 +1629,6 @@ __all__ = [
     "paginate_items",
     "pagination_math",
     "preview_find_replace",
+    "resolve_media_from_metadata",
     "scan_folder",
 ]

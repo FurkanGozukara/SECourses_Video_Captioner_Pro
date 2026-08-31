@@ -336,6 +336,7 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
         "system_prompt",
         "user_prompt",
         "trigger_word",
+        "trigger_mode",
         "language",
         "source_language",
         "target_language",

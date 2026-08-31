@@ -664,12 +664,123 @@ def _uniform_indexes(length: int, count: int) -> list[int]:
     return [int(index) for index in np.linspace(0, length - 1, count).round()]
 
 
+def _frame_timestamp(frame: Any, stream: Any, fallback: float) -> float:
+    timestamp = frame.time
+    if timestamp is None and frame.pts is not None and stream.time_base is not None:
+        timestamp = float(frame.pts * stream.time_base)
+    return float(fallback if timestamp is None else timestamp)
+
+
+def _seek_decode_targets(
+    av_module: Any,
+    source: Path,
+    desired_times: Sequence[float],
+    *,
+    beginning: float,
+    ending: float | None,
+    source_fps: float,
+    cancel_token: object | None,
+) -> tuple[list[np.ndarray], list[float], int, int, int, int, int]:
+    """Seek to keyframes and decode forward only far enough for each target."""
+
+    arrays: list[np.ndarray] = []
+    timestamps: list[float] = []
+    decoded_count = 0
+    with av_module.open(str(source), mode="r") as container:
+        if not container.streams.video:
+            raise MediaError(f"No video stream found in {source}")
+        stream = container.streams.video[0]
+        stream_frames = int(stream.frames or 0)
+        original_width = int(stream.codec_context.width or 0)
+        original_height = int(stream.codec_context.height or 0)
+        tolerance = 0.5 / max(source_fps, 1.0)
+        for target in desired_times:
+            if _is_cancelled(cancel_token):
+                _raise_cancelled("Video frame decoding cancelled")
+            if stream.time_base is not None:
+                try:
+                    container.seek(
+                        max(0, int(float(target) / float(stream.time_base))),
+                        stream=stream,
+                        backward=True,
+                        any_frame=False,
+                    )
+                except Exception:
+                    container.seek(0, backward=True, any_frame=False)
+            selected: Any | None = None
+            selected_time: float | None = None
+            previous: Any | None = None
+            previous_time: float | None = None
+            for offset, frame in enumerate(container.decode(stream)):
+                if _is_cancelled(cancel_token):
+                    _raise_cancelled("Video frame decoding cancelled")
+                decoded_count += 1
+                timestamp = _frame_timestamp(
+                    frame,
+                    stream,
+                    beginning + offset / max(source_fps, 1.0),
+                )
+                if timestamp + 1e-6 < beginning:
+                    continue
+                if ending is not None and timestamp >= ending + 1e-6:
+                    break
+                previous, previous_time = frame, timestamp
+                if timestamp + tolerance >= float(target):
+                    selected, selected_time = frame, timestamp
+                    break
+            if selected is None:
+                selected, selected_time = previous, previous_time
+            if selected is None:
+                if arrays:
+                    arrays.append(arrays[-1])
+                    timestamps.append(timestamps[-1])
+                continue
+            arrays.append(selected.to_ndarray(format="rgb24"))
+            timestamps.append(float(selected_time if selected_time is not None else target))
+    return (
+        arrays,
+        timestamps,
+        decoded_count,
+        stream_frames,
+        original_width,
+        original_height,
+        len(desired_times),
+    )
+
+
+def _adaptive_frame_indexes(arrays: Sequence[np.ndarray], threshold: float = 2.0) -> list[int]:
+    """Keep visually distinct frames using a small grayscale mean-difference test."""
+
+    if not arrays:
+        return []
+
+    def thumbnail(array: np.ndarray) -> np.ndarray:
+        image = Image.fromarray(array, mode="RGB").convert("L")
+        image.thumbnail((64, 64), Image.Resampling.BILINEAR)
+        return np.asarray(image, dtype=np.float32)
+
+    kept = [0]
+    previous = thumbnail(arrays[0])
+    for index, array in enumerate(arrays[1:], start=1):
+        current = thumbnail(array)
+        difference = float(np.mean(np.abs(current - previous)))
+        if difference >= float(threshold):
+            kept.append(index)
+            previous = current
+    if len(kept) < 2 and len(arrays) >= 2:
+        kept.append(len(arrays) - 1)
+    return sorted(set(kept))
+
+
 def read_video_frames(
     path: str | os.PathLike[str],
     *,
     start: float | None = None,
     end: float | None = None,
     target_fps: float | None = None,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    fps: float | None = None,
     num_frames: int | None = None,
     max_frames: int | None = None,
     min_frames: int = 1,
@@ -677,17 +788,29 @@ def read_video_frames(
     min_pixels: int | None = None,
     size_multiple: int = 28,
     keep_aspect: bool = True,
-    sampling: Literal["uniform", "fps", "keyframe"] = "uniform",
+    sampling: Literal["uniform", "fps", "keyframe", "adaptive"] = "uniform",
     cancel_token: object | None = None,
     round_frames_to: int | None = None,
 ) -> VideoFrames:
-    """Sequentially decode and sample RGB frames with Qwen-style smart resizing."""
+    """Decode sampled RGB frames with Qwen-style smart resizing."""
 
     del keep_aspect  # Pixel-area scaling has no alternate target aspect to apply.
+    if start_s is not None:
+        if start is not None and not math.isclose(float(start), float(start_s)):
+            raise ValueError("start and start_s specify different values")
+        start = float(start_s)
+    if end_s is not None:
+        if end is not None and not math.isclose(float(end), float(end_s)):
+            raise ValueError("end and end_s specify different values")
+        end = float(end_s)
+    if fps is not None:
+        if target_fps is not None and not math.isclose(float(target_fps), float(fps)):
+            raise ValueError("target_fps and fps specify different values")
+        target_fps = float(fps)
     source = normalize_path(path, must_exist=True)
-    if sampling not in {"uniform", "fps", "keyframe"}:
-        raise ValueError("sampling must be 'uniform', 'fps', or 'keyframe'")
-    minimum_count = max(1, int(min_frames))
+    if sampling not in {"uniform", "fps", "keyframe", "adaptive"}:
+        raise ValueError("sampling must be 'uniform', 'fps', 'keyframe', or 'adaptive'")
+    minimum_count = max(2 if sampling == "adaptive" else 1, int(min_frames))
     if max_frames is not None and int(max_frames) < minimum_count:
         raise ValueError("max_frames must be greater than or equal to min_frames")
     info = probe_media(source)
@@ -700,6 +823,10 @@ def read_video_frames(
 
     beginning = max(0.0, float(start or 0.0))
     ending = float(end) if end is not None else info.duration
+    if info.duration is not None and ending is not None:
+        ending = min(float(ending), float(info.duration))
+    if ending is None and info.nb_frames and info.fps:
+        ending = beginning + max(0.0, float(info.nb_frames) / float(info.fps))
     if ending is not None and ending <= beginning:
         raise ValueError("end must be greater than start")
     source_fps = float(info.fps or 0.0)
@@ -717,7 +844,7 @@ def read_video_frames(
                 float(value)
                 for value in np.linspace(beginning, last_time, requested_count)
             ]
-        elif sampling == "fps":
+        elif sampling in {"fps", "adaptive"}:
             fps = float(target_fps or source_fps or 1.0)
             if fps <= 0:
                 raise ValueError("target_fps must be positive")
@@ -732,65 +859,130 @@ def read_video_frames(
     decoded_count = 0
     last_array: np.ndarray | None = None
     last_timestamp = beginning
-    with av.open(str(source), mode="r") as container:
-        if not container.streams.video:
-            raise MediaError(f"No video stream found in {source}")
-        stream = container.streams.video[0]
-        if sampling == "keyframe":
-            try:
-                stream.codec_context.skip_frame = "NONKEY"
-            except Exception:
-                pass
-        if beginning > 0 and stream.time_base:
-            try:
-                container.seek(
-                    max(0, int(beginning / float(stream.time_base))),
-                    stream=stream,
-                    backward=True,
-                    any_frame=False,
+    if sampling == "uniform" and desired_times is not None:
+        (
+            decoded_arrays,
+            decoded_times,
+            decoded_count,
+            stream_frame_count,
+            original_width,
+            original_height,
+            _,
+        ) = _seek_decode_targets(
+            av,
+            source,
+            desired_times,
+            beginning=beginning,
+            ending=ending,
+            source_fps=source_fps,
+            cancel_token=cancel_token,
+        )
+        original_width = int(original_width or info.width or 0)
+        original_height = int(original_height or info.height or 0)
+    else:
+        with av.open(str(source), mode="r") as container:
+            if not container.streams.video:
+                raise MediaError(f"No video stream found in {source}")
+            stream = container.streams.video[0]
+            if sampling == "keyframe":
+                try:
+                    stream.codec_context.skip_frame = "NONKEY"
+                except Exception:
+                    pass
+            if beginning > 0 and stream.time_base:
+                try:
+                    container.seek(
+                        max(0, int(beginning / float(stream.time_base))),
+                        stream=stream,
+                        backward=True,
+                        any_frame=False,
+                    )
+                except Exception:
+                    pass
+            target_index = 0
+            for frame in container.decode(stream):
+                if _is_cancelled(cancel_token):
+                    _raise_cancelled("Video frame decoding cancelled")
+                decoded_count += 1
+                timestamp = _frame_timestamp(
+                    frame,
+                    stream,
+                    beginning + (decoded_count - 1) / max(source_fps, 1.0),
                 )
-            except Exception:
-                pass
-        target_index = 0
-        for frame in container.decode(stream):
-            if _is_cancelled(cancel_token):
-                _raise_cancelled("Video frame decoding cancelled")
-            decoded_count += 1
-            timestamp = frame.time
-            if timestamp is None and frame.pts is not None and stream.time_base is not None:
-                timestamp = float(frame.pts * stream.time_base)
-            if timestamp is None:
-                timestamp = beginning + (decoded_count - 1) / max(source_fps, 1.0)
-            timestamp = float(timestamp)
-            if timestamp + 1e-6 < beginning:
-                continue
-            if ending is not None and timestamp >= ending + 1e-6:
-                break
-            array = frame.to_ndarray(format="rgb24")
-            last_array, last_timestamp = array, timestamp
-            if desired_times is None:
-                decoded_arrays.append(array)
-                decoded_times.append(timestamp)
-            else:
-                tolerance = 0.5 / max(source_fps, target_fps or 0.0, 1.0)
-                while target_index < len(desired_times) and timestamp + tolerance >= desired_times[target_index]:
+                if timestamp + 1e-6 < beginning:
+                    continue
+                if ending is not None and timestamp >= ending + 1e-6:
+                    break
+                array = frame.to_ndarray(format="rgb24")
+                last_array, last_timestamp = array, timestamp
+                if desired_times is None:
                     decoded_arrays.append(array)
                     decoded_times.append(timestamp)
-                    target_index += 1
-                if target_index >= len(desired_times):
-                    break
-        if desired_times is not None and last_array is not None:
-            while len(decoded_arrays) < len(desired_times):
-                decoded_arrays.append(last_array)
-                decoded_times.append(last_timestamp)
+                else:
+                    tolerance = 0.5 / max(source_fps, target_fps or 0.0, 1.0)
+                    while target_index < len(desired_times) and timestamp + tolerance >= desired_times[target_index]:
+                        decoded_arrays.append(array)
+                        decoded_times.append(timestamp)
+                        target_index += 1
+                    if target_index >= len(desired_times):
+                        break
+            if desired_times is not None and last_array is not None:
+                while len(decoded_arrays) < len(desired_times):
+                    decoded_arrays.append(last_array)
+                    decoded_times.append(last_timestamp)
 
-        stream_frame_count = int(stream.frames or 0)
-        original_width = int(stream.codec_context.width or info.width or 0)
-        original_height = int(stream.codec_context.height or info.height or 0)
+            stream_frame_count = int(stream.frames or 0)
+            original_width = int(stream.codec_context.width or info.width or 0)
+            original_height = int(stream.codec_context.height or info.height or 0)
+
+    if sampling == "uniform" and desired_times is not None and decoded_arrays:
+        while len(decoded_arrays) < len(desired_times):
+            decoded_arrays.append(decoded_arrays[-1])
+            decoded_times.append(decoded_times[-1])
+
+    if sampling == "keyframe" and len(decoded_arrays) < 2 and ending is not None:
+        fallback_count = requested_count
+        if fallback_count is None:
+            fallback_count = _rounded_frame_count(
+                num_frames or max_frames or max(2, minimum_count),
+                round_frames_to,
+                minimum_count,
+                max_frames,
+            )
+        last_time = max(beginning, ending - (0.5 / source_fps if source_fps > 0 else 1e-6))
+        fallback_times = [
+            float(value) for value in np.linspace(beginning, last_time, fallback_count)
+        ]
+        (
+            decoded_arrays,
+            decoded_times,
+            fallback_decoded,
+            fallback_stream_frames,
+            fallback_width,
+            fallback_height,
+            _,
+        ) = _seek_decode_targets(
+            av,
+            source,
+            fallback_times,
+            beginning=beginning,
+            ending=ending,
+            source_fps=source_fps,
+            cancel_token=cancel_token,
+        )
+        decoded_count += fallback_decoded
+        stream_frame_count = stream_frame_count or fallback_stream_frames
+        original_width = original_width or fallback_width
+        original_height = original_height or fallback_height
+
+    if sampling == "adaptive" and decoded_arrays:
+        indexes = _adaptive_frame_indexes(decoded_arrays)
+        decoded_arrays = [decoded_arrays[index] for index in indexes]
+        decoded_times = [decoded_times[index] for index in indexes]
 
     if desired_times is None:
         cap = requested_count
-        if sampling == "fps" and decoded_arrays:
+        if sampling in {"fps", "adaptive"} and decoded_arrays:
             fps = float(target_fps or source_fps or 1.0)
             count = max(minimum_count, int(math.ceil(len(decoded_arrays) * fps / max(source_fps, fps))))
             cap = _rounded_frame_count(count, round_frames_to, minimum_count, max_frames)
@@ -839,7 +1031,10 @@ def read_video_frames(
             image = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
             resized_arrays.append(np.asarray(image, dtype=np.uint8))
     frames = np.stack(resized_arrays).astype(np.uint8, copy=False)
-    if len(decoded_times) > 1 and decoded_times[-1] > decoded_times[0]:
+    clip_duration = float(ending - beginning) if ending is not None else 0.0
+    if clip_duration > 0:
+        effective_fps = len(decoded_times) / clip_duration
+    elif len(decoded_times) > 1 and decoded_times[-1] > decoded_times[0]:
         effective_fps = (len(decoded_times) - 1) / (decoded_times[-1] - decoded_times[0])
     else:
         effective_fps = float(target_fps or source_fps or 0.0)

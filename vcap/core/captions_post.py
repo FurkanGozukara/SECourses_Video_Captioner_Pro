@@ -258,6 +258,10 @@ def write_caption_outputs(
     written: dict[str, Path] = {}
     for output_format in requested:
         path = paths[output_format]
+        if output_format in {"srt", "vtt"} and not normalized_segments:
+            continue  # no timed cues: never leave an empty subtitle file behind
+        if output_format == "reasoning" and not (reasoning or "").strip():
+            continue  # non-thinking models produce no reasoning text
         if output_format == "txt":
             payload = str(text)
             written[output_format] = writer.write_text(path, payload + ("\n" if payload and not payload.endswith("\n") else ""))

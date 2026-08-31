@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
@@ -138,7 +139,43 @@ class SettingsRegistry:
             return numeric
         if normalized in {"str", "string"}:
             return str(value)
+        if normalized in {"list", "array", "sequence"}:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                try:
+                    decoded = json.loads(text)
+                except json.JSONDecodeError:
+                    decoded = [part.strip() for part in text.split(",") if part.strip()]
+                value = decoded
+            if not isinstance(value, (list, tuple, set)):
+                raise ValueError(f"not a list: {value}")
+            return list(value)
         raise ValueError(f"unsupported setting kind: {kind}")
+
+    @staticmethod
+    def _coerce_choice_item(value: Any, allowed: tuple[Any, ...]) -> Any:
+        for choice in allowed:
+            if type(value) is type(choice) and value == choice:
+                return choice
+        for choice in allowed:
+            try:
+                if isinstance(choice, bool):
+                    continue
+                if isinstance(choice, int):
+                    numeric = float(value)
+                    if numeric.is_integer() and int(numeric) == choice:
+                        return choice
+                elif isinstance(choice, float) and float(value) == choice:
+                    return choice
+                elif isinstance(choice, str) and str(value) == choice:
+                    return choice
+            except (TypeError, ValueError):
+                continue
+        raise ValueError(f"{value!r} is not an allowed choice")
 
     def coerce(self, d: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
         """Cast, clamp, validate, and default a settings mapping."""
@@ -164,7 +201,18 @@ class SettingsRegistry:
                     else choice
                     for choice in entry.choices
                 )
-            if allowed_choices is not None and value not in allowed_choices:
+            if allowed_choices is not None and isinstance(value, list):
+                filtered: list[Any] = []
+                for item in value:
+                    try:
+                        selected = self._coerce_choice_item(item, allowed_choices)
+                    except ValueError:
+                        warnings.append(f"{entry.key}: dropped invalid list choice {item!r}.")
+                        continue
+                    if selected not in filtered:
+                        filtered.append(selected)
+                value = filtered
+            elif allowed_choices is not None and value not in allowed_choices:
                 warnings.append(f"{entry.key}: {value!r} is not an allowed choice; using default.")
                 value = deepcopy(entry.default)
             if isinstance(value, (int, float)) and not isinstance(value, bool):

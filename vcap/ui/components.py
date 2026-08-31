@@ -86,7 +86,8 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
         status = gr.Markdown(
             "<span class='vc-ok'>Ready.</span>",
             elem_classes=["vc-status"],
-            min_width=190,
+            scale=3,
+            min_width=320,
         )
     handles = PresetBarHandles(dropdown, save_as, save, load, delete, reset, status)
     ctx.preset_handles = handles
@@ -184,7 +185,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         show_progress="hidden",
         api_visibility="private",
     )
-    handles.load.click(
+    load_event = handles.load.click(
         load_preset,
         inputs=handles.dropdown,
         outputs=[*components, handles.status],
@@ -200,20 +201,31 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         show_progress="hidden",
         api_visibility="private",
     )
-    handles.reset.click(
+    reset_event = handles.reset.click(
         reset_settings,
         outputs=[*components, handles.status],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
-    demo.load(
+    startup_event = demo.load(
         startup_preset,
         outputs=[*components, handles.dropdown, handles.status],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
+    auto_vram = ctx.states.get("caption_auto_vram_binding")
+    if isinstance(auto_vram, dict):
+        for dependency in (load_event, reset_event, startup_event):
+            dependency.then(
+                auto_vram["fn"],
+                inputs=auto_vram["inputs"],
+                outputs=auto_vram["outputs"],
+                queue=False,
+                show_progress="hidden",
+                api_visibility="private",
+            )
 
 
 @dataclass
@@ -326,7 +338,12 @@ def _preview_updates(paths: list[str]) -> tuple[Any, ...]:
     return video, audio, image, _media_info_markdown(info), _input_gallery(paths), modality, float(info.duration or 0.0)
 
 
-def _folder_scan(folder: str, recursive: bool) -> tuple[list[str], str]:
+def _folder_scan(
+    folder: str,
+    recursive: bool,
+    output_folder: str = "",
+    overwrite: bool = False,
+) -> tuple[list[str], str]:
     raw = str(folder or "").strip()
     if not raw:
         return [], "<span class='vc-help'>Choose a folder for a light extension scan.</span>"
@@ -337,17 +354,29 @@ def _folder_scan(folder: str, recursive: bool) -> tuple[list[str], str]:
     if not root.is_dir():
         return [], f"<span class='vc-err'>Folder does not exist: {html.escape(str(root))}</span>"
     found = list_media_files(root, recursive=bool(recursive), kinds=("video", "audio", "image"))
+    try:
+        output_root = normalize_path(output_folder) if str(output_folder or "").strip() else None
+    except Exception as exc:
+        return [], f"<span class='vc-err'>Invalid output folder: {html.escape(str(exc))}</span>"
     counts = {"video": 0, "audio": 0, "image": 0}
     existing = 0
     for path in found:
         kind = guess_kind_by_extension(path)
         if kind in counts:
             counts[kind] += 1
-        if path.with_suffix(".txt").is_file():
+        relative = path.relative_to(root)
+        caption_path = output_root / relative.with_suffix(".txt") if output_root is not None else None
+        if caption_path is not None and caption_path.is_file():
             existing += 1
+    overwrite_hint = (
+        "Overwrite is on; existing captions will be replaced."
+        if overwrite
+        else "Overwrite is off; existing captions will be skipped."
+    )
     summary = (
         f"🎬 {counts['video']} videos · 🎵 {counts['audio']} audios · "
-        f"🖼️ {counts['image']} images ({existing} with existing captions)"
+        f"🖼️ {counts['image']} images · {existing} already captioned in output folder. "
+        f"{overwrite_hint}"
     )
     return [str(path) for path in found], summary
 
@@ -369,7 +398,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
     with gr.Group(elem_classes=["vc-card"]):
         gr.Markdown("### Input", elem_classes=["vc-section-title"])
         with gr.Tabs(selected="upload", elem_id="vc-input-tabs"):
-            with gr.Tab("📤 Upload files", id="upload"):
+            with gr.Tab("📤 Upload files", id="upload") as upload_tab:
                 files = gr.File(
                     file_count="multiple",
                     file_types=["video", "audio", "image", ".txt"],
@@ -385,7 +414,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     description="Uploaded video, audio, image, or text files.",
                     in_preset=False,
                 )
-            with gr.Tab("📄 File path", id="path"):
+            with gr.Tab("📄 File path", id="path") as path_tab:
                 path = gr.Textbox(
                     label="File path",
                     placeholder="Paste a file path — same as uploading",
@@ -400,7 +429,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     in_preset=False,
                     kind="str",
                 )
-            with gr.Tab("📁 Folder batch", id="folder"):
+            with gr.Tab("📁 Folder batch", id="folder") as folder_tab:
                 folder = gr.Textbox(
                     label="Input folder",
                     placeholder="Folder containing videos, audio, or images",
@@ -506,8 +535,13 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         selected = _paths(value)
         return (*_preview_updates(selected), selected, "path")
 
-    def scan_folder(value: str, recursive_value: bool) -> tuple[Any, ...]:
-        selected, summary = _folder_scan(value, recursive_value)
+    def scan_folder(
+        value: str,
+        recursive_value: bool,
+        output_value: str,
+        overwrite_value: bool,
+    ) -> tuple[Any, ...]:
+        selected, summary = _folder_scan(value, recursive_value, output_value, overwrite_value)
         return (*_preview_updates(selected), selected, "folder", summary)
 
     upload_outputs = [*preview_outputs, resolved_state, mode_state]
@@ -527,11 +561,37 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         show_progress="hidden",
         api_visibility="private",
     )
-    for trigger in (folder.change, recursive.change, rescan.click):
+    upload_tab.select(
+        choose_upload,
+        inputs=files,
+        outputs=upload_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    path_tab.select(
+        choose_path,
+        inputs=path,
+        outputs=upload_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    folder_outputs = [*preview_outputs, resolved_state, mode_state, scan_summary]
+    folder_inputs = [folder, recursive, output_folder, overwrite]
+    folder_tab.select(
+        scan_folder,
+        inputs=folder_inputs,
+        outputs=folder_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    for trigger in (folder.change, recursive.change, output_folder.change, overwrite.change, rescan.click):
         trigger(
             scan_folder,
-            inputs=[folder, recursive],
-            outputs=[*preview_outputs, resolved_state, mode_state, scan_summary],
+            inputs=folder_inputs,
+            outputs=folder_outputs,
             queue=False,
             show_progress="hidden",
             api_visibility="private",

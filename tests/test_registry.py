@@ -41,3 +41,22 @@ def test_coerce_cast_clamp_choice_and_unknown() -> None:
     assert len(warnings) >= 4
     assert "path" not in registry.preset_subset(values)
     assert registry.metadata_subset(values)["frames"] == 32
+
+
+def test_gpu_index_list_coercion_drops_invalid_choices_and_deduplicates() -> None:
+    registry = SettingsRegistry()
+    registry.register(
+        "gpu_indices",
+        object(),
+        [],
+        kind="list",
+        choices=[0, 1, 2],
+        in_preset=False,
+        in_metadata=True,
+    )
+
+    values, warnings = registry.coerce({"gpu_indices": ["2", 0, "2", 99, "invalid"]})
+    assert values["gpu_indices"] == [2, 0]
+    assert len(warnings) == 2
+    assert "gpu_indices" not in registry.preset_subset(values)
+    assert registry.metadata_subset(values)["gpu_indices"] == [2, 0]

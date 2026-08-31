@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import wave
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -180,7 +181,8 @@ def test_job_json_and_batch_skip_overwrite_metadata(
         batch_output_dir=batch_out,
     )
     settings = _settings(overwrite_existing=False, metadata_probe="preserve-me")
-    spec = JobSpec.from_settings(settings, [InputItem(source)], output)
+    batch_inputs = [InputItem(source / "a.txt"), InputItem(source / "b.txt")]
+    spec = JobSpec.from_settings(settings, batch_inputs, output)
     assert JobSpec.from_json(spec.to_json()) == spec
 
     first = run_job(spec, RecordingSink(), CancelToken())
@@ -190,11 +192,13 @@ def test_job_json_and_batch_skip_overwrite_metadata(
     assert (batch_out / "a.txt").read_text(encoding="utf-8") == "existing\n"
     metadata = json.loads(Path(first.metadata_path).read_text(encoding="utf-8"))
     assert metadata["settings"] == settings
+    assert metadata["processing_time_seconds"] >= 0
+    assert Path(first.run_dir, "summary.json").is_file()
     assert Path(first.run_dir, "run_log.txt").is_file()
 
     overwrite = JobSpec.from_settings(
         {**settings, "overwrite_existing": True},
-        [InputItem(source)],
+        batch_inputs,
         output,
     )
     second = run_job(overwrite, RecordingSink(), CancelToken())
@@ -471,24 +475,467 @@ def test_mixed_batch_adapts_automatic_prompt_to_each_modality(
     )
 
 
-def test_multi_gpu_round_robin_fake_workers(
+def test_multi_gpu_batch_dispatch_and_round_robin_partitioning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("VCAP_FAKE_CAPTIONER", "1")
-    inputs = [InputItem(f"prompt {index}", text_prompt_only=True) for index in range(4)]
+    import vcap.pipeline.runner as pipeline_runner
+
+    inputs = [InputItem(f"prompt {index}", text_prompt_only=True) for index in range(5)]
     spec = JobSpec.from_settings(
         _settings(
             subprocess_mode=True,
-            gpu_indices=[0, 1],
+            gpu_indices="0, 1 2;2 invalid",
             keep_model_loaded=False,
         ),
         inputs,
-        OutputSpec(outputs_root=tmp_path / "runs"),
+        OutputSpec(
+            kind="batch",
+            outputs_root=tmp_path / "runs",
+            batch_output_dir=tmp_path / "captions",
+        ),
+    )
+    assert spec.runtime.gpu_indices == (0, 1, 2)
+    list_strings = JobSpec.from_settings(
+        _settings(gpu_indices=["0", "2", "2", "bad"]),
+        [],
+        OutputSpec(kind="batch", outputs_root=tmp_path / "list-strings"),
+    )
+    list_ints = JobSpec.from_settings(
+        _settings(gpu_indices=[0, 2, 2, -1]),
+        [],
+        OutputSpec(kind="batch", outputs_root=tmp_path / "list-ints"),
+    )
+    assert list_strings.runtime.gpu_indices == (0, 2)
+    assert list_ints.runtime.gpu_indices == (0, 2)
+    assert pipeline_runner._round_robin_partitions(list(range(5)), 3) == [[0, 3], [1, 4], [2]]
+
+    called: list[JobSpec] = []
+
+    def fake_multi_gpu(job: JobSpec, _sink: Any, _cancel: Any) -> JobResult:
+        called.append(job)
+        return JobResult([], {"total": 0}, str(tmp_path), str(tmp_path / "metadata.json"), 0.0)
+
+    monkeypatch.setattr(pipeline_runner, "_run_multi_gpu", fake_multi_gpu)
+    pipeline_runner.run_job(spec, RecordingSink(), CancelToken())
+    assert called == [spec]
+
+    single = JobSpec.from_settings(
+        _settings(subprocess_mode=True, gpu_indices="0 1"),
+        [InputItem("one", text_prompt_only=True)],
+        OutputSpec(outputs_root=tmp_path / "single-runs"),
+    )
+    monkeypatch.setenv("VCAP_FAKE_CAPTIONER", "1")
+    pipeline_runner.run_job(single, RecordingSink(), CancelToken())
+    assert called == [spec]
+
+
+def test_batch_file_list_mirrors_source_root_and_skips_mirrored_output(tmp_path: Path) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+
+    source = tmp_path / "batch_in"
+    first = source / "sub1" / "same.mp4"
+    second = source / "sub2" / "same.mp4"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.touch()
+    second.touch()
+    batch_out = tmp_path / "batch_out"
+    spec = JobSpec.from_settings(
+        _settings(),
+        [InputItem(first), InputItem(second)],
+        OutputSpec(
+            kind="batch",
+            outputs_root=tmp_path / "runs",
+            batch_output_dir=batch_out,
+            source_root=source,
+        ),
+    )
+    assert JobSpec.from_json(spec.to_json()).output.source_root == str(source)
+    resolved = pipeline_runner._resolve_inputs(spec)
+    pipeline_runner._assign_batch_outputs(spec, resolved)
+    assert [entry.out_dir for entry in resolved] == [batch_out / "sub1", batch_out / "sub2"]
+    assert [entry.stem for entry in resolved] == ["same", "same"]
+
+    (batch_out / "sub1").mkdir(parents=True)
+    (batch_out / "sub1" / "same.txt").write_text("done", encoding="utf-8")
+    pipeline_runner._apply_batch_skip(spec, resolved)
+    assert [entry.status for entry in resolved] == ["skipped", "pending"]
+
+    duplicate_spec = JobSpec.from_settings(
+        _settings(),
+        [InputItem(first), InputItem(first)],
+        spec.output,
+    )
+    duplicates = pipeline_runner._resolve_inputs(duplicate_spec)
+    pipeline_runner._assign_batch_outputs(duplicate_spec, duplicates)
+    assert [entry.stem for entry in duplicates] == ["same", "same_0002"]
+
+
+def test_batch_directory_expansion_excludes_caption_sidecars(tmp_path: Path) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+
+    source = tmp_path / "batch"
+    source.mkdir()
+    Image.new("RGB", (16, 16), color="red").save(source / "still.png")
+    for name in ("still.txt", "notes.md", "data.json", "rows.jsonl", "captions.srt", "captions.vtt"):
+        (source / name).write_text("sidecar", encoding="utf-8")
+    spec = JobSpec.from_settings(
+        _settings(batch_recursive=True),
+        [InputItem(source)],
+        OutputSpec(kind="batch", outputs_root=tmp_path / "runs", source_root=source, recursive=True),
+    )
+    resolved = pipeline_runner._resolve_inputs(spec)
+    assert [entry.path.name for entry in resolved if entry.path is not None] == ["still.png"]
+
+
+def test_batch_trim_is_ignored_once(
+    tmp_path: Path,
+    fake_model: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+
+    video = tmp_path / "clip.mp4"
+    _two_scene_video(video)
+    monkeypatch.setattr(
+        pipeline_runner,
+        "trim_media",
+        lambda *_args, **_kwargs: pytest.fail("batch trim_media must not be called"),
     )
     sink = RecordingSink()
-    result = run_job(spec, sink, CancelToken())
-    assert result.counts["done"] == 4
-    assert [item.gpu_index for item in result.items] == [0, 1, 0, 1]
-    assert len({item.outputs["txt"] for item in result.items}) == 4
-    assert any(message.startswith("[GPU 0]") for message, _, _ in sink.logs)
-    assert any(message.startswith("[GPU 1]") for message, _, _ in sink.logs)
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(trim_start_s=0.25, trim_end_s=1.25),
+            [InputItem(video)],
+            OutputSpec(
+                kind="batch",
+                outputs_root=tmp_path / "runs",
+                batch_output_dir=tmp_path / "captions",
+                source_root=tmp_path,
+            ),
+        ),
+        sink,
+        CancelToken(),
+    )
+    assert result.counts["done"] == 1
+    notices = [message for message, _, _ in sink.logs if message == "Trim range is ignored for folder batches"]
+    assert notices == ["Trim range is ignored for folder batches"]
+    assert fake_model
+
+
+def test_split_clips_are_temporary_and_subtitle_cues_only_get_replacements(
+    tmp_path: Path,
+    fake_model: list[str],
+) -> None:
+    video = tmp_path / "split.mp4"
+    _two_scene_video(video)
+    sink = RecordingSink()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(
+                segment_mode="fixed",
+                fixed_chunk_s=0.8,
+                trainer_target="wan",
+                save_clips=False,
+                caption_prefix="PRE",
+                trigger_word="TRIG",
+                caption_suffix="POST",
+                replace_pairs=[["caption", "description"]],
+                output_formats=["txt", "srt"],
+            ),
+            [InputItem(video)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+    item = result.items[0]
+    assert len(item.segments) >= 2
+    assert all(not Path(str(record["media_path"])).exists() for record in item.segments)
+    assert not any(path.name.endswith("_clips") for path in Path(result.run_dir).rglob("*"))
+    assert any("Produced clips are temporary" in message for message, _, _ in sink.logs)
+    caption = Path(item.outputs["txt"]).read_text(encoding="utf-8")
+    subtitle = Path(item.outputs["srt"]).read_text(encoding="utf-8")
+    assert all(value in caption for value in ("PRE", "TRIG", "POST", "description"))
+    assert "description" in subtitle
+    assert all(value not in subtitle for value in ("PRE", "TRIG", "POST"))
+    assert len(fake_model) >= 2
+
+
+def test_progress_payload_and_live_item_elapsed_keys(
+    tmp_path: Path,
+    fake_model: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sink = RecordingSink()
+    run_job(
+        JobSpec.from_settings(
+            _settings(),
+            [InputItem("progress text", text_prompt_only=True)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+    required = {
+        "processed",
+        "remaining",
+        "total",
+        "elapsed_s",
+        "eta_s",
+        "item_index",
+        "item_elapsed_s",
+    }
+    assert sink.progress and required <= sink.progress[0].data.keys()
+    running = [event for event in sink.items if event.status == "running"]
+    assert running and required <= running[0].data.keys()
+    assert all(float(event.data["item_elapsed_s"]) >= 0 for event in running)
+    console = capsys.readouterr().out
+    assert "[0/1]" in console and "| elapsed " in console and "| ETA " in console
+
+
+def test_loader_progress_is_written_once_to_run_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vcap.core.logs import get_log
+    from vcap.models import loader
+
+    marker = "Loading checkpoint 50% - test.weight"
+
+    def load_model(variant_key: str, **kwargs: Any) -> FakeCaptioner:
+        get_log().log(marker, scope="models")
+        kwargs["progress_cb"](marker, 0.5)
+        return FakeCaptioner(variant_key, [])
+
+    monkeypatch.setattr(loader, "load_model", load_model)
+    sink = RecordingSink()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(),
+            [InputItem("log text", text_prompt_only=True)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+    run_log = Path(result.run_dir, "run_log.txt").read_text(encoding="utf-8")
+    assert run_log.count(marker) == 1
+    assert any(event.data.get("phase") == "model_load" for event in sink.progress)
+
+
+def test_context_carry_over_appends_only_previous_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vcap.models import loader
+
+    video = tmp_path / "context.mp4"
+    _two_scene_video(video)
+    prompts: list[str | None] = []
+
+    class ContextCaptioner(FakeCaptioner):
+        def caption(self, media: Any, prompt: Any, gen: Any, pre: Any, cb: Any) -> Any:
+            prompts.append(prompt.user_prompt)
+            result = super().caption(media, prompt, gen, pre, cb)
+            number = len(prompts)
+            return replace(result, text=f"final words from segment {number}", raw_text=f"raw {number}")
+
+    monkeypatch.setattr(loader, "load_model", lambda key, **_kwargs: ContextCaptioner(key, []))
+    sink = RecordingSink()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(
+                segment_mode="fixed",
+                fixed_chunk_s=0.8,
+                context_carry_over=True,
+            ),
+            [InputItem(video)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+    assert result.counts["done"] == 1 and len(prompts) >= 2
+    assert prompts[0] == "Describe this input."
+    assert 'Context from the previous segment (do not repeat it): "final words from segment 1"' in str(prompts[1])
+    if len(prompts) >= 3:
+        assert "segment 2" in str(prompts[2]) and "segment 1" not in str(prompts[2])
+    assert any("Applied previous-segment context" in message for message, _, _ in sink.logs)
+
+    import vcap.pipeline.runner as pipeline_runner
+    from vcap.models.registry import MODEL_SPECS
+
+    assert len(pipeline_runner._context_excerpt(" ".join(f"w{i}" for i in range(100))).split()) == 60
+    assert not pipeline_runner._supports_context_carry_over(MODEL_SPECS["timechat"])
+    assert not pipeline_runner._supports_context_carry_over(MODEL_SPECS["qwen3_omni_captioner"])
+
+
+def test_auto_reject_analysis_error_continues_item(
+    tmp_path: Path,
+    fake_model: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+
+    video = tmp_path / "quality_error.mp4"
+    _two_scene_video(video)
+    monkeypatch.setattr(
+        pipeline_runner,
+        "analyze_clip_quality",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("quality unavailable")),
+    )
+    sink = RecordingSink()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(auto_reject=True),
+            [InputItem(video)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+    assert result.counts["done"] == 1 and fake_model
+    assert result.items[0].segments[0]["quality_error"].endswith("quality unavailable")
+    assert any("Auto-reject analysis failed" in message for message, _, _ in sink.logs)
+
+
+def test_audio_only_auto_reject_runs_without_visual_failures(
+    tmp_path: Path,
+    fake_model: list[str],
+) -> None:
+    audio = tmp_path / "audio_quality.wav"
+    _write_wav(audio, seconds=0.25)
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(
+                auto_reject=True,
+                reject_min_duration_s=0.1,
+                reject_max_black_ratio=0.0,
+                reject_max_static_score=1000.0,
+                reject_min_sharpness=1000.0,
+                reject_max_silence_ratio=1.0,
+            ),
+            [InputItem(audio)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        RecordingSink(),
+        CancelToken(),
+    )
+    assert result.counts["done"] == 1 and fake_model
+    quality = result.items[0].segments[0]["quality"]
+    assert quality["has_audio"] is True and quality["has_video"] is False
+
+
+def test_metadata_records_finish_reason_and_new_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vcap.models import loader
+    from vcap.models.base import CaptionResult, CaptionTiming
+
+    sampling_seen: list[str] = []
+
+    class FinishCaptioner(FakeCaptioner):
+        def caption(self, media: Any, prompt: Any, gen: Any, pre: Any, cb: Any) -> Any:
+            del media, prompt, gen, cb
+            sampling_seen.append(pre.sampling_strategy)
+            return CaptionResult(
+                text="complete",
+                raw_text="complete",
+                usage=SimpleNamespace(prompt_tokens=2, new_tokens=3, finish_reason="length"),
+                timing=CaptionTiming(0.0, 0.01, 300.0, 0.01),
+            )
+
+    monkeypatch.setattr(loader, "load_model", lambda key, **_kwargs: FinishCaptioner(key, []))
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(sampling_strategy="uniform", context_carry_over=True),
+            [InputItem("metadata text", text_prompt_only=True)],
+            OutputSpec(outputs_root=tmp_path / "runs", source_root=source_root),
+        ),
+        RecordingSink(),
+        CancelToken(),
+    )
+    metadata = json.loads(Path(result.metadata_path).read_text(encoding="utf-8"))
+    assert metadata["finish_reason"] == "length"
+    assert metadata["sampling_strategy"] == "uniform"
+    assert metadata["context_carry_over"] is True
+    assert Path(metadata["source_root"]) == source_root
+    assert metadata["processing_time_seconds"] >= 0
+    assert metadata["items_results"][0]["segments"][0]["finish_reason"] == "length"
+    assert sampling_seen == ["uniform"]
+
+    import vcap.pipeline.runner as pipeline_runner
+    from vcap.models.registry import MODEL_SPECS
+
+    degraded = pipeline_runner._degrade_pre(
+        {
+            "fps": 2.0,
+            "max_frames": 24,
+            "max_pixels": 131_072,
+            "min_pixels": 4_096,
+            "use_audio_in_video": False,
+            "sampling_strategy": "uniform",
+        },
+        MODEL_SPECS["qwen3_omni_instruct"],
+    )
+    assert degraded is not None and degraded[0]["sampling_strategy"] == "uniform"
+
+
+def test_pipeline_client_mode_switch_stops_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VCAP_FAKE_CAPTIONER", "1")
+    client = PipelineClient(subprocess_mode=True)
+    try:
+        client.run_job(
+            JobSpec.from_settings(
+                _settings(subprocess_mode=True, keep_model_loaded=True),
+                [InputItem("worker text", text_prompt_only=True)],
+                OutputSpec(outputs_root=tmp_path / "runs"),
+            ),
+            RecordingSink(),
+            CancelToken(),
+        )
+        worker = client._worker
+        assert worker is not None and worker.is_alive()
+        client.set_subprocess_mode(False)
+        assert client.subprocess_mode is False and client._worker is None
+        assert not worker.is_alive()
+        client.set_subprocess_mode(True)
+        assert client.subprocess_mode is True and client._worker is None
+    finally:
+        client.shutdown()
+
+
+def test_pipeline_client_in_app_idle_timer_unloads_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+
+    monkeypatch.setenv("VCAP_FAKE_CAPTIONER", "1")
+    unloaded = threading.Event()
+    monkeypatch.setattr(pipeline_runner, "unload_cached_model", unloaded.set)
+    client = PipelineClient(subprocess_mode=False)
+    try:
+        client.run_job(
+            JobSpec.from_settings(
+                _settings(
+                    subprocess_mode=False,
+                    keep_model_loaded=True,
+                    idle_unload_minutes=0.001,
+                ),
+                [InputItem("local idle text", text_prompt_only=True)],
+                OutputSpec(outputs_root=tmp_path / "runs"),
+            ),
+            RecordingSink(),
+            CancelToken(),
+        )
+        assert unloaded.wait(timeout=1.5)
+    finally:
+        client.shutdown()

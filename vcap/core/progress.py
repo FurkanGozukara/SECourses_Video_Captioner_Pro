@@ -55,6 +55,7 @@ class ProgressTracker:
         self._lock = threading.RLock()
         self._current_index: int | None = None
         self._current_label = ""
+        self._current_started_at: float | None = None
         self._step_desc = ""
         self._step_fraction = 0.0
         self._step_total: int | None = None
@@ -70,6 +71,7 @@ class ProgressTracker:
             raise IndexError(f"Item index {index} is outside 0..{self.total_items - 1}")
         with self._lock:
             self._current_index = index
+            self._current_started_at = time.monotonic()
             if label is not None:
                 self._current_label = str(label)
             elif 0 <= index < len(self.item_labels):
@@ -116,6 +118,16 @@ class ProgressTracker:
         """Seconds elapsed since tracker construction."""
 
         return max(0.0, time.monotonic() - self._started_at)
+
+    @property
+    def item_elapsed(self) -> float:
+        """Seconds elapsed for the currently active item."""
+
+        with self._lock:
+            started_at = self._current_started_at
+        if started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started_at)
 
     @property
     def processed(self) -> int:
@@ -214,7 +226,10 @@ class ProgressTracker:
                 "step_index": self._step_index,
                 "total_steps": self._step_total,
                 "elapsed": self.elapsed,
+                "elapsed_s": self.elapsed,
+                "item_elapsed_s": self.item_elapsed,
                 "eta_seconds": self.eta_seconds,
+                "eta_s": self.eta_seconds,
                 "processed": self.processed,
                 "skipped": self.skipped,
                 "failed": self.failed,

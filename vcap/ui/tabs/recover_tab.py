@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import gradio as gr
 
+from vcap.core import gpu
 from vcap.core.outputs import load_metadata
 from vcap.core.paths import natural_sort_key, normalize_path
 from vcap.ui.components import action_button
@@ -34,6 +35,14 @@ _MODEL_PROMPT_KEYS = {
     "avoid_list",
     "extra_instructions",
 }
+_ALWAYS_SKIPPED_KEYS = {"theme", "theme_mode", "outputs_dir", "temp_dir", "models_dir"}
+_OPTIONAL_PATH_KEYS = {
+    "input_files",
+    "input_path",
+    "batch_input_folder",
+    "batch_output_folder",
+}
+_GPU_KEYS = {"gpu_index", "gpu_indices"}
 
 
 def recent_metadata_paths(outputs_dir: str | Path, limit: int = 40) -> list[Path]:
@@ -59,7 +68,21 @@ def recent_metadata_paths(outputs_dir: str | Path, limit: int = 40) -> list[Path
 def _metadata_document(value: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
-    return load_metadata(value)
+    return load_metadata(resolve_metadata_path(value))
+
+
+def resolve_metadata_path(value: str | Path) -> Path:
+    """Resolve either a metadata file or a single/batch run directory."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Choose a metadata.json file or run folder")
+    path = normalize_path(raw)
+    if path.is_dir():
+        path = path / "metadata.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"Metadata file does not exist: {path}")
+    return path
 
 
 def extract_metadata_settings(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -72,6 +95,94 @@ def extract_metadata_settings(metadata: Mapping[str, Any]) -> dict[str, Any]:
         if variant:
             settings["model_key"] = variant
     return settings
+
+
+def present_recovery_settings(
+    metadata: str | Path | Mapping[str, Any],
+    registry: "SettingsRegistry",
+    *,
+    model_prompt_only: bool = False,
+    restore_paths: bool = False,
+    available_gpu_indices: Sequence[int] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Coerce stored settings while excluding unsafe machine and path values."""
+
+    selected, warnings, skipped = _recovery_settings_details(
+        metadata,
+        registry,
+        model_prompt_only=model_prompt_only,
+        restore_paths=restore_paths,
+        available_gpu_indices=available_gpu_indices,
+    )
+    if skipped:
+        warnings.append(f"Skipped keys: {', '.join(skipped)}.")
+    return selected, warnings
+
+
+def _recovery_settings_details(
+    metadata: str | Path | Mapping[str, Any],
+    registry: "SettingsRegistry",
+    *,
+    model_prompt_only: bool = False,
+    restore_paths: bool = False,
+    available_gpu_indices: Sequence[int] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Return selected values, coercion warnings, and explicitly skipped keys."""
+
+    document = _metadata_document(metadata)
+    source = extract_metadata_settings(document)
+    coerced, warnings = registry.coerce(source)
+    allowed = {
+        entry.key
+        for entry in registry.entries()
+        if not model_prompt_only
+        or entry.section in {"model", "prompt"}
+        or entry.key in _MODEL_PROMPT_KEYS
+    }
+    if available_gpu_indices is None:
+        available = {int(info.index) for info in gpu.list_gpus()}
+    else:
+        available = {int(index) for index in available_gpu_indices}
+    selected: dict[str, Any] = {}
+    skipped: list[str] = []
+    for key in source:
+        if key not in allowed or key not in coerced:
+            continue
+        if key in _ALWAYS_SKIPPED_KEYS:
+            skipped.append(key)
+            continue
+        if key in _OPTIONAL_PATH_KEYS and not restore_paths:
+            skipped.append(key)
+            continue
+        value = coerced[key]
+        if key == "gpu_index":
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                skipped.append(key)
+                continue
+            if index not in available:
+                skipped.append(key)
+                continue
+            value = index
+        elif key == "gpu_indices":
+            raw_indices = value if isinstance(value, (list, tuple, set)) else [value]
+            valid: list[int] = []
+            for raw_index in raw_indices:
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if index in available and index not in valid:
+                    valid.append(index)
+            if raw_indices and not valid:
+                skipped.append(key)
+                continue
+            if len(valid) != len(raw_indices):
+                skipped.append(key)
+            value = valid
+        selected[key] = value
+    return selected, warnings, list(dict.fromkeys(skipped))
 
 
 def _display_value(value: Any) -> str:
@@ -90,7 +201,8 @@ def build_recovery_diff_table(
     """Build a pure key/saved/current/difference table for tests and UI styling."""
 
     document = _metadata_document(metadata)
-    saved, _ = registry.coerce(extract_metadata_settings(document))
+    raw_saved = extract_metadata_settings(document)
+    saved, _ = registry.coerce(raw_saved)
     if current_values is None:
         current = registry.defaults()
     elif isinstance(current_values, Mapping):
@@ -99,8 +211,8 @@ def build_recovery_diff_table(
         current = registry.values_to_dict(list(current_values))
     rows: list[dict[str, Any]] = []
     for entry in registry.entries():
-        saved_value = saved.get(entry.key, entry.default)
         current_value = current.get(entry.key, entry.default)
+        saved_value = saved.get(entry.key, entry.default) if entry.key in raw_saved else current_value
         rows.append(
             {
                 "key": entry.key,
@@ -155,7 +267,7 @@ def build(ctx: "UiContext") -> None:
             )
             metadata_path = gr.Textbox(
                 value=choices[0][1] if choices else "", label="Metadata path",
-                info="A local path can be used instead of uploading a file.",
+                info="Enter metadata.json or a single/batch run folder containing it.",
             )
             recent = gr.Dropdown(
                 choices=choices, value=choices[0][1] if choices else None,
@@ -167,6 +279,11 @@ def build(ctx: "UiContext") -> None:
             with gr.Row(elem_classes=["vc-compact-row"]):
                 apply_all = action_button("Apply to UI", "emerald", size="md")
                 apply_model_prompt = action_button("Apply model + prompt only", "violet", size="md")
+            restore_paths = gr.Checkbox(
+                value=False,
+                label="Also restore input/output paths",
+                info="Restore input files and batch input/output folders; app, model, temp, and theme paths remain unchanged.",
+            )
             recovery_status = gr.Markdown("Choose metadata to compare.", elem_classes=["vc-status"])
 
         with gr.Column(scale=6, min_width=520):
@@ -207,19 +324,27 @@ def build(ctx: "UiContext") -> None:
     def load_handler(upload: Any, typed: str, selected: str, *current_values: Any) -> tuple[Any, str, dict[str, Any], Any]:
         source = resolve_path(upload, typed, selected)
         try:
-            document = load_metadata(source)
-            raw_settings = extract_metadata_settings(document)
-            coerced, warnings = registry.coerce(raw_settings)
+            resolved = resolve_metadata_path(source)
+            document = load_metadata(resolved)
+            applicable, warnings, skipped = _recovery_settings_details(document, registry)
             current = registry.values_to_dict(current_values)
             rows = build_recovery_diff_table(document, registry, current)
             differences = sum(bool(row["different"]) for row in rows)
             warning_text = " ".join(warnings[:5])
-            message = f"Loaded {source}. {differences} setting(s) differ."
+            message = f"Loaded {resolved}. {differences} stored setting(s) differ."
+            if skipped:
+                message += f" Skipped keys: {', '.join(skipped)}."
             if warning_text:
                 message += f" Warnings: {warning_text}"
             ctx.app_log.log(message, scope="recover")
-            recovered = {"path": source, "settings": coerced, "warnings": warnings}
-            return _styled_diff(rows), message, recovered, gr.update(value=source)
+            recovered = {
+                "path": str(resolved),
+                "document": document,
+                "settings": applicable,
+                "warnings": warnings,
+                "skipped": skipped,
+            }
+            return _styled_diff(rows), message, recovered, gr.update(value=str(resolved))
         except Exception as exc:
             ctx.app_log.error(f"Metadata recovery load failed: {exc}", scope="recover")
             return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", {}, gr.skip()
@@ -231,35 +356,56 @@ def build(ctx: "UiContext") -> None:
         show_progress="minimal", api_visibility="private",
     )
 
-    def apply_handler(recovered: dict[str, Any], model_prompt_only: bool) -> tuple[Any, ...]:
-        settings = recovered.get("settings") if isinstance(recovered, dict) else None
-        if not isinstance(settings, dict):
+    def apply_handler(
+        recovered: dict[str, Any],
+        model_prompt_only: bool,
+        include_paths: bool,
+    ) -> tuple[Any, ...]:
+        if not isinstance(recovered, dict):
             return (*[gr.skip() for _ in registry_components], "<span class='vc-warn'>Load metadata first.</span>")
-        values = registry.dict_to_values(settings)
-        if model_prompt_only:
-            values = [
-                gr.update(value=value)
-                if entry.section in {"model", "prompt"} or entry.key in _MODEL_PROMPT_KEYS
-                else gr.skip()
-                for entry, value in zip(registry.entries(), values)
-            ]
-            message = "Applied recovered model and prompt settings."
-        else:
-            values = [gr.update(value=value) for value in values]
-            message = f"Applied {len(values)} recovered settings to the UI."
-        warnings = recovered.get("warnings") or []
+        document = recovered.get("document")
+        if not isinstance(document, Mapping):
+            stored = recovered.get("settings")
+            document = {"settings": stored} if isinstance(stored, Mapping) else None
+        if not isinstance(document, Mapping):
+            return (*[gr.skip() for _ in registry_components], "<span class='vc-warn'>Load metadata first.</span>")
+        settings, warnings, skipped = _recovery_settings_details(
+            document,
+            registry,
+            model_prompt_only=model_prompt_only,
+            restore_paths=bool(include_paths),
+        )
+        values: list[Any] = []
+        applied = 0
+        for entry in registry.entries():
+            allowed = (
+                not model_prompt_only
+                or entry.section in {"model", "prompt"}
+                or entry.key in _MODEL_PROMPT_KEYS
+            )
+            if allowed and entry.key in settings:
+                values.append(gr.update(value=settings[entry.key]))
+                applied += 1
+            else:
+                values.append(gr.skip())
+        scope = "model/prompt " if model_prompt_only else ""
+        message = f"Applied {applied} recovered {scope}setting(s) to the UI."
+        if skipped:
+            message += f" Skipped keys: {', '.join(skipped)}."
         if warnings:
             message += " " + " ".join(str(value) for value in warnings[:5])
         ctx.app_log.log(message, scope="recover")
         return *values, message
 
     apply_all.click(
-        lambda recovered: apply_handler(recovered, False), inputs=recovered_state,
+        lambda recovered, include_paths: apply_handler(recovered, False, include_paths),
+        inputs=[recovered_state, restore_paths],
         outputs=[*registry_components, recovery_status],
         queue=False, show_progress="hidden", api_visibility="private",
     )
     apply_model_prompt.click(
-        lambda recovered: apply_handler(recovered, True), inputs=recovered_state,
+        lambda recovered, include_paths: apply_handler(recovered, True, include_paths),
+        inputs=[recovered_state, restore_paths],
         outputs=[*registry_components, recovery_status],
         queue=False, show_progress="hidden", api_visibility="private",
     )
@@ -270,5 +416,7 @@ __all__ = [
     "build_recover_diff_table",
     "build_recovery_diff_table",
     "extract_metadata_settings",
+    "present_recovery_settings",
     "recent_metadata_paths",
+    "resolve_metadata_path",
 ]

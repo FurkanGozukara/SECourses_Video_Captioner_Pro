@@ -77,6 +77,9 @@ _BASE_CSS = r"""
   --vc-ok: #34d399;
   --vc-warn: #fbbf24;
   --vc-err: #fb7185;
+  --vc-log-bg: #070b12;
+  --vc-log-fg: #cbd5e1;
+  --vc-log-border: rgba(56,189,248,0.20);
 }
 
 .gradio-container { max-width: 1840px !important; }
@@ -108,6 +111,10 @@ _BASE_CSS = r"""
 
 #vc-input-tabs .tab-container.visually-hidden {
   display: none !important;
+  visibility: hidden !important;
+  position: absolute !important;
+  height: 0 !important;
+  overflow: hidden !important;
   pointer-events: none !important;
 }
 #vc-input-tabs .tab-container:not(.visually-hidden) {
@@ -126,6 +133,9 @@ _BASE_CSS = r"""
   border-radius: 8px !important;
   background: rgba(15,23,42,0.38) !important;
   padding: 5px !important;
+}
+#vc-main-tabs > .tab-wrapper > .tab-container {
+  background: linear-gradient(130deg, rgba(30,41,59,.42), rgba(15,23,42,.26)) !important;
 }
 #vc-main-tabs .tab-container button { font-weight: 700 !important; }
 #vc-main-tabs .tab-container button.selected {
@@ -161,9 +171,9 @@ _BASE_CSS = r"""
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace !important;
   font-size: 12px !important;
   line-height: 1.45 !important;
-  color: #cbd5e1 !important;
-  background: #070b12 !important;
-  border-color: rgba(56,189,248,0.20) !important;
+  color: var(--vc-log-fg) !important;
+  background: var(--vc-log-bg) !important;
+  border-color: var(--vc-log-border) !important;
 }
 .vc-mono textarea { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace !important; }
 
@@ -199,6 +209,9 @@ body:not(.dark) {
   --vc-ok: #047857;
   --vc-warn: #a16207;
   --vc-err: #be123c;
+  --vc-log-bg: #f8fafc;
+  --vc-log-fg: #0f172a;
+  --vc-log-border: rgba(2,132,199,.25);
 }
 body:not(.dark) .vc-header {
   background: linear-gradient(112deg, #eef2ff, #f8fafc 55%, #ecfeff) !important;
@@ -210,12 +223,18 @@ body:not(.dark) .gradio-container .contain .vc-header.vc-header .vc-header-meta 
 body:not(.dark) .gradio-container .contain .vc-header.vc-header a { color: #0369a1 !important; }
 body:not(.dark) .vc-preset-bar { background: rgba(241,245,249,.86) !important; }
 body:not(.dark) .vc-card, body:not(.dark) .vc-panel { background: rgba(255,255,255,.96) !important; box-shadow: 0 8px 22px rgba(15,23,42,.07) !important; }
-body:not(.dark) #vc-main-tabs > .tab-wrapper { background: linear-gradient(130deg, rgba(224,231,255,.7), rgba(236,254,255,.65)) !important; border-color: rgba(37,99,235,.20) !important; }
+body:not(.dark) #vc-main-tabs > .tab-wrapper,
+body:not(.dark) #vc-main-tabs > .tab-wrapper > .tab-container { background: linear-gradient(130deg, rgba(224,231,255,.78), rgba(236,254,255,.72)) !important; border-color: rgba(37,99,235,.20) !important; }
 body:not(.dark) #vc-main-tabs .tab-container button { color: #0f172a !important; background: rgba(255,255,255,.84) !important; border-color: rgba(100,116,139,.28) !important; }
 body:not(.dark) #vc-main-tabs .tab-container button.selected { color: #ffffff !important; background: linear-gradient(145deg, #4f46e5, #0d9488) !important; border-color: #0d9488 !important; }
 body:not(.dark) .vc-input-tile { background: #f8fafc !important; }
 body:not(.dark) .vc-progress, body:not(.dark) .vc-meter { background: #f8fafc !important; }
-body:not(.dark) .vc-log textarea { color: #0f172a !important; background: #f8fafc !important; border-color: rgba(2,132,199,.25) !important; }
+body:not(.dark) .gradio-container .vc-log textarea { color: #0f172a !important; background: #f8fafc !important; border-color: rgba(2,132,199,.25) !important; }
+body:not(.dark) input[type=checkbox]:not(:checked),
+body:not(.dark) input[type=radio]:not(:checked) { background: #ffffff !important; border: 1.5px solid #64748b !important; box-shadow: inset 0 0 0 1px rgba(100,116,139,.08) !important; }
+body:not(.dark) .vcap-replace-chip { background: rgba(8,145,178,.08) !important; border-color: rgba(3,105,161,.34) !important; }
+body:not(.dark) .vcap-replace-arrow { color: #0369a1 !important; }
+body:not(.dark) .vc-btn:focus-visible { outline-color: #0369a1 !important; }
 
 @media (max-width: 760px) {
   .vc-header-meta { text-align: left; }
@@ -262,12 +281,19 @@ def build_css() -> str:
 
 THEME_CHANGE_JS = r"""
 (mode) => {
-  const selected = mode === 'light' ? 'light' : 'dark';
+  const selected = ['dark', 'light', 'system'].includes(mode) ? mode : 'dark';
   localStorage.setItem('secourses_theme_mode', selected);
-  document.body.classList.toggle('dark', selected === 'dark');
-  const url = new URL(window.location.href);
-  url.searchParams.set('__theme', selected);
-  window.history.replaceState({}, '', url.toString());
+  if (typeof window.__secoursesApplyThemeMode === 'function') {
+    window.__secoursesApplyThemeMode(selected);
+  } else {
+    const effective = selected === 'system'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      : selected;
+    if (document.body) document.body.classList.toggle('dark', effective === 'dark');
+    const url = new URL(window.location.href);
+    url.searchParams.set('__theme', effective);
+    window.history.replaceState({}, '', url.toString());
+  }
   return [];
 }
 """
@@ -279,38 +305,112 @@ HOTKEYS_HEAD = r"""
   if (window.__secoursesVcapInstalled) return;
   window.__secoursesVcapInstalled = true;
 
-  function applyStoredTheme() {
-    const stored = localStorage.getItem('secourses_theme_mode');
-    if (stored !== 'dark' && stored !== 'light') return;
-    document.body.classList.toggle('dark', stored === 'dark');
+  const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+  function normalizeThemeMode(value) {
+    return value === 'light' || value === 'system' || value === 'dark' ? value : 'dark';
+  }
+  function effectiveThemeMode(mode) {
+    return mode === 'system' ? (themeMedia.matches ? 'dark' : 'light') : mode;
+  }
+  function applyThemeMode(mode) {
+    const effective = effectiveThemeMode(normalizeThemeMode(mode));
+    document.documentElement.classList.toggle('dark', effective === 'dark');
+    if (document.body) document.body.classList.toggle('dark', effective === 'dark');
     const url = new URL(window.location.href);
-    if (url.searchParams.get('__theme') !== stored) {
-      url.searchParams.set('__theme', stored);
+    if (url.searchParams.get('__theme') !== effective) {
+      url.searchParams.set('__theme', effective);
       window.history.replaceState({}, '', url.toString());
     }
+    return effective;
   }
+  window.__secoursesApplyThemeMode = applyThemeMode;
+
+  function applyStoredTheme() {
+    let stored = localStorage.getItem('secourses_theme_mode');
+    if (stored !== 'dark' && stored !== 'light' && stored !== 'system') {
+      stored = 'dark';
+      localStorage.setItem('secourses_theme_mode', 'dark');
+    }
+    applyThemeMode(stored);
+  }
+  applyStoredTheme();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', applyStoredTheme, {once: true});
   } else {
     applyStoredTheme();
   }
+  const onSystemThemeChange = function () {
+    if (localStorage.getItem('secourses_theme_mode') === 'system') applyThemeMode('system');
+  };
+  if (typeof themeMedia.addEventListener === 'function') themeMedia.addEventListener('change', onSystemThemeChange);
+  else if (typeof themeMedia.addListener === 'function') themeMedia.addListener(onSystemThemeChange);
+
+  function activeMainTab() {
+    const root = document.getElementById('vc-main-tabs');
+    if (!root) return null;
+    const bar = root.querySelector(':scope > .tab-wrapper > .tab-container:not(.visually-hidden)') ||
+      root.querySelector(':scope > .tab-wrapper .tab-container:not(.visually-hidden)');
+    const selected = bar && bar.querySelector('[role="tab"][aria-selected="true"], button.selected');
+    const label = (selected && selected.textContent ? selected.textContent : '').toLowerCase();
+    if (label.includes('caption editor')) return 'editor';
+    if (label.includes('caption')) return 'caption';
+    const panels = root.querySelectorAll('[role="tabpanel"]');
+    for (const panel of panels) {
+      const style = window.getComputedStyle(panel);
+      if (panel.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility === 'hidden') continue;
+      if (panel.querySelector('#hk_ed_save')) return 'editor';
+      if (panel.querySelector('#hk_caption_start')) return 'caption';
+    }
+    return null;
+  }
+
+  function isDropdownSearch(target) {
+    if (!target || typeof target.closest !== 'function') return false;
+    const input = target.closest('input');
+    if (!input) return false;
+    return input.getAttribute('role') === 'combobox' ||
+      input.getAttribute('aria-autocomplete') !== null ||
+      Boolean(input.closest('.dropdown, [data-testid="dropdown"], [role="listbox"]'));
+  }
+
+  function isTextEntry(target) {
+    if (!target) return false;
+    const tag = (target.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || Boolean(target.isContentEditable);
+  }
+
+  function clickHotkey(id, event) {
+    const button = document.getElementById(id);
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    event.preventDefault();
+    button.click();
+    return true;
+  }
+
+  function captionJobRunning() {
+    const button = document.getElementById('vc_caption_cancel');
+    return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+  }
 
   document.addEventListener('keydown', function (event) {
     const target = event.target;
-    const tag = (target && target.tagName ? target.tagName : '').toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || (target && target.isContentEditable)) return;
+    if (isDropdownSearch(target)) return;
+    const tab = activeMainTab();
+    const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+    const primary = (event.ctrlKey || event.metaKey) && !event.altKey;
 
-    let id = null;
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 's') id = 'hk_save';
-    else if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'ArrowLeft') id = 'hk_prev';
-    else if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'ArrowRight') id = 'hk_next';
-    else if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'F9') id = 'hk_caption_start';
-    else if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Escape') id = 'hk_caption_cancel';
-    if (!id) return;
-    const button = document.getElementById(id);
-    if (button) {
-      event.preventDefault();
-      button.click();
+    if (tab === 'caption') {
+      if (plain && event.key === 'F9' && !captionJobRunning()) clickHotkey('hk_caption_start', event);
+      else if (plain && event.key === 'Escape' && captionJobRunning()) clickHotkey('hk_caption_cancel', event);
+      return;
+    }
+    if (tab === 'editor') {
+      const key = event.key.toLowerCase();
+      if (primary && key === 's') clickHotkey('hk_ed_save', event);
+      else if (primary && event.key === 'Enter') clickHotkey('hk_ed_approve', event);
+      else if (primary && event.key === 'Delete') clickHotkey('hk_ed_reject', event);
+      else if (plain && !isTextEntry(target) && event.key === 'ArrowLeft') clickHotkey('hk_ed_prev', event);
+      else if (plain && !isTextEntry(target) && event.key === 'ArrowRight') clickHotkey('hk_ed_next', event);
     }
   }, false);
 })();

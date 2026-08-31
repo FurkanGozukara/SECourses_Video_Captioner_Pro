@@ -1,11 +1,12 @@
-venv/
-models/
-outputs/
-temp/
-tmp/
-logs/
-llamacpp/
-presets/
+/venv/
+/models/
+/outputs/
+/temp/
+/tmp/
+/logs/
+/llamacpp/
+/presets/
+/app_settings.json
 __pycache__/
 *.pyc
 *.pyo
@@ -35,3 +36,5 @@ __pycache__/
 !assets/*.ico
 .codex-run/
 *.log
+.kernel_cache.json
+.compile_env_cache.json

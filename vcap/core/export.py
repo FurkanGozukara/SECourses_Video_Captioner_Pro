@@ -40,6 +40,7 @@ class ExportReport:
     exported: int
     skipped: int
     rejected: int
+    no_media: int
     media_files: list[Path]
     caption_files: list[Path]
     errors: list[str]
@@ -55,6 +56,18 @@ class ExportReport:
         """Alias used by UI counters."""
 
         return self.skipped
+
+    @property
+    def not_approved(self) -> int:
+        """Number excluded by the approved-only filter."""
+
+        return self.rejected
+
+    @property
+    def error_count(self) -> int:
+        """Number of per-item export errors."""
+
+        return len(self.errors)
 
 
 def _repeat_parts(name: str) -> tuple[int, str, bool]:
@@ -333,6 +346,18 @@ def _unique_target(directory: Path, filename: str, caption_ext: str) -> Path:
         counter += 1
 
 
+def _unique_caption_target(directory: Path, stem: str, caption_ext: str) -> Path:
+    candidate = directory / f"{stem}{caption_ext}"
+    if not candidate.exists():
+        return candidate
+    counter = 1
+    while True:
+        value = directory / f"{stem}_{counter:04d}{caption_ext}"
+        if not value.exists():
+            return value
+        counter += 1
+
+
 def export_dataset(
     items: Iterable[Any],
     out_root: str | os.PathLike[str],
@@ -341,44 +366,62 @@ def export_dataset(
     copy_media: bool = True,
     caption_ext: str = ".txt",
     flat: bool = True,
+    include_caption_only: bool = False,
 ) -> ExportReport:
-    """Export media/caption pairs, continuing after per-item errors."""
+    """Export approved pairs and optional caption-only items with explicit counts."""
 
     root = normalize_path(out_root)
     root.mkdir(parents=True, exist_ok=True)
     extension = str(caption_ext or ".txt")
     if not extension.startswith("."):
         extension = "." + extension
-    exported = skipped = rejected = 0
+    exported = skipped = rejected = no_media = 0
     media_outputs: list[Path] = []
     caption_outputs: list[Path] = []
     errors: list[str] = []
     for item in items:
         raw_media = _item_value(item, "media_path", "path", "media", "file", default=item if isinstance(item, (str, os.PathLike)) else None)
+        if raw_media is None:
+            raw_media = _item_value(item, "source_media_path", default=None)
+        raw_caption_path = _item_value(item, "caption_path", default=None)
         try:
-            if raw_media is None:
-                raise ValueError("item has no media path")
-            media = normalize_path(raw_media, must_exist=True)
-            if not media.is_file():
-                raise ValueError("media path is not a file")
-            if only_approved and not _approved(item, media):
+            media = normalize_path(raw_media) if raw_media else None
+            if media is not None and not media.is_file():
+                media = None
+            approval_reference = media
+            if approval_reference is None and raw_caption_path:
+                approval_reference = normalize_path(raw_caption_path)
+            if approval_reference is None:
+                approval_reference = root / "caption.txt"
+            if only_approved and not _approved(item, approval_reference):
                 rejected += 1
                 continue
-            caption, _ = _caption_for(item, media)
+            if media is None:
+                no_media += 1
+                if not include_caption_only:
+                    skipped += 1
+                    continue
+            caption_reference = media or approval_reference
+            caption, caption_source = _caption_for(item, caption_reference)
             if caption is None:
                 skipped += 1
-                errors.append(f"Missing caption for {media}")
+                errors.append(f"Missing caption for {caption_reference}")
                 continue
             destination_dir = root if flat else root / _relative_parent(item)
             destination_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = sanitize_filename(media.name)
-            media_target = _unique_target(destination_dir, safe_name, extension)
-            caption_target = media_target.with_suffix(extension)
-            if copy_media:
-                shutil.copy2(media, media_target)
-                media_outputs.append(media_target)
+            if media is not None:
+                safe_name = sanitize_filename(media.name)
+                media_target = _unique_target(destination_dir, safe_name, extension)
+                caption_target = media_target.with_suffix(extension)
+                if copy_media:
+                    shutil.copy2(media, media_target)
+                    media_outputs.append(media_target)
+                else:
+                    media_outputs.append(media)
             else:
-                media_outputs.append(media)
+                source_name = caption_source.name if caption_source is not None else Path(str(raw_caption_path or "caption.txt")).name
+                safe_stem = Path(sanitize_filename(source_name)).stem or "caption"
+                caption_target = _unique_caption_target(destination_dir, safe_stem, extension)
             OutputWriter().write_text(
                 caption_target,
                 caption + ("\n" if caption and not caption.endswith("\n") else ""),
@@ -393,6 +436,7 @@ def export_dataset(
         exported=exported,
         skipped=skipped,
         rejected=rejected,
+        no_media=no_media if not include_caption_only else 0,
         media_files=media_outputs,
         caption_files=caption_outputs,
         errors=errors,

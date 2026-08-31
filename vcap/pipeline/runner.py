@@ -10,16 +10,21 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from vcap import TEMP_DIR, VERSION
-from vcap.core import gpu
-from vcap.core.captions_post import Segment, finalize_caption, write_caption_outputs
+from vcap.core import console_progress, gpu
+from vcap.core.captions_post import (
+    Segment,
+    apply_replacements,
+    finalize_caption,
+    write_caption_outputs,
+)
 from vcap.core.logs import get_log
 from vcap.core.media import MediaInfo, extract_audio, probe_media, trim_media
-from vcap.core.outputs import MetadataBuilder, RunLog, allocate_run_dir, model_short_name
+from vcap.core.outputs import MetadataBuilder, OutputWriter, RunLog, allocate_run_dir, model_short_name
 from vcap.core.paths import list_media_files, normalize_path, sanitize_filename
 from vcap.core.preprocess import (
     AutoRejectRules,
@@ -27,7 +32,7 @@ from vcap.core.preprocess import (
     normalize_clip_for_model,
     should_reject,
 )
-from vcap.core.progress import ProgressEvent, ProgressSink, ProgressTracker
+from vcap.core.progress import ProgressEvent, ProgressSink, ProgressTracker, UiThrottle
 from vcap.core.scene_split import SceneDetectParams, SceneRange, plan_segments, split_video
 from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, ModelSpec, variant_to_family
@@ -63,6 +68,9 @@ class _Emitter:
     def __init__(self, sink: ProgressSink | None, tracker: ProgressTracker) -> None:
         self.sink: ProgressSink = sink or _NullSink()
         self.tracker = tracker
+        self._current_event_index: int | None = None
+        self._console_key = ("pipeline", id(self))
+        self._console_throttle = UiThrottle(0.5)
 
     def log(self, text: object, level: str = "info", scope: str = "pipeline") -> None:
         message = str(text)
@@ -74,8 +82,89 @@ class _Emitter:
         )
         _call_sink(self.sink.on_log, message, level=level, scope=scope)
 
-    def start_item(self, tracker_index: int, label: str) -> None:
+    def start_item(self, tracker_index: int, label: str, event_index: int | None = None) -> None:
         self.tracker.start_item(tracker_index, label)
+        self._current_event_index = tracker_index if event_index is None else event_index
+
+    @staticmethod
+    def _clock(seconds: float | None) -> str:
+        if seconds is None:
+            return "unknown"
+        total = max(0, int(round(float(seconds))))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _payload(
+        self,
+        event_index: int | None,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self.tracker.to_dict()
+        return {
+            "fraction_in_item": snapshot["fraction_in_item"],
+            "step_index": snapshot["step_index"],
+            "total_steps": snapshot["total_steps"],
+            "eta_seconds": snapshot["eta_seconds"],
+            "elapsed": snapshot["elapsed"],
+            "processed": snapshot["total_items"] - snapshot["remaining"],
+            "done": snapshot["processed"],
+            "remaining": snapshot["remaining"],
+            "total": snapshot["total_items"],
+            "elapsed_s": snapshot["elapsed_s"],
+            "eta_s": snapshot["eta_s"],
+            "item_index": event_index,
+            "item_elapsed_s": snapshot["item_elapsed_s"],
+            "status_line": self.tracker.status_line(),
+            **dict(data or {}),
+        }
+
+    def _console_status(
+        self,
+        message: str,
+        payload: Mapping[str, Any],
+        *,
+        force: bool = False,
+        finalize: bool = False,
+    ) -> None:
+        if os.environ.get("VCAP_WORKER") == "1" and os.environ.get("VCAP_CONSOLE_PROGRESS_PARENT") == "1":
+            return
+        if not self._console_throttle.should_emit(force=force):
+            return
+        speed = payload.get("tok_per_s", payload.get("tokens_per_second"))
+        display_message = message
+        message_parts = message.rsplit("|", 1)
+        if speed is not None and len(message_parts) == 2 and message_parts[1].strip().casefold().endswith("tok/s"):
+            display_message = message_parts[0].rstrip()
+        line = (
+            f"[{int(payload.get('processed', 0))}/{int(payload.get('total', 0))}] {display_message}"
+            f" | elapsed {self._clock(payload.get('elapsed_s'))}"
+            f" | ETA {self._clock(payload.get('eta_s'))}"
+        )
+        try:
+            if speed is not None and float(speed) > 0:
+                line += f" | {float(speed):.1f} tok/s"
+        except (TypeError, ValueError):
+            pass
+        if finalize:
+            console_progress.finalize_progress_line(self._console_key, line)
+        else:
+            console_progress.show_progress_line(line, key=self._console_key)
+
+    def _emit_running_item(self, message: str, event_index: int | None, payload: dict[str, Any]) -> None:
+        _call_sink(
+            self.sink.on_item,
+            ProgressEvent(
+                message=message,
+                fraction=self.tracker.overall_fraction,
+                item_index=event_index,
+                total_items=self.tracker.total_items,
+                status="running",
+                data=payload,
+                kind="item",
+            ),
+        )
 
     def progress(
         self,
@@ -88,20 +177,14 @@ class _Emitter:
         data: Mapping[str, Any] | None = None,
     ) -> None:
         del tracker_index
+        self._current_event_index = event_index
         self.tracker.set_step(
             message,
             min(1.0, max(0.0, float(fraction_in_item))),
             total_steps=_TOTAL_STEPS,
             step_index=step_index,
         )
-        payload = {
-            "fraction_in_item": min(1.0, max(0.0, float(fraction_in_item))),
-            "step_index": step_index,
-            "total_steps": _TOTAL_STEPS,
-            "eta_seconds": self.tracker.eta_seconds,
-            "elapsed": self.tracker.elapsed,
-            **dict(data or {}),
-        }
+        payload = self._payload(event_index, data=data)
         _call_sink(
             self.sink.on_progress,
             ProgressEvent(
@@ -112,6 +195,33 @@ class _Emitter:
                 data=payload,
             ),
         )
+        self._emit_running_item(message, event_index, payload)
+        self._console_status(message, payload)
+
+    def phase_progress(
+        self,
+        message: str,
+        fraction: float | None,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Emit download/load progress without disturbing the active item fraction."""
+
+        event_index = self._current_event_index
+        payload = self._payload(event_index, data=data)
+        resolved_fraction = self.tracker.overall_fraction if fraction is None else min(1.0, max(0.0, float(fraction)))
+        _call_sink(
+            self.sink.on_progress,
+            ProgressEvent(
+                message=message,
+                fraction=resolved_fraction,
+                item_index=event_index,
+                total_items=self.tracker.total_items,
+                data=payload,
+            ),
+        )
+        self._emit_running_item(message, event_index, payload)
+        self._console_status(message, payload)
 
     def finish(
         self,
@@ -123,6 +233,10 @@ class _Emitter:
     ) -> None:
         tracker_status = status if status in {"done", "skipped", "failed"} else "failed"
         self.tracker.finish_item(tracker_status, seconds)
+        payload = self._payload(
+            event_index,
+            data={"elapsed": max(0.0, float(seconds)), "item_elapsed_s": max(0.0, float(seconds))},
+        )
         _call_sink(
             self.sink.on_item,
             ProgressEvent(
@@ -131,9 +245,15 @@ class _Emitter:
                 item_index=event_index,
                 total_items=self.tracker.total_items,
                 status=status,
-                data={"elapsed": max(0.0, float(seconds))},
+                data=payload,
                 kind="item",
             ),
+        )
+        self._console_status(
+            message,
+            payload,
+            force=True,
+            finalize=self.tracker.remaining == 0,
         )
 
 
@@ -191,7 +311,10 @@ def _record_value(value: Any) -> dict[str, Any]:
     try:
         return asdict(value)
     except (TypeError, ValueError):
-        return dict(value) if isinstance(value, Mapping) else {"value": str(value)}
+        if isinstance(value, Mapping):
+            return dict(value)
+        attributes = getattr(value, "__dict__", None)
+        return dict(attributes) if isinstance(attributes, Mapping) else {"value": str(value)}
 
 
 def _status_counts(items: Iterable[ItemResult]) -> dict[str, int]:
@@ -219,8 +342,24 @@ def _result_index(spec: JobSpec, local_index: int) -> int:
     return local_index
 
 
+def _inside_root(path: Path, root: Path | None) -> bool:
+    if root is None:
+        return False
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def _resolve_inputs(spec: JobSpec) -> list[_ResolvedInput]:
     expanded: list[tuple[InputItem, Path | None]] = []
+    configured_root: Path | None = None
+    if spec.output.source_root:
+        try:
+            configured_root = normalize_path(spec.output.source_root)
+        except Exception:
+            configured_root = None
     for item in spec.inputs:
         if item.text_prompt_only:
             expanded.append((item, None))
@@ -233,11 +372,13 @@ def _resolve_inputs(spec: JobSpec) -> list[_ResolvedInput]:
             files = list_media_files(
                 path,
                 recursive=spec.output.recursive,
-                kinds=("video", "audio", "image", "text"),
+                kinds=("video", "audio", "image"),
             )
-            expanded.extend((InputItem(file, item.kind), path) for file in files)
+            source_root = configured_root if _inside_root(path, configured_root) else path
+            expanded.extend((InputItem(file, item.kind), source_root) for file in files)
         else:
-            expanded.append((item, path))
+            source_root = configured_root if _inside_root(path, configured_root) else None
+            expanded.append((item, source_root))
     resolved: list[_ResolvedInput] = []
     for local_index, (item, root) in enumerate(expanded):
         path = None if item.text_prompt_only else normalize_path(item.path)
@@ -402,6 +543,40 @@ def _metadata_settings(spec: JobSpec) -> dict[str, Any]:
     return {"typed_job": typed}
 
 
+def _metadata_finish_reason(items: Sequence[ItemResult]) -> str | list[str] | None:
+    reasons: list[str] = []
+    for item in items:
+        for segment in item.segments:
+            usage = segment.get("usage")
+            reason = usage.get("finish_reason") if isinstance(usage, Mapping) else None
+            if reason not in {None, ""} and str(reason) not in reasons:
+                reasons.append(str(reason))
+    if not reasons:
+        return None
+    return reasons[0] if len(reasons) == 1 else reasons
+
+
+def _write_batch_summary(run_dir: Path, items: Sequence[ItemResult], elapsed: float) -> Path:
+    counts = _status_counts(items)
+    summary = {
+        "counts": {
+            key: int(counts.get(key, 0))
+            for key in ("total", "done", "skipped", "failed", "unsupported", "cancelled")
+        },
+        "processing_time_seconds": max(0.0, float(elapsed)),
+        "items": [
+            {
+                "status": item.status,
+                "path": item.path,
+                "elapsed": max(0.0, float(item.elapsed)),
+                "elapsed_s": max(0.0, float(item.elapsed)),
+            }
+            for item in sorted(items, key=lambda value: value.index)
+        ],
+    }
+    return OutputWriter().write_json(run_dir / "summary.json", summary, pretty=False)
+
+
 def _write_metadata(
     spec: JobSpec,
     items: list[ItemResult],
@@ -438,7 +613,19 @@ def _write_metadata(
         gpu_info,
         {"counts": _status_counts(items), **dict(extra or {})},
     )
+    source_root = normalize_path(spec.output.source_root) if spec.output.source_root else None
+    explicit_metadata = dict(
+        finish_reason=_metadata_finish_reason(items),
+        sampling_strategy=spec.preprocess.sampling_strategy,
+        context_carry_over=bool(spec.context_carry_over),
+        source_root=str(source_root) if source_root is not None else None,
+        processing_time_seconds=max(0.0, float(elapsed)),
+    )
+    if builder.data is not None:
+        builder.data.update(explicit_metadata)
     builder.write(target)
+    if spec.output.kind == "batch" and target.name.casefold() == "metadata.json":
+        _write_batch_summary(run_dir, items, elapsed)
     return target
 
 
@@ -507,11 +694,24 @@ class _ModelSession:
         if self._compile_prepared or not self.spec.runtime.compile:
             return
         self._compile_prepared = True
-        from vcap.models.torch_compile import prepare_compile_env
+        from vcap.models.registry import variant_to_family
+        from vcap.models.torch_compile import DEFAULT_COMPILE_MODE, prepare_compile_env
 
-        plan = prepare_compile_env(True)
+        requested_mode = str(
+            self.spec.settings.get("compile_mode")
+            or self.spec.settings.get("torch_compile_mode")
+            or DEFAULT_COMPILE_MODE
+        )
+        plan = prepare_compile_env(
+            True,
+            mode=requested_mode,
+            family=variant_to_family(self.spec.model.variant_key),
+        )
         os.environ.update(plan.env_updates)
-        self.emitter.log(f"torch.compile mode: {plan.mode}", scope="compile")
+        self.emitter.log(
+            f"torch.compile mode: {plan.requested_mode} ({plan.mode})",
+            scope="compile",
+        )
         for warning in plan.warnings:
             self.emitter.log(warning, level="warning", scope="compile")
 
@@ -543,13 +743,16 @@ class _ModelSession:
 
         def download_progress(message: Any, payload: Any = None) -> None:
             data = payload if isinstance(payload, Mapping) else {}
-            self.emitter.log(str(message), scope="downloads")
             fraction = data.get("fraction") if isinstance(data, Mapping) else None
-            if fraction is not None:
-                _call_sink(
-                    self.emitter.sink.on_progress,
-                    ProgressEvent(str(message), fraction=float(fraction), data=dict(data)),
-                )
+            try:
+                parsed_fraction = float(fraction) if fraction is not None else None
+            except (TypeError, ValueError):
+                parsed_fraction = None
+            self.emitter.phase_progress(
+                str(message),
+                parsed_fraction,
+                data={"phase": "model_download", **dict(data)},
+            )
 
         if not loader_is_patched and os.environ.get("VCAP_SKIP_MODEL_ENSURE", "") != "1":
             ready, detail = downloads.ensure_model(
@@ -563,14 +766,17 @@ class _ModelSession:
         def load_progress(*args: Any) -> None:
             message = str(args[0]) if args else "Loading model"
             fraction: float | None = None
-            if len(args) > 1 and isinstance(args[1], (int, float)):
+            data: dict[str, Any] = {"phase": "model_load"}
+            if len(args) > 1 and isinstance(args[1], Mapping):
+                data.update(dict(args[1]))
+                try:
+                    raw_fraction = data.get("fraction")
+                    fraction = float(raw_fraction) if raw_fraction is not None else None
+                except (TypeError, ValueError):
+                    fraction = None
+            elif len(args) > 1 and isinstance(args[1], (int, float)):
                 fraction = float(args[1])
-            self.emitter.log(message, scope="models")
-            if fraction is not None:
-                _call_sink(
-                    self.emitter.sink.on_progress,
-                    ProgressEvent(message, fraction=fraction, data={"phase": "model_load"}),
-                )
+            self.emitter.phase_progress(message, fraction, data=data)
 
         max_memory: dict[Any, str] | None = None
         if self.spec.model.offload.max_memory:
@@ -587,10 +793,12 @@ class _ModelSession:
         physical_gpu_index = int(self.spec.runtime.gpu_index)
         isolated_worker = os.environ.get("VCAP_WORKER", "").strip() == "1"
         process_device_index = 0 if isolated_worker else physical_gpu_index
+        from vcap.models.torch_compile import DEFAULT_COMPILE_MODE
+
         compile_mode = str(
             self.spec.settings.get("compile_mode")
             or self.spec.settings.get("torch_compile_mode")
-            or "cudagraphs"
+            or DEFAULT_COMPILE_MODE
         )
         load_kwargs = {
             "device": f"cuda:{process_device_index}",
@@ -705,6 +913,8 @@ def _trim_source(
 ) -> tuple[Path, MediaInfo, float]:
     assert entry.info is not None
     info = entry.info
+    if spec.output.kind == "batch":
+        return source, info, 0.0
     start = max(0.0, spec.preprocess.trim_start_s)
     end = spec.preprocess.trim_end_s
     if info.duration is not None:
@@ -734,16 +944,7 @@ def _trim_source(
 
 
 def _is_dataset_job(spec: JobSpec) -> bool:
-    if spec.output.save_clips or spec.split.mode == "trainer" or spec.split.trainer_target:
-        return True
-    if spec.prompt.preset_id:
-        try:
-            from vcap.prompts.presets import get_preset
-
-            return get_preset(spec.prompt.preset_id).group == "Training captions"
-        except KeyError:
-            pass
-    return False
+    return bool(spec.output.save_clips or spec.split.mode == "trainer")
 
 
 def _plan_item_segments(
@@ -787,12 +988,8 @@ def _materialize_segments(
 ) -> list[_SegmentSource]:
     if source is None or info is None or info.kind in {"image", "text"}:
         return [_SegmentSource(1, source, 0.0, 0.0, None, None)]
-    physical = len(segments) > 1 or spec.output.save_clips
-    persist = (
-        spec.output.save_clips
-        or spec.output.save_processed_files
-        or (len(segments) > 1 and _is_dataset_job(spec))
-    )
+    persist = _is_dataset_job(spec)
+    physical = len(segments) > 1 or persist
     if not physical:
         segment = segments[0]
         return [
@@ -805,6 +1002,17 @@ def _materialize_segments(
                 segment.end_s,
             )
         ]
+    if persist:
+        reason = "Save produced clips is enabled" if spec.output.save_clips else "Trainer split mode is selected"
+        emitter.log(
+            f"Produced clips will be persisted because {reason}. Clips are otherwise temporary.",
+            scope="split",
+        )
+    else:
+        emitter.log(
+            "Produced clips are temporary; enable Save produced clips or select Trainer split mode to persist them.",
+            scope="split",
+        )
     if persist and entry.out_dir is not None:
         clip_dir = entry.out_dir / f"{entry.stem}_clips"
     else:
@@ -969,9 +1177,11 @@ def _model_pre(spec: JobSpec, model: ModelSpec, override: Mapping[str, Any] | No
         "max_pixels": spec.preprocess.max_pixels,
         "min_pixels": spec.preprocess.min_pixels or model.limits.min_pixels,
         "use_audio_in_video": spec.preprocess.use_audio_in_video,
+        "sampling_strategy": spec.preprocess.sampling_strategy,
     }
     values.update(dict(override or {}))
-    return PreprocessParams(**values)
+    supported = {item.name for item in fields(PreprocessParams)}
+    return PreprocessParams(**{key: value for key, value in values.items() if key in supported})
 
 
 def _media_input(entry: _ResolvedInput, segment: _SegmentSource, spec: JobSpec, model: ModelSpec) -> Any:
@@ -1062,8 +1272,10 @@ def _caption_with_oom_recovery(
         "max_pixels": spec.preprocess.max_pixels,
         "min_pixels": spec.preprocess.min_pixels or model.limits.min_pixels,
         "use_audio_in_video": spec.preprocess.use_audio_in_video,
+        "sampling_strategy": spec.preprocess.sampling_strategy,
     }
     retries = 0
+    compile_retried = False
     while True:
         _check_cancel(cancel)
         try:
@@ -1084,6 +1296,27 @@ def _caption_with_oom_recovery(
         except CancelledError:
             raise
         except Exception as exc:
+            if not compile_retried and session.loaded is not None:
+                from vcap.models.torch_compile import (
+                    is_compile_runtime_error,
+                    restore_eager_model,
+                )
+
+                if is_compile_runtime_error(exc):
+                    fallback = restore_eager_model(session.loaded, exc)
+                    if fallback is not None:
+                        compile_retried = True
+                        exc.__traceback__ = None
+                        _empty_cuda_cache()
+                        emitter.log(
+                            f"torch.compile mode '{fallback.mode}' failed for {fallback.family} "
+                            f"({fallback.reason}); restored {fallback.restored_modules} compiled "
+                            "module(s), disabled this family/mode for the process, and retrying "
+                            "the same segment once in eager mode.",
+                            "warning",
+                            "compile",
+                        )
+                        continue
             if not gpu.is_oom_error(exc) or retries >= 2:
                 raise
             _empty_cuda_cache()
@@ -1115,6 +1348,48 @@ def _finalize_text(spec: JobSpec, text: str) -> str:
         },
         collapse_whitespace=spec.post.collapse_whitespace,
     )
+
+
+def _finalize_cue_text(spec: JobSpec, text: str) -> str:
+    """Apply find/replace to a cue without caption-level text injection."""
+
+    if not spec.post.replace_pairs:
+        return str(text)
+    return apply_replacements(
+        str(text),
+        spec.post.replace_pairs,
+        regex=spec.post.replace_regex,
+        case_insensitive=spec.post.replace_case_insensitive,
+        whole_words=spec.post.replace_whole_words,
+    )
+
+
+def _context_excerpt(text: str, word_limit: int = 60) -> str:
+    words = str(text).split()
+    return " ".join(words[-max(1, int(word_limit)) :])
+
+
+def _prompt_with_context(prompt: Any, previous_text: str, model: ModelSpec) -> Any:
+    excerpt = _context_excerpt(previous_text)
+    if not excerpt:
+        return prompt
+    base_user = getattr(prompt, "user_prompt", None)
+    if base_user is None:
+        preset_id = getattr(prompt, "preset_id", None) or model.default_prompt_preset
+        if preset_id:
+            try:
+                from vcap.prompts.presets import get_preset, render_prompt
+
+                _, base_user = render_prompt(get_preset(preset_id), dict(getattr(prompt, "variables", {}) or {}))
+            except KeyError:
+                base_user = ""
+    context = f"Context from the previous segment (do not repeat it): {json.dumps(excerpt, ensure_ascii=False)}"
+    user_prompt = f"{str(base_user or '').rstrip()}\n\n{context}".lstrip()
+    return replace(prompt, user_prompt=user_prompt)
+
+
+def _supports_context_carry_over(model: ModelSpec) -> bool:
+    return model.family in {"avocado", "qwen3_omni_instruct", "qwen3_omni_thinking"}
 
 
 def _segment_output_location(entry: _ResolvedInput, segment: _SegmentSource) -> tuple[Path, str]:
@@ -1179,7 +1454,13 @@ def _process_item(
             emitter=emitter,
             item_label=entry.stem,
         )
-        for segment in sources:
+        previous_final_text = ""
+        context_enabled = (
+            spec.context_carry_over
+            and total_sources > 1
+            and _supports_context_carry_over(model)
+        )
+        for source_position, segment in enumerate(sources):
             _check_cancel(cancel)
             record: dict[str, Any] = {
                 "index": segment.index,
@@ -1187,7 +1468,7 @@ def _process_item(
                 "end_s": trim_offset + segment.end_s,
                 "media_path": str(segment.path) if segment.path is not None else None,
             }
-            if spec.split.auto_reject and segment.path is not None and probe_media(segment.path).has_video:
+            if spec.split.auto_reject and segment.path is not None:
                 emitter.progress(
                     entry.tracker_index,
                     entry.result_index,
@@ -1195,9 +1476,23 @@ def _process_item(
                     0.37,
                     step_index=4,
                 )
-                quality = analyze_clip_quality(segment.path)
-                reject, reasons = should_reject(quality, _reject_rules(spec))
-                record["quality"] = asdict(quality)
+                try:
+                    quality = analyze_clip_quality(
+                        segment.path,
+                        start_s=segment.media_start,
+                        end_s=segment.media_end,
+                    )
+                    reject, reasons = should_reject(quality, _reject_rules(spec))
+                    record["quality"] = asdict(quality)
+                except Exception as exc:
+                    reject, reasons = False, []
+                    record["quality_error"] = f"{type(exc).__name__}: {exc}"
+                    emitter.log(
+                        f"Auto-reject analysis failed for clip {segment.index}; continuing: "
+                        f"{type(exc).__name__}: {exc}",
+                        "warning",
+                        "fitness",
+                    )
                 if reject:
                     rejected_count += 1
                     record.update(status="rejected", reasons=reasons)
@@ -1224,11 +1519,18 @@ def _process_item(
                 step_index=6,
             )
             media = _media_input(entry, model_segment, spec, model)
+            segment_prompt = item_prompt
+            if context_enabled and source_position > 0 and previous_final_text:
+                segment_prompt = _prompt_with_context(item_prompt, previous_final_text, model)
+                emitter.log(
+                    f"Applied previous-segment context to clip {segment.index}/{total_sources}.",
+                    scope="prompts",
+                )
             caption_result = _caption_with_oom_recovery(
                 spec,
                 model,
                 session,
-                item_prompt,
+                segment_prompt,
                 media,
                 _caption_progress(
                     emitter,
@@ -1240,13 +1542,14 @@ def _process_item(
                 cancel,
                 emitter,
             )
-            final_text = _finalize_text(spec, str(caption_result.text))
+            raw_caption_text = str(caption_result.text)
+            final_text = _finalize_text(spec, raw_caption_text)
             local_cues = [
-                Segment(float(start), float(end), _finalize_text(spec, str(text)))
+                Segment(float(start), float(end), _finalize_cue_text(spec, str(text)))
                 for start, end, text in list(getattr(caption_result, "segments", []) or [])
             ]
             if not local_cues and final_text and segment.duration_s > 0:
-                local_cues = [Segment(0.0, segment.duration_s, final_text)]
+                local_cues = [Segment(0.0, segment.duration_s, _finalize_cue_text(spec, raw_caption_text))]
             cue_offset = trim_offset + segment.start_s
             combined_cues.extend(
                 Segment(cue_offset + cue.start_s, cue_offset + cue.end_s, cue.text)
@@ -1258,18 +1561,22 @@ def _process_item(
                     f"[{_time_label(cue_offset)} - {_time_label(trim_offset + segment.end_s)}]\n{reasoning}"
                 )
             formats = list(spec.post.formats)
-            if spec.post.save_reasoning and "reasoning" not in formats:
+            if spec.post.save_reasoning and reasoning and "reasoning" not in formats:
                 formats.append("reasoning")
-            segment_dir, segment_stem = _segment_output_location(entry, segment)
-            paths = write_caption_outputs(
-                segment_dir,
-                segment_stem,
-                formats,
-                text=final_text,
-                structured=getattr(caption_result, "structured", None),
-                segments=local_cues,
-                reasoning=reasoning,
-            )
+            paths: dict[str, Path] = {}
+            if len(sources) > 1 or segment.persistent_clip:
+                # Per-clip files only make sense for multi-segment items or
+                # persisted clips; a single segment is covered by the item files.
+                segment_dir, segment_stem = _segment_output_location(entry, segment)
+                paths = write_caption_outputs(
+                    segment_dir,
+                    segment_stem,
+                    formats,
+                    text=final_text,
+                    structured=getattr(caption_result, "structured", None),
+                    segments=local_cues,
+                    reasoning=reasoning,
+                )
             peak = max(peak, float(getattr(caption_result, "peak_vram_gb", 0.0) or 0.0))
             timing = getattr(caption_result, "timing", None)
             tok_per_s = float(getattr(timing, "tok_per_s", 0.0) or 0.0)
@@ -1277,17 +1584,20 @@ def _process_item(
                 emitter.log(f"Clip {segment.index}: {tok_per_s:.2f} tok/s", scope="caption")
             for warning in getattr(caption_result, "warnings", ()) or ():
                 emitter.log(str(warning), "warning", "caption")
+            usage = _record_value(getattr(caption_result, "usage", None))
             record.update(
                 status="done",
                 caption=final_text,
                 structured=getattr(caption_result, "structured", None),
                 outputs={key: str(path) for key, path in paths.items()},
                 reasoning_saved=bool(reasoning and spec.post.save_reasoning),
-                usage=_record_value(getattr(caption_result, "usage", None)),
+                usage=usage,
+                finish_reason=usage.get("finish_reason"),
                 timing=_record_value(timing),
                 peak_vram_gb=float(getattr(caption_result, "peak_vram_gb", 0.0) or 0.0),
             )
             accepted.append(record)
+            previous_final_text = final_text
 
         done_records = [record for record in accepted if record.get("status") == "done"]
         if not done_records:
@@ -1325,7 +1635,7 @@ def _process_item(
             ]
         emitter.progress(entry.tracker_index, entry.result_index, "Writing combined outputs", 0.94, step_index=7)
         formats = list(spec.post.formats)
-        if spec.post.save_reasoning and "reasoning" not in formats:
+        if spec.post.save_reasoning and combined_reasoning and "reasoning" not in formats:
             formats.append("reasoning")
         combined_paths = write_caption_outputs(
             entry.out_dir,
@@ -1380,6 +1690,10 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             f"Starting {spec.output.kind} job with {len(resolved)} resolved input(s) using "
             f"{spec.model.variant_key}."
         )
+        if spec.output.kind == "batch" and (
+            spec.preprocess.trim_start_s > 1e-9 or spec.preprocess.trim_end_s is not None
+        ):
+            emitter.log("Trim range is ignored for folder batches", "warning", "preprocess")
         if model_error:
             for entry in resolved:
                 entry.status = "failed"
@@ -1394,7 +1708,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             if entry.status == "pending":
                 actionable.append(entry)
                 continue
-            emitter.start_item(entry.tracker_index, entry.stem)
+            emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
             result = ItemResult(
                 index=entry.result_index,
                 path=str(entry.path or entry.item.path),
@@ -1412,7 +1726,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         cancelled_job = False
         for position, entry in enumerate(actionable):
             if cancelled_job or _is_cancelled(cancel):
-                emitter.start_item(entry.tracker_index, entry.stem)
+                emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
                 result = ItemResult(
                     entry.result_index,
                     str(entry.path or entry.item.path),
@@ -1430,7 +1744,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     0.0,
                 )
                 continue
-            emitter.start_item(entry.tracker_index, entry.stem)
+            emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
             item_started = time.perf_counter()
             try:
                 result = _process_item(spec, entry, run_dir, model, session, emitter, cancel)
@@ -1566,6 +1880,17 @@ def _compile_env_updates(enabled: bool) -> dict[str, str]:
         return {}
 
 
+def _round_robin_partitions(
+    entries: Sequence[_ResolvedInput], partition_count: int
+) -> list[list[_ResolvedInput]]:
+    partitions: list[list[_ResolvedInput]] = [
+        [] for _ in range(max(1, int(partition_count)))
+    ]
+    for index, entry in enumerate(entries):
+        partitions[index % len(partitions)].append(entry)
+    return partitions
+
+
 def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToken) -> JobResult:
     from queue import Queue
 
@@ -1574,7 +1899,11 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     started = time.perf_counter()
     expanded = _resolve_inputs(spec)
     if not expanded:
-        return _run_job_local(replace(spec, runtime=replace(spec.runtime, gpu_indices=(spec.runtime.gpu_index,))), sinks, cancel)
+        local_spec = replace(
+            spec,
+            runtime=replace(spec.runtime, gpu_indices=(spec.runtime.gpu_index,)),
+        )
+        return _run_job_local(local_spec, sinks, cancel)
     run_dir = _allocate_job_dir(spec)
     with RunLog(run_dir):
         get_log().log(
@@ -1587,9 +1916,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     else:
         _assign_batch_outputs(spec, expanded)
     gpu_indices = tuple(spec.runtime.gpu_indices)
-    partitions: list[list[_ResolvedInput]] = [[] for _ in gpu_indices]
-    for index, entry in enumerate(expanded):
-        partitions[index % len(partitions)].append(entry)
+    partitions = _round_robin_partitions(expanded, len(gpu_indices))
     messages: Queue[tuple[int, str, Any]] = Queue()
     workers: dict[int, WorkerProcess] = {}
     threads: list[threading.Thread] = []
@@ -1688,9 +2015,26 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         event = value
         ev = event.get("ev")
         if ev in {"log", "stdout"}:
-            prefixed.on_log(str(event.get("text", "")), str(event.get("level", "info")), event.get("scope"))
+            prefixed.on_log(
+                str(event.get("text", "")),
+                str(event.get("level", "info")),
+                event.get("scope"),
+            )
         elif ev == "progress":
-            fields = {key: event.get(key) for key in ("message", "fraction", "item_index", "total_items", "status", "data", "timestamp", "kind") if event.get(key) is not None}
+            fields = {
+                key: event.get(key)
+                for key in (
+                    "message",
+                    "fraction",
+                    "item_index",
+                    "total_items",
+                    "status",
+                    "data",
+                    "timestamp",
+                    "kind",
+                )
+                if event.get(key) is not None
+            }
             prefixed.on_progress(ProgressEvent(**fields))
         elif ev == "item":
             prefixed.on_item(
@@ -1699,7 +2043,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     item_index=event.get("index"),
                     status=event.get("status"),
                     kind="item",
-                    data={"gpu_index": gpu_index},
+                    data={**dict(event.get("data") or {}), "gpu_index": gpu_index},
                 )
             )
         elif ev == "result":
@@ -1777,7 +2121,8 @@ def run_job(
         spec = JobSpec.from_dict(spec)  # type: ignore[arg-type]
     token = cancel or CancelToken()
     multi_gpu = (
-        len(spec.runtime.gpu_indices) > 1
+        spec.output.kind == "batch"
+        and len(spec.runtime.gpu_indices) > 1
         and spec.runtime.subprocess_mode
         and os.environ.get("VCAP_MULTI_GPU_CHILD", "") != "1"
     )

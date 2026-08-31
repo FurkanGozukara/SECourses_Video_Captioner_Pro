@@ -6,6 +6,15 @@ Hugging Face root: `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/`
 
 Sizes use decimal GB. SHA-256 values were calculated by streaming each file.
 
+GGUF files are an exception to the root above. The downloader menu resolves
+them from the third-party repositories pinned in the app registry:
+
+| Menu keys | Artifact repository |
+|---|---|
+| `qwen3_omni_instruct_gguf_q4`, `qwen3_omni_instruct_gguf_q8` | `ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF` |
+| `qwen3_omni_thinking_gguf_q4`, `qwen3_omni_thinking_gguf_q8` | `ggml-org/Qwen3-Omni-30B-A3B-Thinking-GGUF` |
+| `qwen3_omni_captioner_gguf_q4`, `qwen3_omni_captioner_gguf_q8` | `mradermacher/Qwen3-Omni-30B-A3B-Captioner-GGUF` |
+
 ## timechat_bf16
 
 Total: 17.879958 GB (17,879,958,161 bytes)
@@ -197,9 +206,9 @@ Total: 19.882074 GB (19,882,074,428 bytes)
 
 | File | Bytes | Size GB | SHA-256 | Hugging Face path |
 |---|---:|---:|---|---|
-| `mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf` | 1,325,020,128 | 1.325020 | `1104376db833f1e89c84834144ac3863340c2cd1ddaeddb39cb0247fb5c20c8d` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_instruct_gguf_q4/mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf` |
-| `Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf` | 18,557,053,952 | 18.557054 | `d9e2876556e7873e02c0359f832432ee2d67ab7dd0cee3efe0f77fd7a1f4dd85` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_instruct_gguf_q4/Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf` |
-| `vcap_model_info.json` | 348 | 0.000000 | `1fdbd784f45eecaa62873fdd10e0efcdf1786b8c80e8fee1d95157497a051750` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_instruct_gguf_q4/vcap_model_info.json` |
+| `mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf` | 1,325,020,128 | 1.325020 | `1104376db833f1e89c84834144ac3863340c2cd1ddaeddb39cb0247fb5c20c8d` | `ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF/mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf` |
+| `Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf` | 18,557,053,952 | 18.557054 | `d9e2876556e7873e02c0359f832432ee2d67ab7dd0cee3efe0f77fd7a1f4dd85` | `ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF/Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf` |
+| `vcap_model_info.json` | 348 | 0.000000 | `1fdbd784f45eecaa62873fdd10e0efcdf1786b8c80e8fee1d95157497a051750` | generated locally after verification |
 
 ## qwen3_omni_thinking_bf16
 
@@ -308,9 +317,9 @@ Total: 19.882075 GB (19,882,074,629 bytes)
 
 | File | Bytes | Size GB | SHA-256 | Hugging Face path |
 |---|---:|---:|---|---|
-| `Qwen3-Omni-30B-A3B-Captioner.mmproj-Q8_0.gguf` | 1,325,020,384 | 1.325020 | `ef6ee1e11745ca7a88c71a401f7e261078c41980d15d1e8ffb34fe25ed56c95a` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_captioner_gguf_q4/Qwen3-Omni-30B-A3B-Captioner.mmproj-Q8_0.gguf` |
-| `Qwen3-Omni-30B-A3B-Captioner.Q4_K_M.gguf` | 18,557,053,888 | 18.557054 | `1ea2e29a75bd7f5cff9f78915c07f9e8c2a70e0bf159604de06b2d2691d100d9` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_captioner_gguf_q4/Qwen3-Omni-30B-A3B-Captioner.Q4_K_M.gguf` |
-| `vcap_model_info.json` | 357 | 0.000000 | `de850c10f7e178cef4a60df755935854594e46056adcf855a98bd2a18b22ac49` | `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/qwen3_omni_captioner_gguf_q4/vcap_model_info.json` |
+| `Qwen3-Omni-30B-A3B-Captioner.mmproj-Q8_0.gguf` | 1,325,020,384 | 1.325020 | `ef6ee1e11745ca7a88c71a401f7e261078c41980d15d1e8ffb34fe25ed56c95a` | `mradermacher/Qwen3-Omni-30B-A3B-Captioner-GGUF/Qwen3-Omni-30B-A3B-Captioner.mmproj-Q8_0.gguf` |
+| `Qwen3-Omni-30B-A3B-Captioner.Q4_K_M.gguf` | 18,557,053,888 | 18.557054 | `1ea2e29a75bd7f5cff9f78915c07f9e8c2a70e0bf159604de06b2d2691d100d9` | `mradermacher/Qwen3-Omni-30B-A3B-Captioner-GGUF/Qwen3-Omni-30B-A3B-Captioner.Q4_K_M.gguf` |
+| `vcap_model_info.json` | 357 | 0.000000 | `de850c10f7e178cef4a60df755935854594e46056adcf855a98bd2a18b22ac49` | generated locally after verification |
 
 ## Tower Sharing
 

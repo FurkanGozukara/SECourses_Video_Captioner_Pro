@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html
+import importlib.metadata
 import json
 import math
+import os
 import queue
 import re
 import subprocess
@@ -17,10 +19,11 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 import gradio as gr
 
+from vcap import TEMP_DIR
 from vcap.core.clip_fitness import TRAINER_TARGETS
 from vcap.core.captions_post import to_srt
 from vcap.core.media import probe_media
-from vcap.core.paths import open_in_file_manager, reveal_in_file_manager
+from vcap.core.paths import normalize_path, open_in_file_manager, reveal_in_file_manager
 from vcap.core.preprocess import fits_context, token_budget_estimate
 from vcap.core.progress import ProgressEvent, format_eta
 from vcap.core.scene_split import (
@@ -30,16 +33,23 @@ from vcap.core.scene_split import (
     merge_short_scenes,
 )
 from vcap.core.subprocess_runner import CancelToken, CancelledError, build_child_env
-from vcap.models.attention import ATTENTION_CHOICES, probe_available
+from vcap.models import attention as attention_module
+from vcap.models.attention import ATTENTION_CHOICES
 from vcap.models.downloads import ensure_model
 from vcap.models.registry import (
     MODEL_SPECS,
     all_variant_choices,
     get_variant,
+    variant_size_gb,
     variant_is_ready,
     variant_to_family,
 )
-from vcap.models.torch_compile import clear_inductor_caches
+from vcap.models.torch_compile import (
+    DEFAULT_COMPILE_MODE,
+    clear_inductor_caches,
+    compile_mode_choices,
+    compile_mode_values,
+)
 from vcap.models.vram_presets import (
     VRAM_TIERS,
     allowed_variants,
@@ -47,6 +57,11 @@ from vcap.models.vram_presets import (
     auto_tier,
     preset_for,
 )
+
+# Slider ceilings never shrink below a loaded value: Gradio rejects out-of-range
+# inputs at event time, so the UI keeps the global cap and the pipeline clamps
+# max_new_tokens to the selected family's real limit.
+_GLOBAL_MAX_NEW_TOKENS = max(spec.limits.max_new_tokens_cap for spec in MODEL_SPECS.values())
 from vcap.pipeline.job import InputItem, JobResult, JobSpec, OutputSpec
 from vcap.prompts.presets import (
     TEMPLATE_VARIABLES,
@@ -73,6 +88,11 @@ if TYPE_CHECKING:
 
 _INITIAL_VARIANT = "qwen3_omni_instruct_int8"
 _INITIAL_MODALITY = "video_audio"
+_COMPILE_PROBE_CACHE = TEMP_DIR / "compile_probe.json"
+_COMPILE_PROBE_TTL_S = 24 * 60 * 60
+_COMPILE_PROBE_LOCK = threading.Lock()
+_COMPILE_PROBE_HTML: str | None = None
+_COMPILE_PROBE_RUNNING = False
 
 
 def _display(value: object) -> str:
@@ -87,6 +107,69 @@ def _display(value: object) -> str:
 
 def _variant_choices() -> list[tuple[str, str]]:
     return [(_display(label), key) for label, key in all_variant_choices()]
+
+
+def variant_choices_for_tier(
+    selected_variant: str,
+    tier: int | float,
+    show_all: bool = False,
+) -> list[tuple[str, str]]:
+    """Filter every model family to variants supported by a VRAM tier."""
+
+    all_choices = _variant_choices()
+    if show_all:
+        return all_choices
+    allowed: set[str] = set()
+    for family in MODEL_SPECS:
+        try:
+            allowed.update(allowed_variants(family, tier))
+        except (KeyError, TypeError, ValueError):
+            continue
+    result: list[tuple[str, str]] = []
+    for label, key in all_choices:
+        if key not in allowed and key != selected_variant:
+            continue
+        if key == selected_variant and key not in allowed:
+            label = f"{label} ⚠ exceeds tier"
+        result.append((label, key))
+    return result
+
+
+def _attention_choices() -> list[tuple[str, str]]:
+    describe = getattr(attention_module, "describe_available", None)
+    if callable(describe):
+        try:
+            descriptions = describe()
+            if isinstance(descriptions, dict):
+                choices: list[tuple[str, str]] = []
+                for name in ATTENTION_CHOICES:
+                    detail = str(descriptions.get(name) or "— unavailable").strip()
+                    normalized = detail.casefold()
+                    if normalized == "available":
+                        label = f"{name} ✓"
+                    elif normalized.startswith("available:"):
+                        label = f"{name} ✓ — {detail.split(':', 1)[1].strip()}"
+                    elif detail.startswith(("—", "✓")):
+                        label = f"{name} {detail}"
+                    elif normalized.startswith(("falls back", "unavailable")):
+                        label = f"{name} — {detail}"
+                    else:
+                        label = detail if normalized.startswith(name.casefold()) else f"{name} — {detail}"
+                    choices.append((_display(label), name))
+                return choices
+        except Exception:
+            pass
+
+    availability = attention_module.probe_available()
+    labels = {
+        "auto": "✓" if availability.get("auto") else "— unavailable",
+        "flash_attention_2": "✓" if availability.get("flash_attention_2") else "— unavailable; falls back to SDPA",
+        "sdpa": "✓" if availability.get("sdpa") else "— unavailable",
+        "sage": "— falls back to SDPA (Sage kernel preference only)",
+        "xformers": "— falls back to SDPA (efficient-kernel preference only)",
+        "eager": "✓" if availability.get("eager") else "— unavailable",
+    }
+    return [(f"{name} {labels[name]}", name) for name in ATTENTION_CHOICES]
 
 
 def _prompt_choices(family: str, modality: str) -> list[tuple[str, str]]:
@@ -147,7 +230,7 @@ def _format_compile_report(data: dict[str, Any]) -> str:
         message = "⚠ No C++ build tools — Triton-only fallback will be used"
         css = "vc-warn"
     elif readiness == "cudagraphs_only":
-        message = "⚠ Triton unavailable — CUDA graphs fallback only"
+        message = "⚠ Triton unavailable — CUDA graphs compatibility fallback; failures retry eagerly"
         css = "vc-warn"
     else:
         detail = "; ".join(str(item) for item in data.get("messages") or []) or "torch.compile is unavailable"
@@ -156,7 +239,52 @@ def _format_compile_report(data: dict[str, Any]) -> str:
     return f"<span class='{css}'>{message}</span> <span title='{html.escape(tooltip)}'>ⓘ</span>"
 
 
-def _probe_compile_in_child() -> str:
+def _compile_probe_key() -> dict[str, str]:
+    try:
+        torch_version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        torch_version = "not-installed"
+    return {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "torch": torch_version,
+    }
+
+
+def _read_compile_probe_cache() -> str | None:
+    try:
+        payload = json.loads(_COMPILE_PROBE_CACHE.read_text(encoding="utf-8"))
+        age = time.time() - float(payload.get("timestamp", 0.0))
+        if payload.get("key") != _compile_probe_key() or age < 0 or age > _COMPILE_PROBE_TTL_S:
+            return None
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return _format_compile_report(data)
+        cached_html = payload.get("html")
+        return str(cached_html) if cached_html else None
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _write_compile_probe_cache(report_html: str, data: dict[str, Any] | None) -> None:
+    try:
+        _COMPILE_PROBE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _COMPILE_PROBE_CACHE.with_suffix(".json.tmp")
+        payload = {
+            "key": _compile_probe_key(),
+            "timestamp": time.time(),
+            "data": data,
+            "html": report_html,
+        }
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, _COMPILE_PROBE_CACHE)
+    except OSError:
+        pass
+
+
+def _run_compile_probe_in_child() -> tuple[str, dict[str, Any] | None]:
     """Call the backend probe in a disposable process so this parent stays Torch-free."""
 
     code = (
@@ -183,10 +311,44 @@ def _probe_compile_in_child() -> str:
         )
         if line is None:
             detail = (completed.stderr or completed.stdout or "probe returned no data").strip()[-500:]
-            return f"<span class='vc-err'>✗ compile probe failed: {html.escape(detail)}</span>"
-        return _format_compile_report(json.loads(line))
+            return f"<span class='vc-err'>✗ compile probe failed: {html.escape(detail)}</span>", None
+        data = json.loads(line)
+        return _format_compile_report(data), data
     except Exception as exc:
-        return f"<span class='vc-err'>✗ compile probe failed: {html.escape(str(exc))}</span>"
+        return f"<span class='vc-err'>✗ compile probe failed: {html.escape(str(exc))}</span>", None
+
+
+def _probe_compile_in_child(force: bool = False) -> str:
+    """Return cached probe status and refresh stale results in a background thread."""
+
+    global _COMPILE_PROBE_HTML, _COMPILE_PROBE_RUNNING
+    if not force:
+        with _COMPILE_PROBE_LOCK:
+            if _COMPILE_PROBE_HTML is not None:
+                return _COMPILE_PROBE_HTML
+        cached = _read_compile_probe_cache()
+        if cached is not None:
+            with _COMPILE_PROBE_LOCK:
+                _COMPILE_PROBE_HTML = cached
+            return cached
+
+    with _COMPILE_PROBE_LOCK:
+        if force:
+            _COMPILE_PROBE_HTML = None
+        if _COMPILE_PROBE_RUNNING:
+            return "<span class='vc-warn'>Probing C++ toolchain…</span>"
+        _COMPILE_PROBE_RUNNING = True
+
+    def probe() -> None:
+        global _COMPILE_PROBE_HTML, _COMPILE_PROBE_RUNNING
+        report_html, data = _run_compile_probe_in_child()
+        _write_compile_probe_cache(report_html, data)
+        with _COMPILE_PROBE_LOCK:
+            _COMPILE_PROBE_HTML = report_html
+            _COMPILE_PROBE_RUNNING = False
+
+    threading.Thread(target=probe, daemon=True, name="vcap-compile-probe").start()
+    return "<span class='vc-warn'>Probing C++ toolchain…</span>"
 
 
 def _ready_line(variant_key: str) -> str:
@@ -239,6 +401,7 @@ class CaptionTabHandles:
     cancel: gr.Button
     hotkey_start: gr.Button
     hotkey_cancel: gr.Button
+    cancel_timer: gr.Timer
     open_output: gr.Button
     open_caption: gr.Button
     reveal_clip: gr.Button
@@ -262,6 +425,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     initial_vars = {name: data["default"] for name, data in TEMPLATE_VARIABLES.items()}
     initial_system, initial_user = render_prompt(initial_prompt, initial_vars)
     gpu_choices, gpu_default, gpu_total, _ = _gpu_inventory()
+    data_parallel_gpu_choices = gpu_choices if gpu_total > 0 else []
+    detected_tier = auto_tier(gpu_total) if gpu_total else 32
     ctx.states["gpu_index_default"] = gpu_default
     ctx.states["gpu_index"] = gr.State(gpu_default)
 
@@ -346,12 +511,21 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
 
             with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
                 start = action_button("▶ Start Captioning", "emerald", variant="primary", size="lg", scale=3)
-                cancel = action_button("⏹ Cancel", "red", variant="stop", size="lg", scale=2)
+                cancel = action_button(
+                    "⏹ Cancel",
+                    "red",
+                    variant="stop",
+                    size="lg",
+                    scale=2,
+                    elem_id="vc_caption_cancel",
+                    interactive=False,
+                )
                 open_output = action_button("📂 Open Output", "teal", size="md", scale=2)
                 open_caption = action_button("📝 Open Last Caption", "violet", size="md", scale=2)
                 reveal_clip = action_button("🎬 Reveal Clip", "amber", size="md", scale=2)
             hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")
             hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
+            cancel_timer = gr.Timer(1.0)
 
             progress = progress_panel(ctx)
             item_table = gr.Dataframe(
@@ -370,8 +544,9 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         with gr.Column(scale=4, min_width=430):
             with gr.Accordion("1. Model", open=True):
                 model_key = gr.Dropdown(
-                    choices=_variant_choices(),
+                    choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
                     value=_INITIAL_VARIANT,
+                    allow_custom_value=True,
                     label="Model variant",
                     info="Model family, precision/backend variant, and estimated local checkpoint size.",
                 )
@@ -379,9 +554,17 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     "model_key", model_key, _INITIAL_VARIANT, section="model",
                     description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
                 )
+                show_all_variants = gr.Checkbox(
+                    value=False,
+                    label="Show all variants (ignore VRAM tier)",
+                    info="Lists variants above the active VRAM tier; they may require CPU offload or run out of memory.",
+                )
+                controls["show_all_variants"] = ctx.reg(
+                    "show_all_variants", show_all_variants, False, section="model",
+                    description="Show model variants that exceed the active VRAM tier.", kind="bool",
+                )
                 quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
                 with gr.Row(elem_classes=["vc-compact-row"]):
-                    tier = auto_tier(gpu_total) if gpu_total else 32
                     vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
                     vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
                     vram_preset = gr.Dropdown(
@@ -394,13 +577,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "vram_preset", vram_preset, "auto", section="model",
                         description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
                     )
-                    availability = probe_available()
-                    attention_choices = [
-                        (f"{name} {'✓' if availability.get(name) else '— unavailable'}", name)
-                        for name in ATTENTION_CHOICES
-                    ]
                     attention = gr.Dropdown(
-                        choices=attention_choices,
+                        choices=_attention_choices(),
                         value="auto",
                         label="Attention backend",
                         info="Unavailable optimized backends fall back safely to PyTorch SDPA.",
@@ -410,7 +588,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         description="Requested attention implementation with safe runtime fallback.", choices=ATTENTION_CHOICES, kind="str",
                     )
                 vram_note = gr.Markdown(
-                    f"<span class='vc-help'>Auto tier: {tier} GB. Choose a tier to apply its complete plan.</span>"
+                    f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
                 )
                 with gr.Row(elem_classes=["vc-compact-row"]):
                     gpu_picker = gr.Dropdown(
@@ -422,6 +600,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     controls["gpu_index"] = ctx.reg(
                         "gpu_index", gpu_picker, gpu_default, section="runtime",
                         description="Physical NVIDIA GPU index used by the pipeline.", kind="int",
+                        choices=[value for _, value in gpu_choices], in_preset=False,
                     )
                     subprocess_mode = gr.Checkbox(
                         value=True,
@@ -432,6 +611,20 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "subprocess_mode", subprocess_mode, True, section="runtime",
                         description="Run model inference in an isolated worker process.", kind="bool",
                     )
+                gpu_indices = gr.CheckboxGroup(
+                    choices=data_parallel_gpu_choices,
+                    value=[],
+                    label="Data-parallel GPUs",
+                    info=(
+                        "Leave empty to use the single GPU above. Selecting 2 or more GPUs splits folder batches "
+                        "across workers, with one model copy loaded per GPU."
+                    ),
+                )
+                controls["gpu_indices"] = ctx.reg(
+                    "gpu_indices", gpu_indices, [], section="runtime",
+                    description="Physical GPU indices used for data-parallel folder batch workers.",
+                    choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
+                )
                 with gr.Row(elem_classes=["vc-compact-row"]):
                     keep_loaded = gr.Checkbox(
                         value=True,
@@ -491,8 +684,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         value=False,
                         label="torch.compile",
                         info=(
-                            "CUDA graphs are the safe default. Full Inductor is opt-in because "
-                            "DynamicCache specialization was slower in measured decode runs."
+                            "The first generation can spend 1–5 minutes compiling kernels; later runs reuse them. "
+                            "A compile runtime failure restores the loaded model and retries that segment eagerly."
                         ),
                     )
                     controls["torch_compile"] = ctx.reg(
@@ -500,24 +693,24 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         description="Compile the language model forward pass with safe fallbacks.", kind="bool",
                     )
                     compile_mode = gr.Dropdown(
-                        choices=[
-                            ("CUDA graphs (recommended)", "cudagraphs"),
-                            ("Full Inductor", "default"),
-                            ("Max autotune, no CUDA graphs", "max-autotune-no-cudagraphs"),
-                        ],
-                        value="cudagraphs",
+                        choices=compile_mode_choices(),
+                        value=DEFAULT_COMPILE_MODE,
                         label="Compile mode",
-                        info="Choose CUDA graphs for stable decode or explicitly opt into Inductor tuning.",
+                        info=(
+                            "Both choices avoid explicit CUDA graph replay, which is incompatible with the "
+                            "DynamicCache used by these decoders. Max autotune has a longer first run."
+                        ),
                     )
                     controls["torch_compile_mode"] = ctx.reg(
-                        "torch_compile_mode", compile_mode, "cudagraphs", section="runtime",
+                        "torch_compile_mode", compile_mode, DEFAULT_COMPILE_MODE, section="runtime",
                         description="Requested torch.compile tuning mode.",
-                        choices=["default", "max-autotune-no-cudagraphs", "cudagraphs"], kind="str",
+                        choices=list(compile_mode_values()), kind="str",
                     )
                 compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
+                compile_probe_timer = gr.Timer(1.0)
                 with gr.Row(elem_classes=["vc-compact-row"]):
                     download = action_button("📥 Download / Verify model", "sky", size="md", scale=3)
-                    refresh_ready = action_button("↻ Refresh", "cyan", size="md", scale=1)
+                    refresh_ready = action_button("↻ Refresh", "lime", size="md", scale=1)
                     clear_compile = action_button("⌫ Clear compile caches", "rose", size="md", scale=2)
                 ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
 
@@ -654,7 +847,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 )
                 max_new_tokens = gr.Slider(
                     1,
-                    initial_spec.limits.max_new_tokens_cap,
+                    _GLOBAL_MAX_NEW_TOKENS,
                     value=int(schema["max_new_tokens"].default),
                     step=1,
                     precision=0,
@@ -974,6 +1167,18 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     "save_clips", save_clips, False, section="output",
                     description="Persist materialized split clips in the output dataset.", kind="bool",
                 )
+                context_carry_over = gr.Checkbox(
+                    value=False,
+                    label="Carry previous chunk context",
+                    info=(
+                        "Feeds the tail of the previous chunk's text into the next chunk prompt for long transcriptions; "
+                        "not used by Captioner or TimeChat."
+                    ),
+                )
+                controls["context_carry_over"] = ctx.reg(
+                    "context_carry_over", context_carry_over, False, section="splitting",
+                    description="Carry the previous transcription chunk's text into the next chunk prompt.", kind="bool",
+                )
                 initial_model_limit = initial_spec.limits.compute_max_duration(
                     fps=initial_spec.limits.default_fps,
                     max_pixels=initial_spec.limits.default_max_pixels,
@@ -1011,12 +1216,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
                     trigger_mode = gr.Dropdown(
                         choices=[("Prefix", "prefix"), ("Suffix", "suffix"), ("Prompt only / none", "none")],
-                        value="prefix",
+                        value="none",
                         label="Trigger injection",
                         info="Places the template trigger word before, after, or outside the saved caption.",
                     )
                     controls["trigger_mode"] = ctx.reg(
-                        "trigger_mode", trigger_mode, "prefix", section="postprocessing",
+                        "trigger_mode", trigger_mode, "none", section="postprocessing",
                         description="Position where the trigger word is injected into final captions.", choices=["prefix", "suffix", "none"], kind="str",
                     )
                 gr.Markdown("The **Trigger word** in Template variables is shared with caption injection.", elem_classes=["vc-help"])
@@ -1054,12 +1259,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     description="Caption and dataset file formats written for every item.",
                 )
                 save_reasoning = gr.Checkbox(
-                    value=False,
+                    value=True,
                     label="Save reasoning",
                     info="Persist Thinking-model reasoning separately; it remains hidden from the caption.",
                 )
                 controls["save_reasoning"] = ctx.reg(
-                    "save_reasoning", save_reasoning, False, section="output",
+                    "save_reasoning", save_reasoning, True, section="output",
                     description="Write Thinking-model reasoning to a separate text file.", kind="bool",
                 )
 
@@ -1075,6 +1280,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         cancel=cancel,
         hotkey_start=hotkey_start,
         hotkey_cancel=hotkey_cancel,
+        cancel_timer=cancel_timer,
         open_output=open_output,
         open_caption=open_caption,
         reveal_clip=reveal_clip,
@@ -1094,6 +1300,33 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         lambda value: int(value or 0),
         inputs=gpu_picker,
         outputs=ctx.states["gpu_index"],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def set_subprocess_mode(enabled: bool) -> None:
+        try:
+            setter = getattr(ctx.pipeline_client, "set_subprocess_mode", None)
+            if callable(setter):
+                setter(bool(enabled))
+            else:
+                ctx.pipeline_client.subprocess_mode = bool(enabled)
+        except Exception as exc:
+            ctx.app_log.warn(f"Could not change subprocess mode: {exc}", scope="runtime")
+
+    ctx.states["set_subprocess_mode"] = set_subprocess_mode
+    subprocess_mode.change(
+        set_subprocess_mode,
+        inputs=subprocess_mode,
+        outputs=[],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    compile_probe_timer.tick(
+        _probe_compile_in_child,
+        outputs=compile_status,
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -1143,13 +1376,51 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             api_visibility="private",
         )
 
-    def apply_vram(selected_variant: str, selected_tier: str, selected_gpu: int) -> tuple[Any, ...]:
+    def gpu_total_for(selected_gpu: int) -> float:
+        return next(
+            (
+                device.total_gb
+                for device in __import__("vcap.core.gpu", fromlist=["list_gpus"]).list_gpus()
+                if device.index == int(selected_gpu)
+            ),
+            gpu_total or 32,
+        )
+
+    def tier_warning(selected_variant: str, physical_tier: int) -> str:
+        family = variant_to_family(selected_variant)
+        if selected_variant in allowed_variants(family, physical_tier):
+            return ""
+        required = int(math.ceil(variant_size_gb(selected_variant)))
+        return (
+            f" <span class='vc-warn'>Selected variant needs ~{required} GB; detected tier "
+            f"{physical_tier} GB — expect offload/slow or OOM.</span>"
+        )
+
+    vram_outputs = [
+        model_key,
+        attention,
+        fps,
+        max_frames,
+        max_pixels,
+        max_new_tokens,
+        gpu_layers,
+        offload_experts,
+        pin_cpu,
+        vram_note,
+    ]
+
+    def apply_vram_plan(
+        selected_variant: str,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+        *,
+        switch_variant: bool,
+    ) -> tuple[Any, ...]:
         try:
             family = variant_to_family(selected_variant)
-            total = next(
-                (device.total_gb for device in __import__("vcap.core.gpu", fromlist=["list_gpus"]).list_gpus() if device.index == int(selected_gpu)),
-                gpu_total or 32,
-            )
+            total = gpu_total_for(selected_gpu)
+            physical_tier = auto_tier(total)
             resolved_tier = auto_tier(total) if selected_tier == "auto" else int(selected_tier)
             preset = preset_for(family, resolved_tier)
             applied = apply_preset({}, preset)
@@ -1159,11 +1430,35 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 if variant.scheme == applied["variant_scheme"]
                 and variant.key in allowed_variants(family, resolved_tier)
             ]
-            next_variant = candidates[0] if candidates else selected_variant
+            next_variant = candidates[0] if switch_variant and candidates else selected_variant
+            plan_tier = resolved_tier
+            kept = ""
+            kept_scheme = get_variant(next_variant).scheme
+            if kept_scheme != applied["variant_scheme"]:
+                # The tier plan is tuned for another precision; reuse the richest
+                # tier plan that targets the kept scheme so offload/frame budgets
+                # match the model actually selected (e.g. INT4 resident instead of
+                # an INT8 plan with a CPU-offloaded decoder tail).
+                for tier_option in sorted((t for t in VRAM_TIERS if t <= resolved_tier), reverse=True):
+                    try:
+                        candidate_preset = preset_for(family, tier_option)
+                    except ValueError:
+                        continue  # tier not offered for this family (e.g. Qwen3 below 8 GB)
+                    if candidate_preset.variant_scheme == kept_scheme:
+                        preset = candidate_preset
+                        plan_tier = tier_option
+                        break
+                kept = f" Keeping the selected variant ({html.escape(get_variant(next_variant).label)})."
+                if plan_tier != resolved_tier:
+                    kept += f" Using the {plan_tier} GB plan tuned for this precision."
             offload = preset.offload
-            note = f"<span class='vc-ok'>{resolved_tier} GB plan applied.</span> {html.escape(preset.notes)}"
+            choices = variant_choices_for_tier(next_variant, physical_tier, bool(show_all))
+            note = (
+                f"<span class='vc-ok'>{resolved_tier} GB plan applied.</span> {html.escape(preset.notes)}{kept}"
+                + tier_warning(next_variant, physical_tier)
+            )
             return (
-                gr.update(value=next_variant),
+                gr.update(choices=choices, value=next_variant),
                 preset.attention,
                 preset.fps,
                 preset.max_frames,
@@ -1177,14 +1472,101 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         except Exception as exc:
             return (*[gr.skip() for _ in range(9)], f"<span class='vc-err'>{html.escape(str(exc))}</span>")
 
+    def apply_vram(
+        selected_variant: str,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+    ) -> tuple[Any, ...]:
+        return apply_vram_plan(
+            selected_variant,
+            selected_tier,
+            selected_gpu,
+            show_all,
+            switch_variant=True,
+        )
+
+    def apply_auto_vram(
+        selected_variant: str,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+        *,
+        keep_variant: bool = True,
+    ) -> tuple[Any, ...]:
+        """Apply the automatic tier plan.
+
+        ``keep_variant=True`` (user-driven changes) never replaces the chosen
+        variant; the startup path passes ``False`` so a preset variant that
+        cannot fit the detected tier is swapped for one that does.
+        """
+
+        if selected_tier != "auto":
+            physical_tier = auto_tier(gpu_total_for(selected_gpu))
+            choices = variant_choices_for_tier(selected_variant, physical_tier, bool(show_all))
+            note = (
+                f"<span class='vc-help'>Manual {html.escape(str(selected_tier))} GB plan retained.</span>"
+                + tier_warning(selected_variant, physical_tier)
+            )
+            return gr.update(choices=choices, value=selected_variant), *[gr.skip() for _ in range(8)], note
+        physical_tier = auto_tier(gpu_total_for(selected_gpu))
+        selected_fits = selected_variant in allowed_variants(
+            variant_to_family(selected_variant),
+            physical_tier,
+        )
+        return apply_vram_plan(
+            selected_variant,
+            selected_tier,
+            selected_gpu,
+            show_all,
+            switch_variant=(not selected_fits) and not keep_variant,
+        )
+
+    def apply_auto_vram_startup(
+        selected_variant: str,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+    ) -> tuple[Any, ...]:
+        return apply_auto_vram(selected_variant, selected_tier, selected_gpu, show_all, keep_variant=False)
+
     vram_preset.input(
         apply_vram,
-        inputs=[model_key, vram_preset, gpu_picker],
-        outputs=[model_key, attention, fps, max_frames, max_pixels, max_new_tokens, gpu_layers, offload_experts, pin_cpu, vram_note],
+        inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
+        outputs=vram_outputs,
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
+
+    def filter_variant_choices(selected_variant: str, selected_gpu: int, show_all: bool) -> Any:
+        physical_tier = auto_tier(gpu_total_for(selected_gpu))
+        return gr.update(
+            choices=variant_choices_for_tier(selected_variant, physical_tier, bool(show_all)),
+            value=selected_variant,
+        )
+
+    show_all_variants.change(
+        filter_variant_choices,
+        inputs=[model_key, gpu_picker, show_all_variants],
+        outputs=model_key,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    gpu_picker.change(
+        apply_auto_vram,
+        inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
+        outputs=vram_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    ctx.states["caption_auto_vram_binding"] = {
+        "fn": apply_auto_vram_startup,
+        "inputs": [model_key, vram_preset, gpu_picker, show_all_variants],
+        "outputs": vram_outputs,
+    }
 
     def model_defaults(variant_key: str) -> tuple[Any, ...]:
         spec = MODEL_SPECS[variant_to_family(variant_key)]
@@ -1195,7 +1577,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             gr.update(value=values["top_p"].default, minimum=0, maximum=1, step=0.01),
             gr.update(value=values["top_k"].default, minimum=0, maximum=200, step=1),
             gr.update(value=values["repetition_penalty"].default, minimum=0.5, maximum=2, step=0.01),
-            gr.update(value=values["max_new_tokens"].default, minimum=1, maximum=spec.limits.max_new_tokens_cap, step=1),
+            gr.update(value=values["max_new_tokens"].default, minimum=1, maximum=_GLOBAL_MAX_NEW_TOKENS, step=1),
             gr.update(value=values["do_sample"].default),
             gr.update(value=bool(values.get("enable_thinking") and values["enable_thinking"].default), interactive=thinking),
             gr.update(value=values["fps"].default, minimum=values["fps"].min, maximum=values["fps"].max, step=values["fps"].step),
@@ -1208,14 +1590,18 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     def model_constraints(variant_key: str) -> tuple[Any, ...]:
         spec = MODEL_SPECS[variant_to_family(variant_key)]
         values = {item.name: item for item in spec.param_schema}
+        thinking = values.get("enable_thinking")
         return (
             gr.update(minimum=0, maximum=2, step=0.01),
             gr.update(minimum=0, maximum=1, step=0.01),
             gr.update(minimum=0, maximum=200, step=1),
             gr.update(minimum=0.5, maximum=2, step=0.01),
-            gr.update(minimum=1, maximum=spec.limits.max_new_tokens_cap, step=1),
+            gr.update(minimum=1, maximum=_GLOBAL_MAX_NEW_TOKENS, step=1),
             gr.skip(),
-            gr.update(interactive="enable_thinking" in values),
+            gr.update(
+                value=bool(thinking.default) if thinking is not None else False,
+                interactive=thinking is not None,
+            ),
             gr.update(minimum=values["fps"].min, maximum=values["fps"].max, step=values["fps"].step),
             gr.update(minimum=0, maximum=values["max_frames"].max, step=values["max_frames"].step),
             gr.update(minimum=values["max_pixels"].min, maximum=values["max_pixels"].max, step=values["max_pixels"].step),
@@ -1232,7 +1618,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         api_visibility="private",
     )
 
-    model_key.input(
+    model_defaults_event = model_key.input(
         model_defaults,
         inputs=model_key,
         outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio],
@@ -1240,7 +1626,14 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         show_progress="hidden",
         api_visibility="private",
     )
-
+    model_defaults_event.then(
+        apply_auto_vram,
+        inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
+        outputs=vram_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
     variable_components = [
         trigger_word,
         language,
@@ -1479,7 +1872,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         ctx.app_log.log(f"Cleared {removed} compile cache location(s).", scope="compile")
         for error in errors:
             ctx.app_log.warn(error, scope="compile")
-        return _probe_compile_in_child()
+        return _probe_compile_in_child(force=True)
 
     clear_compile.click(
         clear_caches,
@@ -1669,6 +2062,7 @@ def wire(ctx: "UiContext") -> None:
         input_mode = str(args[value_count + 1] or "upload")
         token = CancelToken()
         ctx.activate_cancel(token)
+        ctx.states["caption_job_token"] = token
         items: list[InputItem] = [InputItem(path=value) for value in resolved]
         if not items:
             family = variant_to_family(str(settings.get("model_key", _INITIAL_VARIANT)))
@@ -1681,9 +2075,11 @@ def wire(ctx: "UiContext") -> None:
                     "**Speed:** —",
                     [],
                     *[gr.skip() for _ in range(7)],
-                    gr.update(value="⏹ Cancel"),
+                    gr.update(value="⏹ Cancel", interactive=False),
                 )
                 ctx.clear_active_cancel(token)
+                if ctx.states.get("caption_job_token") is token:
+                    ctx.states["caption_job_token"] = None
                 return
             items = [InputItem(path="", kind="text", text_prompt_only=True, text=str(settings.get("user_prompt") or ""))]
 
@@ -1691,23 +2087,44 @@ def wire(ctx: "UiContext") -> None:
         if segment_mode == "scenes" and not bool(settings.get("scene_detect_enabled")):
             segment_mode = "whole"
         settings["segment_mode"] = segment_mode
-        settings["compile_mode"] = settings.get("torch_compile_mode", "cudagraphs")
+        settings["compile_mode"] = settings.get("torch_compile_mode", DEFAULT_COMPILE_MODE)
         settings["recursive"] = bool(settings.get("batch_recursive", settings.get("scan_subfolders", False)))
         output_kind = "batch" if input_mode == "folder" else "single"
-        output = OutputSpec(
-            kind=output_kind,
-            outputs_root=str(settings.get("outputs_dir") or ctx.outputs_dir),
-            batch_output_dir=(str(settings.get("batch_output_folder") or ctx.outputs_dir / "batch_captions") if output_kind == "batch" else None),
-            mirror_names=True,
-            overwrite=bool(settings.get("overwrite_existing", False)),
-            save_processed_files=bool(settings.get("save_processed_files", False)),
-            save_clips=bool(settings.get("save_clips", False)),
-            recursive=bool(settings["recursive"]),
-        )
+        output_kwargs: dict[str, Any] = {
+            "kind": output_kind,
+            "outputs_root": str(settings.get("outputs_dir") or ctx.outputs_dir),
+            "batch_output_dir": (
+                str(settings.get("batch_output_folder") or ctx.outputs_dir / "batch_captions")
+                if output_kind == "batch"
+                else None
+            ),
+            "mirror_names": True,
+            "overwrite": bool(settings.get("overwrite_existing", False)),
+            "save_processed_files": bool(settings.get("save_processed_files", False)),
+            "save_clips": bool(settings.get("save_clips", False)),
+            "recursive": bool(settings["recursive"]),
+        }
+        if output_kind == "batch" and str(settings.get("batch_input_folder") or "").strip():
+            output_kwargs["source_root"] = str(normalize_path(settings["batch_input_folder"]))
+        try:
+            output = OutputSpec(**output_kwargs)
+        except TypeError as exc:
+            if "source_root" not in output_kwargs or "source_root" not in str(exc):
+                raise
+            output_kwargs.pop("source_root", None)
+            output = OutputSpec(**output_kwargs)
         spec = JobSpec.from_settings(settings, items, output)
-        ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
+        set_mode = ctx.states.get("set_subprocess_mode")
+        if callable(set_mode):
+            set_mode(bool(settings.get("subprocess_mode", True)))
+        else:
+            ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
         event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        sink = _UiSink(ctx, event_queue, mirror_logs=ctx.pipeline_client.subprocess_mode)
+        sink = _UiSink(
+            ctx,
+            event_queue,
+            mirror_logs=bool(getattr(ctx.pipeline_client, "subprocess_mode", settings.get("subprocess_mode", True))),
+        )
         terminal: dict[str, Any] = {}
 
         def work() -> None:
@@ -1729,8 +2146,17 @@ def wire(ctx: "UiContext") -> None:
         last_message = "Starting caption job"
         last_eta = "—"
         last_speed = "—"
+        processed_count = 0
+        total_count = len(items)
+        remaining_count = total_count
+        item_started_at: dict[int, float] = {}
+        terminal_items: set[int] = set()
         yield (
-            render_progress_html(0, "Starting", f"Preparing {len(items)} item(s)."),
+            render_progress_html(
+                0,
+                "Starting",
+                f"0/{len(items)} processed · {len(items)} remaining · ETA —",
+            ),
             "**Status:** Starting caption worker",
             "**ETA:** —",
             "**Speed:** —",
@@ -1742,7 +2168,7 @@ def wire(ctx: "UiContext") -> None:
             gr.update(visible=False),
             [],
             {},
-            gr.update(value="⏹ Cancel"),
+            gr.update(value="⏹ Cancel", interactive=True),
         )
         finished = False
         try:
@@ -1757,29 +2183,61 @@ def wire(ctx: "UiContext") -> None:
                     last_fraction = float(event.fraction or 0.0)
                     last_message = event.message
                     data = event.data or {}
-                    eta_seconds = data.get("eta_seconds")
+                    eta_seconds = data.get("eta_s", data.get("eta_seconds"))
                     last_eta = format_eta(eta_seconds) if eta_seconds is not None else "—"
                     speed = data.get("tok_per_s") or data.get("tokens_per_second")
                     if speed is not None:
                         last_speed = f"{float(speed):.2f} tok/s"
-                    index = int(event.item_index or 0)
+                    raw_index = data.get("item_index", event.item_index)
+                    index = int(raw_index or 0)
                     if 0 <= index < len(item_rows):
+                        item_started_at.setdefault(index, now)
                         item_rows[index][2] = "running"
                         item_rows[index][3] = event.message
+                        elapsed_value = data.get("item_elapsed_s")
+                        if elapsed_value is None:
+                            elapsed_value = now - item_started_at[index]
+                        item_rows[index][4] = f"{max(0.0, float(elapsed_value)):.1f}s"
+                    processed_count = int(data.get("processed", processed_count) or 0)
+                    total_count = int(data.get("total", event.total_items or total_count) or total_count)
+                    remaining_count = int(
+                        data.get("remaining", max(0, total_count - processed_count))
+                        or 0
+                    )
                 elif kind == "item":
                     event = payload
-                    index = int(event.item_index or 0)
+                    data = event.data or {}
+                    raw_index = data.get("item_index", event.item_index)
+                    index = int(raw_index or 0)
                     if 0 <= index < len(item_rows):
                         item_rows[index][2] = str(event.status or "done")
                         item_rows[index][3] = event.message
-                        item_rows[index][4] = f"{float((event.data or {}).get('elapsed', 0)):.1f}s"
+                        elapsed_value = data.get(
+                            "item_elapsed_s",
+                            data.get("elapsed_s", data.get("elapsed")),
+                        )
+                        if elapsed_value is None:
+                            started = item_started_at.get(index, now)
+                            elapsed_value = now - started
+                        item_rows[index][4] = f"{max(0.0, float(elapsed_value)):.1f}s"
+                        if str(event.status or "").casefold() not in {"running", "queued"}:
+                            terminal_items.add(index)
+                    processed_count = int(data.get("processed", len(terminal_items)) or 0)
+                    total_count = int(data.get("total", event.total_items or total_count) or total_count)
+                    remaining_count = int(
+                        data.get("remaining", max(0, total_count - processed_count))
+                        or 0
+                    )
                     last_message = event.message
                     last_fraction = float(event.fraction or last_fraction)
                 if now - last_emit < 0.12 and kind == "progress":
                     continue
                 last_emit = now
+                progress_detail = (
+                    f"{processed_count}/{total_count} processed · {remaining_count} remaining · ETA {last_eta}"
+                )
                 yield (
-                    render_progress_html(last_fraction, last_message, f"{len(items)} item(s) in this job"),
+                    render_progress_html(last_fraction, last_message, progress_detail),
                     f"**Status:** {html.escape(last_message)}",
                     f"**ETA:** {last_eta}",
                     f"**Speed:** {last_speed}",
@@ -1805,7 +2263,7 @@ def wire(ctx: "UiContext") -> None:
                 gr.update(visible=bool(reasoning_text)),
                 gallery,
                 state,
-                gr.update(value="⏹ Cancel"),
+                gr.update(value="⏹ Cancel", interactive=False),
             )
         except (CancelledError, KeyboardInterrupt) as exc:
             ctx.app_log.warn(str(exc), scope="cancel")
@@ -1816,7 +2274,7 @@ def wire(ctx: "UiContext") -> None:
                 f"**Speed:** {last_speed}",
                 item_rows,
                 *[gr.skip() for _ in range(7)],
-                gr.update(value="⏹ Cancel"),
+                gr.update(value="⏹ Cancel", interactive=False),
             )
         except BaseException as exc:
             ctx.app_log.exception(f"Caption job failed: {exc}", scope="ui")
@@ -1827,10 +2285,12 @@ def wire(ctx: "UiContext") -> None:
                 f"**Speed:** {last_speed}",
                 item_rows,
                 *[gr.skip() for _ in range(7)],
-                gr.update(value="⏹ Cancel"),
+                gr.update(value="⏹ Cancel", interactive=False),
             )
         finally:
             ctx.clear_active_cancel(token)
+            if ctx.states.get("caption_job_token") is token:
+                ctx.states["caption_job_token"] = None
 
     run_inputs = [*registry_components, handles.media.resolved_state, handles.media.mode_state]
     handles.start.click(
@@ -1855,12 +2315,21 @@ def wire(ctx: "UiContext") -> None:
     )
 
     def cancel_job() -> tuple[Any, str]:
-        token = ctx.get_active_cancel()
+        token = ctx.states.get("caption_job_token")
         if token is None or token.is_cancelled():
-            return gr.update(value="⏹ Cancel"), "**Status:** No active job to cancel."
+            return gr.update(value="⏹ Cancel", interactive=False), "**Status:** No active caption job to cancel."
+        if not token.is_armed():
+            token.arm_confirmation(window_s=6)
+            return (
+                gr.update(value="⚠ Click again to confirm cancel", interactive=True),
+                "<span class='vc-warn'>**Status:** Click Cancel again within 6 seconds to stop the running job.</span>",
+            )
         token.cancel()
         ctx.pipeline_client.cancel(force=False)
-        return gr.update(value="Cancelling…"), "<span class='vc-warn'>**Status:** Cooperative cancellation requested.</span>"
+        return (
+            gr.update(value="Cancelling…", interactive=False),
+            "<span class='vc-warn'>**Status:** Cooperative cancellation requested.</span>",
+        )
 
     for trigger in (handles.cancel.click, handles.hotkey_cancel.click):
         trigger(
@@ -1870,6 +2339,22 @@ def wire(ctx: "UiContext") -> None:
             show_progress="hidden",
             api_visibility="private",
         )
+
+    def refresh_cancel_button() -> Any:
+        token = ctx.states.get("caption_job_token")
+        if token is None or token.is_cancelled():
+            return gr.update(value="⏹ Cancel", interactive=False)
+        if token.is_armed():
+            return gr.skip()
+        return gr.update(value="⏹ Cancel", interactive=True)
+
+    handles.cancel_timer.tick(
+        refresh_cancel_button,
+        outputs=handles.cancel,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
 
     def open_last(state: dict[str, Any], key: str, reveal: bool = False) -> str:
         value = (state or {}).get(key)
@@ -1905,4 +2390,4 @@ def wire(ctx: "UiContext") -> None:
     )
 
 
-__all__ = ["CaptionTabHandles", "build", "wire"]
+__all__ = ["CaptionTabHandles", "build", "variant_choices_for_tier", "wire"]

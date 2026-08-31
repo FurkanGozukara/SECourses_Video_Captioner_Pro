@@ -218,6 +218,59 @@ class _Server:
             self._active_thread = thread
         thread.start()
 
+    def chat(self, raw_request: Any) -> None:
+        """Run one streamed chat turn without replacing the resident model cache."""
+
+        if self._active():
+            self.protocol.emit({"ev": "error", "message": "Worker is already running a job", "traceback": ""})
+            return
+        try:
+            from .chat import ChatRequest
+
+            request = ChatRequest.from_dict(raw_request or {})
+        except Exception as exc:
+            self.protocol.emit(
+                {
+                    "ev": "error",
+                    "message": f"Invalid chat payload: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            return
+        token = CancelToken()
+
+        def execute() -> None:
+            result: Any | None = None
+            error: BaseException | None = None
+            try:
+                from .chat import run_chat
+
+                result = run_chat(request, self.protocol.emit, token)
+            except BaseException as exc:
+                error = exc
+            finally:
+                with self._lock:
+                    self._cancel = None
+                    self._active_thread = None
+            if error is not None:
+                self.protocol.emit(
+                    {
+                        "ev": "error",
+                        "message": f"{type(error).__name__}: {error}",
+                        "traceback": "".join(
+                            traceback.format_exception(type(error), error, error.__traceback__)
+                        ),
+                    }
+                )
+            elif result is not None:
+                self.protocol.emit({"ev": "chat_result", "result": result.to_dict()})
+
+        thread = threading.Thread(target=execute, name="vcap-worker-chat", daemon=False)
+        with self._lock:
+            self._cancel = token
+            self._active_thread = thread
+        thread.start()
+
     def cancel(self) -> None:
         with self._lock:
             token = self._cancel
@@ -371,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         command = str(request.get("cmd", "")).casefold()
         if command == "run_job":
             server.run(request.get("job", request.get("spec")))
+        elif command == "chat":
+            server.chat(request.get("payload", request.get("request", request)))
         elif command == "cancel":
             server.cancel()
         elif command == "unload":
