@@ -33,6 +33,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Gradio serves ``favicon_path`` at /favicon.ico but never emits a <link> for it,
+# so browsers fall back to the implicit probe and can keep a stale default cached.
+# Declaring it explicitly also tells them the payload is SVG rather than an .ico.
+FAVICON_HEAD = '<link rel="icon" type="image/svg+xml" href="/favicon.ico">'
+
+
 def _startup_banner() -> None:
     print("=" * 76)
     print(f"{APP_NAME} v{VERSION}")
@@ -67,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         show_error=True,
         theme=build_theme(),
         css=build_css(),
-        head=HOTKEYS_HEAD,
+        head=FAVICON_HEAD + HOTKEYS_HEAD,
         allowed_paths=discover_allowed_paths(),
         favicon_path=str(favicon),
         max_file_size="8gb",

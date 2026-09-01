@@ -1,7 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="12" fill="#0f172a"/>
-  <rect x="8" y="13" width="48" height="38" rx="6" fill="#4f46e5"/>
-  <path d="M14 22h36v20H14z" fill="#08111f"/>
-  <path d="M28 26l12 6-12 6z" fill="#34d399"/>
-  <path d="M13 17h6m7 0h6m7 0h6m7 0h2M13 47h6m7 0h6m7 0h6m7 0h2" stroke="#bae6fd" stroke-width="3" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="vcap-icon-title">
+  <title id="vcap-icon-title">SECourses Video Captioner Pro</title>
+  <defs>
+    <!-- Shell reuses the indigo -> teal ramp the app header and primary buttons use. -->
+    <linearGradient id="vcap-shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset=".52" stop-color="#4338ca"/>
+      <stop offset="1" stop-color="#0d9488"/>
+    </linearGradient>
+    <linearGradient id="vcap-screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111c33"/>
+      <stop offset="1" stop-color="#070c17"/>
+    </linearGradient>
+    <linearGradient id="vcap-play" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#a5f3fc"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="14" fill="url(#vcap-shell)"/>
+  <!-- Hairline keeps the tile from dissolving into dark browser chrome. -->
+  <rect x="1" y="1" width="62" height="62" rx="13.2" fill="none"
+        stroke="#ffffff" stroke-opacity=".15" stroke-width="2"/>
+
+  <!-- Player screen. -->
+  <rect x="8" y="11" width="48" height="42" rx="8" fill="url(#vcap-screen)"/>
+
+  <!-- Play head. The round join stops the tips aliasing away at 16px. -->
+  <path d="M24 18 L39.5 25.75 L24 33.5 Z" fill="url(#vcap-play)" stroke="url(#vcap-play)"
+        stroke-width="3.2" stroke-linejoin="round"/>
+
+  <!-- Two subtitle lines - the "captioner" half of the mark. -->
+  <rect x="16" y="38" width="32" height="5.5" rx="2.75" fill="#7dd3fc"/>
+  <rect x="22.5" y="45.5" width="19" height="5.5" rx="2.75" fill="#34d399"/>
 </svg>
