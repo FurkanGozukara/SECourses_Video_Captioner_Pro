@@ -537,6 +537,12 @@ def _apply_preassigned_outputs(spec: JobSpec, resolved: list[_ResolvedInput]) ->
 
 
 def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: ModelSpec) -> None:
+    fake_captioner = os.environ.get("VCAP_FAKE_CAPTIONER", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     for entry in resolved:
         if entry.item.text_prompt_only:
             entry.info = None
@@ -553,7 +559,10 @@ def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: Mo
                 continue
         capability, kind = _required_capability(entry.info, entry.item, spec, model)
         entry.capability, entry.kind = capability, kind
-        if not capability or capability not in model.capabilities:
+        if not capability or (
+            capability not in model.capabilities
+            and not (fake_captioner and entry.item.text_prompt_only)
+        ):
             entry.status = "unsupported"
             entry.message = _capability_message(model, capability or kind, kind)
 
@@ -1079,19 +1088,27 @@ def loaded_block_swap_summary() -> dict[str, Any] | None:
         return None
 
 
-def unload_cached_model() -> None:
-    """Release the persistent worker model, including the CPU fake hook."""
+def unload_cached_model(
+    unless_variant: str | None = None,
+) -> dict[str, Any] | None:
+    """Release a resident model unless it is the selected variant."""
 
     global _FAKE_CAPTIONER, _FAKE_VARIANT
     with _FAKE_LOCK:
-        _FAKE_CAPTIONER = None
-        _FAKE_VARIANT = None
+        if _FAKE_VARIANT is not None:
+            if _FAKE_VARIANT == unless_variant:
+                return None
+            released = _FAKE_VARIANT
+            _FAKE_CAPTIONER = None
+            _FAKE_VARIANT = None
+            return {"variant_key": released, "released": True, "fake": True}
     try:
         from vcap.models.loader import MODEL_CACHE
 
-        MODEL_CACHE.unload()
-    except Exception:
-        pass
+        report = MODEL_CACHE.unload(unless_variant=unless_variant)
+        return report.to_dict() if report is not None else None
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _context_limit(spec: JobSpec, model: ModelSpec) -> int:

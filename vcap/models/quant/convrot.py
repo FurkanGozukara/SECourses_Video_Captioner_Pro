@@ -51,6 +51,16 @@ _TRITON_FAILED = False
 _DECODE_DISPATCH_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
+def clear_device_caches() -> int:
+    """Drop lazily recreated device tensors retained by the ConvRot kernels."""
+
+    with _HADAMARD_LOCK:
+        count = len(_HADAMARD_CACHE) + len(_DECODE_DISPATCH_CACHE)
+        _HADAMARD_CACHE.clear()
+        _DECODE_DISPATCH_CACHE.clear()
+    return count
+
+
 @dataclass(frozen=True)
 class QuantLayerMeta:
     name: str
@@ -1581,6 +1591,7 @@ __all__ = [
     "QuantLayerMeta",
     "QuantMeta",
     "apply_quantized_checkpoint",
+    "clear_device_caches",
     "estimate_checkpoint_vram_gb",
     "fuse_bf16_experts_from_per_expert",
     "iter_safetensors_tensors",

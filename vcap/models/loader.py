@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import gc
 from itertools import chain
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -65,6 +66,19 @@ class UnloadReport:
     vram_before_gb: float
     vram_after_gb: float
     freed_vram_gb: float
+    variant_key: str | None = None
+    backend: str = ""
+    released: bool = True
+    host_before_gb: float = 0.0
+    host_after_gb: float = 0.0
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe release report."""
+
+        value = asdict(self)
+        value["notes"] = list(self.notes)
+        return value
 
 
 @dataclass(eq=False)
@@ -147,26 +161,49 @@ def _trim_host_working_set() -> None:
         pass
 
 
-def _remove_model_runtime(model: Any) -> None:
-    manager = getattr(model, "_vcap_block_swap_manager", None)
+def _process_private_gb() -> float:
+    import psutil
+
+    memory = psutil.Process().memory_info()
+    private = getattr(memory, "private", None)
+    value = private if private is not None else getattr(memory, "rss", 0)
+    return float(value or 0) / _GIB
+
+
+def _remove_model_runtime(model: Any) -> tuple[str, ...]:
+    notes: list[str] = []
+    try:
+        manager = getattr(model, "_vcap_block_swap_manager", None)
+    except Exception as exc:
+        manager = None
+        notes.append(f"Could not inspect the block-swap manager: {exc}")
     remove_manager = getattr(manager, "remove", None)
     if callable(remove_manager):
         try:
             remove_manager()
         except Exception as exc:
-            get_log().warn(f"Could not remove block-swap manager cleanly: {exc}", scope="models")
-    hook = getattr(model, "_vcap_last_token_logits_hook", None)
+            message = f"Could not remove block-swap manager cleanly: {exc}"
+            notes.append(message)
+            get_log().warn(message, scope="models")
+    try:
+        hook = getattr(model, "_vcap_last_token_logits_hook", None)
+    except Exception as exc:
+        hook = None
+        notes.append(f"Could not inspect the last-token hook: {exc}")
     remove_hook = getattr(hook, "remove", None)
     if callable(remove_hook):
         try:
             remove_hook()
-        except Exception:
-            pass
+        except Exception as exc:
+            notes.append(f"Could not remove the last-token hook: {exc}")
     for name in ("_vcap_last_token_logits_hook", "_vcap_last_token_logits"):
         try:
             delattr(model, name)
         except (AttributeError, TypeError):
             pass
+        except Exception as exc:
+            notes.append(f"Could not clear {name}: {exc}")
+    return tuple(notes)
 
 
 def _block_swap_layers(model: Any, family: str, expected_count: int) -> Any:
@@ -982,60 +1019,285 @@ def load_model(
     return loaded
 
 
-def unload_model(loaded: LoadedModel | None) -> UnloadReport:
-    """Release a loaded model, collect Python objects, and empty CUDA caches."""
+def unload_model(
+    loaded: LoadedModel | None,
+    *,
+    wait_s: float = 5.0,
+) -> UnloadReport:
+    """Release a loaded model and report whether its resources were reclaimed."""
+
+    if loaded is None:
+        return UnloadReport(0.0, 0.0, 0.0, 0.0)
 
     started = time.perf_counter()
-    physical_gpu_index = int(getattr(loaded, "gpu_index", 0) or 0) if loaded is not None else 0
-    device_name = str(getattr(loaded, "device", "cuda:0") or "cuda:0") if loaded is not None else "cuda:0"
-    before = float(
-        resource_snapshot(physical_gpu_index).get("vram_used_gb", 0.0) or 0.0
-    )
-    llama_backend = bool(loaded is not None and loaded.variant.backend == "llamacpp")
-    if loaded is not None:
+    notes: list[str] = []
+
+    def note(message: str) -> None:
+        notes.append(str(message))
+
+    try:
+        variant = loaded.variant
+        raw_variant_key = getattr(variant, "key", None)
+        variant_key = str(raw_variant_key) if raw_variant_key is not None else None
+        backend = (
+            "llamacpp"
+            if str(getattr(variant, "backend", "")).casefold() == "llamacpp"
+            else "transformers"
+        )
+    except Exception as exc:
+        variant_key = None
+        backend = "transformers"
+        note(f"Could not read loaded-model metadata: {exc}")
+    try:
+        physical_gpu_index = int(getattr(loaded, "gpu_index", 0) or 0)
+    except Exception as exc:
+        physical_gpu_index = 0
+        note(f"Could not read the model GPU index: {exc}")
+    try:
+        device_name = str(getattr(loaded, "device", "cuda:0") or "cuda:0")
+    except Exception as exc:
+        device_name = "cuda:0"
+        note(f"Could not read the model device: {exc}")
+
+    def vram_used(label: str) -> float | None:
+        try:
+            snapshot = resource_snapshot(physical_gpu_index)
+            return float(snapshot.get("vram_used_gb", 0.0) or 0.0)
+        except Exception as exc:
+            note(f"Could not read VRAM {label}: {exc}")
+            return None
+
+    before = vram_used("before unload")
+    before = 0.0 if before is None else before
+    try:
+        host_before = _process_private_gb()
+    except Exception as exc:
+        host_before = 0.0
+        note(f"Could not read host memory before unload: {exc}")
+
+    try:
         _SWITCH_REGISTRY.discard(loaded)
+    except Exception as exc:
+        note(f"Could not discard the model from the switch registry: {exc}")
+    try:
         model = loaded.model
-        if not llama_backend:
-            _remove_model_runtime(model)
+    except Exception as exc:
+        model = None
+        note(f"Could not read the loaded model object: {exc}")
+
+    compile_module: Any | None = None
+    if backend == "transformers":
+        try:
+            from . import torch_compile as compile_module
+
+            compile_module.release_compiled_model(model)
+        except ImportError as exc:
+            note(f"Could not import the compiled-model release helper: {exc}")
+        except Exception as exc:
+            note(f"Could not release compiled model state: {exc}")
+        try:
+            notes.extend(_remove_model_runtime(model))
+        except Exception as exc:
+            note(f"Could not remove model runtime hooks: {exc}")
+        try:
+            from .quant.convrot import clear_device_caches
+
+            clear_device_caches()
+        except ImportError as exc:
+            note(f"Could not import the ConvRot cache release helper: {exc}")
+        except Exception as exc:
+            note(f"Could not clear ConvRot device caches: {exc}")
+
+    try:
         stop = getattr(model, "stop", None)
         if callable(stop):
             stop()
+    except Exception as exc:
+        note(f"Could not stop the model backend: {exc}")
+    finally:
+        stop = None
+
+    try:
         loaded.model = None
+    except Exception as exc:
+        note(f"Could not clear the loaded model reference: {exc}")
+    try:
         loaded.processor = None
-        try:
-            del model
-        except UnboundLocalError:
-            pass
-    gc.collect()
-    if not llama_backend:
+    except Exception as exc:
+        note(f"Could not clear the loaded processor reference: {exc}")
+
+    model_ref: weakref.ReferenceType[Any] | None = None
+    try:
+        model_ref = weakref.ref(model)
+    except (TypeError, AttributeError):
+        pass
+    except Exception as exc:
+        note(f"Could not create a model liveness reference: {exc}")
+    try:
+        del model
+    except UnboundLocalError:
+        pass
+    try:
+        gc.collect()
+    except Exception as exc:
+        note(f"Could not collect Python objects after unload: {exc}")
+
+    if backend == "transformers":
+        if "torch._dynamo" in sys.modules:
+            try:
+                if compile_module is None:
+                    from . import torch_compile as compile_module
+                compile_module._reset_compiler_runtime()
+            except ImportError as exc:
+                note(f"Could not import the compiler runtime reset helper: {exc}")
+            except Exception as exc:
+                note(f"Could not reset the compiler runtime: {exc}")
         try:
             import torch
 
-            host_empty_cache = getattr(getattr(torch, "_C", None), "_host_emptyCache", None)
-            if callable(host_empty_cache):
-                try:
+            try:
+                host_empty_cache = getattr(
+                    getattr(torch, "_C", None), "_host_emptyCache", None
+                )
+                if callable(host_empty_cache):
                     host_empty_cache()
-                except (AttributeError, RuntimeError):
-                    pass
-            if torch.cuda.is_available() and device_name.startswith("cuda"):
-                selected_device = torch.device(device_name)
+            except Exception as exc:
+                note(f"Could not empty the Torch host cache: {exc}")
+
+            cuda_device = device_name.startswith("cuda")
+            try:
+                cuda_available = bool(torch.cuda.is_available())
+            except Exception as exc:
+                cuda_available = False
+                note(f"Could not query CUDA availability: {exc}")
+            if cuda_available and cuda_device:
                 try:
-                    torch.cuda.set_per_process_memory_fraction(1.0, selected_device)
-                except (AttributeError, RuntimeError):
-                    pass
-                torch.cuda.synchronize(selected_device)
-                torch.cuda.empty_cache()
-                try:
-                    torch.cuda.ipc_collect()
-                except (RuntimeError, AttributeError):
-                    pass
-        except ImportError:
+                    selected_device = torch.device(device_name)
+                except Exception as exc:
+                    selected_device = None
+                    note(f"Could not select {device_name} for CUDA cleanup: {exc}")
+                if selected_device is not None:
+                    try:
+                        torch.cuda.set_per_process_memory_fraction(
+                            1.0, selected_device
+                        )
+                    except Exception as exc:
+                        note(f"Could not reset the CUDA allocator fraction: {exc}")
+                    try:
+                        torch.cuda.synchronize(selected_device)
+                    except Exception as exc:
+                        note(f"Could not synchronize CUDA during unload: {exc}")
+                    # cuBLAS keeps a 32 MiB workspace per handle inside the caching
+                    # allocator; drop it so nothing of the model's session survives.
+                    try:
+                        clear_workspaces = getattr(
+                            getattr(torch, "_C", None), "_cuda_clearCublasWorkspaces", None
+                        )
+                        if callable(clear_workspaces):
+                            clear_workspaces()
+                    except Exception as exc:
+                        note(f"Could not clear the cuBLAS workspaces: {exc}")
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception as exc:
+                        note(f"Could not empty the CUDA cache: {exc}")
+                    try:
+                        torch.cuda.ipc_collect()
+                    except Exception as exc:
+                        note(f"Could not collect CUDA IPC allocations: {exc}")
+        except ImportError as exc:
+            note(f"Could not import Torch for cache cleanup: {exc}")
+        except Exception as exc:
+            note(f"Could not complete Torch cache cleanup: {exc}")
+        try:
+            gc.collect()
+        except Exception as exc:
+            note(f"Could not collect Python objects after CUDA cleanup: {exc}")
+
+    released = True
+    if model_ref is not None:
+        referent = model_ref()
+        if referent is not None:
+            released = False
+            try:
+                referrer_names = [
+                    type(referrer).__name__
+                    for referrer in gc.get_referrers(referent)[:8]
+                ]
+            except Exception as exc:
+                referrer_names = [f"referrer inspection failed: {exc}"]
+            detail = ", ".join(referrer_names) or "unknown referrer"
+            message = (
+                f"{variant_key} is still referenced after unload: {detail}"
+            )
+            note(message)
+            try:
+                get_log().warn(message, scope="models")
+            except Exception:
+                pass
+        try:
+            del referent
+        except UnboundLocalError:
             pass
-    gc.collect()
-    after = float(
-        resource_snapshot(physical_gpu_index).get("vram_used_gb", 0.0) or 0.0
+
+    after = before
+    previous = before
+    stable_samples = 0
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    while True:
+        sample = vram_used("while waiting for release")
+        if sample is None:
+            break
+        after = sample
+        if abs(previous - sample) < 0.05:
+            stable_samples += 1
+        else:
+            stable_samples = 0
+        previous = sample
+        if stable_samples >= 4:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            note(
+                f"VRAM settle wait timed out after {max(0.0, float(wait_s)):.1f}s"
+            )
+            break
+        time.sleep(min(0.1, remaining))
+
+    try:
+        _trim_host_working_set()
+    except Exception as exc:
+        note(f"Could not trim the host working set: {exc}")
+    try:
+        host_after = _process_private_gb()
+    except Exception as exc:
+        host_after = 0.0
+        note(f"Could not read host memory after unload: {exc}")
+
+    seconds = time.perf_counter() - started
+    freed = max(0.0, before - after)
+    label = variant_key if variant_key is not None else "<unknown>"
+    try:
+        get_log().log(
+            f"Unloaded {label} ({backend}) in {seconds:.1f}s: "
+            f"VRAM {before:.2f} -> {after:.2f} GiB (freed {freed:.2f}), "
+            f"host {host_before:.2f} -> {host_after:.2f} GB",
+            scope="models",
+        )
+    except Exception as exc:
+        note(f"Could not log the model release report: {exc}")
+    return UnloadReport(
+        seconds,
+        before,
+        after,
+        freed,
+        variant_key=variant_key,
+        backend=backend,
+        released=released,
+        host_before_gb=host_before,
+        host_after_gb=host_after,
+        notes=tuple(notes),
     )
-    return UnloadReport(time.perf_counter() - started, before, after, max(0.0, before - after))
 
 
 _SWITCH_REGISTRY: "weakref.WeakSet[LoadedModel]" = weakref.WeakSet()
@@ -1090,11 +1352,37 @@ class ModelCache:
                     "than the current block-swap plan reserved.",
                     scope="models",
                 )
+            released_old = False
             if self._loaded is not None:
-                unload_model(self._loaded)
+                old_key = str(getattr(self._loaded.variant, "key", "<unknown>"))
+                get_log().log(
+                    f"Switching model: unloading {old_key} before loading {variant_key}",
+                    scope="models",
+                )
+                report = unload_model(self._loaded)
+                if report is not None and not report.released:
+                    get_log().warn(
+                        f"The previous model {old_key} is still referenced after the switch",
+                        scope="models",
+                    )
                 self._loaded = None
                 self._key = None
-            self._loaded = load_model(variant_key, **kwargs)
+                released_old = True
+            try:
+                self._loaded = load_model(variant_key, **kwargs)
+            except Exception:
+                self._loaded = None
+                self._key = None
+                if released_old:
+                    gc.collect()
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                raise
             self._key = key
             return self._loaded
 
@@ -1119,11 +1407,31 @@ class ModelCache:
             return True
         return needed <= planned
 
-    def unload(self) -> UnloadReport | None:
+    def loaded_variant_key(self) -> str | None:
+        """Return the resident variant key without exposing the model object."""
+
+        with self._lock:
+            if self._loaded is None:
+                return None
+            try:
+                return str(self._loaded.variant.key)
+            except Exception:
+                return None
+
+    def unload(
+        self,
+        *,
+        unless_variant: str | None = None,
+    ) -> UnloadReport | None:
         """Unload the cached model and clear the cache key."""
 
         with self._lock:
             if self._loaded is None:
+                return None
+            if (
+                unless_variant is not None
+                and self.loaded_variant_key() == str(unless_variant)
+            ):
                 return None
             report = unload_model(self._loaded)
             self._loaded = None

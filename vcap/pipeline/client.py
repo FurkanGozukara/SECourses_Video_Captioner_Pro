@@ -110,6 +110,8 @@ class PipelineClient:
         self._force_requested = threading.Event()
         self._external_cancel_at: float | None = None
         self._local_chat_cancel: CancelToken | None = None
+        self._selected_variant: str | None = None
+        self._release_pending = False
         self._shutdown = threading.Event()
         self._console_key = ("pipeline-client", id(self))
         self._console_throttle = UiThrottle(0.5)
@@ -128,10 +130,43 @@ class PipelineClient:
         finally:
             event_queue.put(_EOF)
 
+    @staticmethod
+    def _wait_for_worker_vram(gpu_index: int | None) -> None:
+        if gpu_index is None:
+            return
+        try:
+            from vcap.core import gpu
+
+            previous = float(
+                gpu.resource_snapshot(int(gpu_index)).get("vram_used_gb", 0.0)
+                or 0.0
+            )
+        except Exception:
+            return
+        stable_samples = 0
+        deadline = time.monotonic() + 3.0
+        while stable_samples < 4 and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            try:
+                current = float(
+                    gpu.resource_snapshot(int(gpu_index)).get(
+                        "vram_used_gb", 0.0
+                    )
+                    or 0.0
+                )
+            except Exception:
+                return
+            if abs(previous - current) < 0.05:
+                stable_samples += 1
+            else:
+                stable_samples = 0
+            previous = current
+
     def _stop_worker(self, *, graceful: bool = True, unload: bool = False) -> None:
         with self._state_lock:
             worker = self._worker
             busy = self._busy
+            worker_gpu = self._worker_gpu
         if worker is None:
             return
         if worker.is_alive() and graceful:
@@ -146,12 +181,15 @@ class PipelineClient:
                 worker.kill_tree(grace=0.25)
         elif worker.is_alive():
             worker.kill_tree(grace=0.25)
+        worker_exited = not worker.is_alive()
         with self._state_lock:
             if self._worker is worker:
                 self._worker = None
                 self._worker_gpu = None
                 self._worker_compile = None
                 self._reader = None
+        if worker_exited:
+            self._wait_for_worker_vram(worker_gpu)
 
     def set_subprocess_mode(self, enabled: bool) -> None:
         """Switch execution modes without leaving a second model resident."""
@@ -265,6 +303,8 @@ class PipelineClient:
             _sink_call(sink.on_item, item_event)
         elif kind == "result":
             return JobResult.from_dict(event["job_result"])
+        elif kind == "unloaded":
+            pass
         return None
 
     def _ensure_worker(self, gpu_index: int, compile_enabled: bool, sink: ProgressSink) -> WorkerProcess:
@@ -335,6 +375,45 @@ class PipelineClient:
                 continue
             self._forward(event, sink)
 
+    def _release_after_selection_change(self, used_variant: str) -> None:
+        with self._state_lock:
+            selected = self._selected_variant
+        if selected is None or selected == str(used_variant):
+            with self._state_lock:
+                self._release_pending = False
+            return
+        try:
+            outcome = self.release_model(unless_variant=selected)
+            released = outcome.get("released") if isinstance(outcome, Mapping) else None
+            if released is not None:
+                from vcap.core.logs import get_log
+
+                get_log().log(
+                    f"Released {released} after the model selection changed to {selected}",
+                    scope="models",
+                )
+            elif isinstance(outcome, Mapping) and outcome.get("error"):
+                from vcap.core.logs import get_log
+
+                get_log().warn(
+                    f"Could not release the previous model after selecting {selected}: "
+                    f"{outcome['error']}",
+                    scope="models",
+                )
+        except Exception as exc:
+            try:
+                from vcap.core.logs import get_log
+
+                get_log().warn(
+                    f"Could not release the previous model after selecting {selected}: {exc}",
+                    scope="models",
+                )
+            except Exception:
+                pass
+        finally:
+            with self._state_lock:
+                self._release_pending = False
+
     def run_job(
         self,
         spec: JobSpec,
@@ -365,6 +444,9 @@ class PipelineClient:
                         self._busy = False
                         self._last_activity = time.monotonic()
                         self._idle_unloaded = not local_spec.runtime.keep_model_loaded
+                    self._release_after_selection_change(
+                        local_spec.model.variant_key
+                    )
 
         worker_spec = replace(spec, runtime=replace(spec.runtime, subprocess_mode=True))
         with self._run_lock:
@@ -424,6 +506,9 @@ class PipelineClient:
                     self._busy = False
                     self._last_activity = time.monotonic()
                     self._external_cancel_at = None
+                self._release_after_selection_change(
+                    worker_spec.model.variant_key
+                )
                 if self._console_active:
                     console_progress.finalize_progress_line(self._console_key)
                     self._console_active = False
@@ -441,6 +526,7 @@ class PipelineClient:
         selected = ChatRequest.from_dict(request)
         token = cancel or CancelToken()
         settings = selected.settings
+        used_variant = str(settings.get("model_key") or "")
         requested_mode = bool(settings.get("subprocess_mode", self.subprocess_mode))
         if requested_mode != self.subprocess_mode:
             self.set_subprocess_mode(requested_mode)
@@ -496,6 +582,7 @@ class PipelineClient:
                         self._local_chat_cancel = None
                         self._last_activity = time.monotonic()
                         self._idle_unloaded = not keep_loaded
+                    self._release_after_selection_change(used_variant)
                     console_progress.finalize_progress_line(console_key)
 
         gpu_index = max(0, int(settings.get("gpu_index", 0) or 0))
@@ -553,6 +640,7 @@ class PipelineClient:
                     self._last_activity = time.monotonic()
                     self._external_cancel_at = None
                     self._idle_unloaded = not keep_loaded
+                self._release_after_selection_change(used_variant)
                 console_progress.finalize_progress_line(console_key)
 
     def cancel(self, force: bool = False) -> None:
@@ -576,6 +664,118 @@ class PipelineClient:
                 self._external_cancel_at = time.monotonic()
         except Exception:
             worker.kill_tree(grace=0.25)
+
+    def release_model(
+        self,
+        unless_variant: str | None = None,
+        timeout_s: float = 30.0,
+        lock_timeout_s: float = 2.0,
+    ) -> dict[str, Any]:
+        """Release the resident model while keeping an idle worker available."""
+
+        with self._state_lock:
+            if self._busy:
+                return {"busy": True}
+        # A health ping or a job that is still spawning its worker can hold the run
+        # lock for a moment; wait briefly so a selection change is not dropped.
+        if not self._run_lock.acquire(timeout=max(0.0, float(lock_timeout_s))):
+            return {"busy": True}
+
+        deferred: list[Any] = []
+        try:
+            with self._state_lock:
+                if self._busy:
+                    return {"busy": True}
+                worker = self._worker
+
+            if not self.subprocess_mode:
+                try:
+                    from .runner import loaded_variant_key, unload_cached_model
+
+                    resident = loaded_variant_key()
+                    outcome = unload_cached_model(
+                        unless_variant=unless_variant
+                    )
+                except Exception as exc:
+                    return {"error": str(exc)}
+                has_error = isinstance(outcome, Mapping) and "error" in outcome
+                released = (
+                    outcome.get("variant_key")
+                    if isinstance(outcome, Mapping) and not has_error
+                    else None
+                )
+                result = {
+                    "ev": "unloaded",
+                    "resident": resident,
+                    "released": released,
+                    "skipped": resident is not None and outcome is None,
+                    "report": outcome,
+                }
+                if released is not None:
+                    with self._state_lock:
+                        self._idle_unloaded = True
+                        self._last_activity = time.monotonic()
+                return result
+
+            if worker is None or not worker.is_alive():
+                return {
+                    "ev": "unloaded",
+                    "resident": None,
+                    "released": None,
+                    "skipped": False,
+                    "report": None,
+                }
+
+            try:
+                worker.send(
+                    {
+                        "cmd": "unload",
+                        "unless_variant": unless_variant,
+                    }
+                )
+                deadline = time.monotonic() + max(0.05, float(timeout_s))
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return {"error": "Model release timed out"}
+                    try:
+                        event = self._events.get(timeout=min(0.1, remaining))
+                    except queue.Empty:
+                        continue
+                    if isinstance(event, Mapping):
+                        kind = str(event.get("ev") or "")
+                        if kind == "unloaded":
+                            result = dict(event)
+                            if result.get("released") is not None:
+                                with self._state_lock:
+                                    self._idle_unloaded = True
+                                    self._last_activity = time.monotonic()
+                            return result
+                        if kind == "error":
+                            return {
+                                "error": str(
+                                    event.get("message") or "Worker error"
+                                )
+                            }
+                    deferred.append(event)
+            except Exception as exc:
+                return {"error": str(exc)}
+        finally:
+            for event in deferred:
+                self._events.put(event)
+            self._run_lock.release()
+
+    def select_variant(self, variant_key: str) -> dict[str, Any]:
+        """Record a model selection and release any different resident model."""
+
+        selected = str(variant_key)
+        with self._state_lock:
+            self._selected_variant = selected
+            if self._busy:
+                self._release_pending = True
+                return {"busy": True, "deferred": True}
+            self._release_pending = False
+        return self.release_model(unless_variant=selected)
 
     def unload(self) -> None:
         """Release the idle worker or in-app model cache."""

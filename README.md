@@ -91,6 +91,8 @@ Both shell installers use `apt-get` for missing Git, FFmpeg, CMake, and a C++ bu
 
 `Windows_Run_Video_Captioner_Pro.bat` opens the local app at `http://127.0.0.1:7860`, or the next free port if 7860 is taken; pass `--server-name` and `--server-port` to pin a specific address and port. The terminal prints the URL actually used. A missing model is downloaded and validated when it is first used for captioning; interrupted downloads retain their resumable `.part` state.
 
+Selecting a different model variant unloads the resident model right away, or as soon as the running job finishes. The release covers VRAM, pinned RAM, compiled graphs, and the GGUF `llama-server` process before the new model loads.
+
 To choose models in advance or resume downloads manually, run this from the distribution folder:
 
 ```text

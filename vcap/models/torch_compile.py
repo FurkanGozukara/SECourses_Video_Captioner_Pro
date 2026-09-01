@@ -762,6 +762,70 @@ def _reset_compiler_runtime() -> None:
         pass
 
 
+def release_compiled_model(model: Any) -> int:
+    """Restore compiled forwards and discard per-model compiler state."""
+
+    try:
+        modules = _modules(model)
+    except Exception:
+        modules = [model]
+    if not any(module is model for module in modules):
+        modules.insert(0, model)
+
+    restored = 0
+    seen: set[int] = set()
+    attributes = (
+        "_vcap_compiled",
+        "_vcap_original_forward",
+        "_vcap_original_disabled_forward",
+        "_vcap_compile_plan",
+        "_vcap_compile_family",
+        "_vcap_compile_requested_mode",
+        "_vcap_compile_disabled",
+    )
+    for module in modules:
+        identity = id(module)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        restored_module = False
+        try:
+            original = getattr(module, "_vcap_original_forward", None)
+        except Exception:
+            original = None
+        if callable(original):
+            try:
+                module.forward = original
+                restored_module = True
+            except Exception:
+                pass
+        try:
+            disabled_original = getattr(
+                module, "_vcap_original_disabled_forward", None
+            )
+        except Exception:
+            disabled_original = None
+        if callable(disabled_original):
+            try:
+                module.forward = disabled_original
+                restored_module = True
+            except Exception:
+                pass
+        try:
+            _delete_instance_attrs(module, attributes)
+        except Exception:
+            pass
+        if restored_module:
+            restored += 1
+
+    if restored:
+        try:
+            _reset_compiler_runtime()
+        except Exception:
+            pass
+    return restored
+
+
 def restore_eager_model(loaded_or_model: Any, exc: BaseException) -> CompileFallback | None:
     """Restore compiled forwards in place, disable the failed mode, and keep weights loaded."""
 
@@ -974,5 +1038,6 @@ __all__ = [
     "normalize_compile_mode",
     "prepare_compile_env",
     "probe_compile_environment",
+    "release_compiled_model",
     "restore_eager_model",
 ]

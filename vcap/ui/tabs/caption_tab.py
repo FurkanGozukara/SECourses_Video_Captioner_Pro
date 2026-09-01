@@ -2474,6 +2474,62 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         api_visibility="private",
     )
 
+    def release_previous_model(variant_key: str) -> None:
+        selected = str(variant_key)
+        try:
+            select_variant = getattr(ctx.pipeline_client, "select_variant", None)
+            if not callable(select_variant):
+                return
+            outcome = select_variant(selected)
+            if not isinstance(outcome, Mapping):
+                return
+            if outcome.get("busy"):
+                ctx.app_log.log(
+                    f"Model selection changed to {selected}; the resident model will be "
+                    "released when the current job finishes.",
+                    scope="models",
+                )
+                return
+            released = outcome.get("released")
+            if released is None:
+                return
+            report = outcome.get("report")
+            try:
+                freed = (
+                    float(report.get("freed_vram_gb", 0.0) or 0.0)
+                    if isinstance(report, Mapping)
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                freed = 0.0
+            ctx.app_log.log(
+                f"Unloaded {released} after the model selection changed to {selected} "
+                f"(freed {freed:.2f} GiB of VRAM).",
+                scope="models",
+            )
+        except Exception as exc:
+            ctx.app_log.warn(
+                f"Could not release the previous model after selecting {selected}: {exc}",
+                scope="models",
+            )
+
+    model_key.change(
+        release_previous_model,
+        inputs=model_key,
+        outputs=[],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    ).then(
+        refresh_block_swap,
+        inputs=block_swap_inputs,
+        outputs=block_swap_outputs,
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
     def limit_line(
         variant_key: str,
         fps_value: float,

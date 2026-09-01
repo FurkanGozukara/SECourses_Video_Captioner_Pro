@@ -12,6 +12,18 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.3.2",
+        "2026-09-02",
+        """
+### Switching models releases the previous model completely
+
+- Selecting another model variant now releases the resident model immediately, or as soon as a running caption or chat job finishes.
+- A full release now restores compiled forwards and clears Dynamo/Inductor state, removes the block-swap manager and pinned RAM, drops ConvRot device caches and cuBLAS workspaces, stops the GGUF `llama-server` process, and waits for the driver to return VRAM.
+- Release verification checks weak-reference liveness and records freed VRAM plus before/after host memory in the model log.
+- The worker `unload` command accepts `unless_variant`; its `unloaded` event reports `resident`, `released`, `skipped`, and the full release `report`.
+""".strip(),
+    ),
+    (
         "v1.3.1",
         "2026-09-02",
         """

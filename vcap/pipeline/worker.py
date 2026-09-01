@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 from dataclasses import asdict
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
 from vcap.core.logs import setup_utf8_stdio
 from vcap.core.progress import ProgressEvent, ProgressSink
@@ -280,18 +280,60 @@ class _Server:
         else:
             self.protocol.emit({"ev": "log", "level": "info", "text": "No job is running"})
 
-    def unload(self) -> None:
+    def unload(self, request: Mapping[str, Any] | None = None) -> None:
         if self._active():
             self.protocol.emit({"ev": "error", "message": "Cannot unload while a job is running", "traceback": ""})
             return
         try:
-            from .runner import unload_cached_model
+            from .runner import loaded_variant_key, unload_cached_model
 
-            unload_cached_model()
-            self.protocol.emit({"ev": "log", "level": "info", "text": "Model unloaded"})
+            resident = loaded_variant_key()
+            raw_unless = request.get("unless_variant") if request is not None else None
+            unless = raw_unless if isinstance(raw_unless, str) else None
+            outcome = unload_cached_model(unless_variant=unless)
         except Exception as exc:
             self.protocol.emit(
                 {"ev": "error", "message": f"Could not unload model: {exc}", "traceback": traceback.format_exc()}
+            )
+            return
+
+        has_error = isinstance(outcome, Mapping) and "error" in outcome
+        released = (
+            outcome.get("variant_key")
+            if isinstance(outcome, Mapping) and not has_error
+            else None
+        )
+        skipped = resident is not None and outcome is None
+        if has_error:
+            self.protocol.emit(
+                {
+                    "ev": "error",
+                    "message": str(outcome.get("error") or "Could not unload model"),
+                    "traceback": "",
+                }
+            )
+        self.protocol.emit(
+            {
+                "ev": "unloaded",
+                "resident": resident,
+                "released": released,
+                "skipped": skipped,
+                "report": outcome,
+            }
+        )
+        if released is not None:
+            self.protocol.emit({"ev": "log", "level": "info", "text": "Model unloaded"})
+        elif skipped:
+            self.protocol.emit(
+                {
+                    "ev": "log",
+                    "level": "info",
+                    "text": f"Keeping {resident} loaded",
+                }
+            )
+        elif resident is None and not has_error:
+            self.protocol.emit(
+                {"ev": "log", "level": "info", "text": "No model is loaded"}
             )
 
     def ping(self) -> None:
@@ -433,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "cancel":
             server.cancel()
         elif command == "unload":
-            server.unload()
+            server.unload(request)
         elif command == "ping":
             server.ping()
         elif command == "exit":
