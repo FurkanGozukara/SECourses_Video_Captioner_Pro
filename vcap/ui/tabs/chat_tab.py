@@ -17,9 +17,9 @@ import gradio as gr
 from vcap.core.media import probe_media
 from vcap.core.paths import normalize_path
 from vcap.core.subprocess_runner import CancelToken, CancelledError
-from vcap.models.registry import MODEL_SPECS, variant_to_family
+from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
 from vcap.pipeline.chat import ChatRequest, ChatResponse, save_conversation
-from vcap.ui.components import action_button
+from vcap.ui.components import action_button, context_usage_text
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
@@ -62,20 +62,22 @@ def model_chat_support(variant_key: str) -> tuple[str, str]:
     """Return the backend chat mode and its concise user-facing note."""
 
     family = variant_to_family(str(variant_key))
+    name = html.escape(f"{MODEL_SPECS[family].label} · {get_variant(str(variant_key)).label}")
     if family in {"qwen3_omni_instruct", "qwen3_omni_thinking"}:
         return (
             "multi",
-            "<span class='vc-ok'>Multi-turn chat · video, audio, image, and text.</span>",
+            f"<span class='vc-ok'><strong>{name}</strong> — multi-turn chat with video, audio, image, and text.</span>",
         )
     if family in {"timechat", "avocado"}:
         return (
             "single",
-            f"<span class='vc-warn'>{html.escape(MODEL_SPECS[family].label)} supports video-only, "
-            "single-turn Q&A. Each Send starts a fresh exchange.</span>",
+            f"<span class='vc-warn'><strong>{name}</strong> — video-only, single-turn Q&A. "
+            "Each Send starts a fresh exchange with exactly one video.</span>",
         )
     return (
         "unsupported",
-        "<span class='vc-err'>Qwen3-Omni Captioner has no chat mode. Pick Qwen3-Omni Instruct or Thinking.</span>",
+        f"<span class='vc-err'><strong>{name}</strong> has no chat mode. Pick Qwen3-Omni Instruct or Thinking "
+        "in the Caption tab, or load a Chat preset.</span>",
     )
 
 
@@ -123,17 +125,59 @@ def _attachment_line(files: Any, path_text: str) -> str:
     return f"<span class='vc-ok'>Attached: {' · '.join(labels)}</span>"
 
 
-def _chatbot_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
-    return [
-        {"role": str(item.get("role") or "assistant"), "content": str(item.get("content") or "")}
-        for item in messages
-        if str(item.get("role") or "") in {"user", "assistant"}
-    ]
+def _thought_message(reasoning: str, *, done: bool, seconds: Any = None) -> dict[str, Any]:
+    """Chatbot "thought" entry: an expandable block holding streamed or saved reasoning.
+
+    Gradio opens a pending thought (with a spinner) so the reasoning is visible
+    while it streams, and collapses it once it is marked done.
+    """
+
+    metadata: dict[str, Any] = {
+        "title": "🧠 Reasoning" if done else "🧠 Thinking…",
+        "status": "done" if done else "pending",
+    }
+    try:
+        duration = float(seconds) if seconds is not None else 0.0
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration > 0:
+        metadata["duration"] = round(duration, 1)
+    return {"role": "assistant", "content": reasoning, "metadata": metadata}
+
+
+def _is_thought(item: Mapping[str, Any] | None) -> bool:
+    metadata = (item or {}).get("metadata")
+    return isinstance(metadata, Mapping) and bool(metadata.get("title"))
+
+
+def _chatbot_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Render history for the Chatbot: attachments under each turn, reasoning as a thought."""
+
+    display: list[dict[str, Any]] = []
+    for item in messages:
+        role = str(item.get("role") or "assistant")
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content") or "")
+        names = [Path(str(value)).name for value in (item.get("media") or []) if str(value)]
+        if names:
+            content = f"{content}\n\n📎 {' · '.join(names)}".strip()
+        reasoning = str(item.get("reasoning") or "").strip() if role == "assistant" else ""
+        if reasoning:
+            display.append(_thought_message(reasoning, done=True, seconds=item.get("reasoning_s")))
+        display.append({"role": role, "content": content})
+    return display
+
+
+def _tokens_line(tokens: Any = "—", speed: Any = "—", used: Any = None, limit: Any = None) -> str:
+    """Tokens, speed, and context statistics shown under the composer."""
+
+    return f"**Tokens:** {tokens} · **Speed:** {speed} · **Context:** {context_usage_text(used, limit)}"
 
 
 def _last_answer(history: Sequence[Mapping[str, Any]] | None) -> str:
     for item in reversed(list(history or [])):
-        if str(item.get("role") or "") == "assistant":
+        if str(item.get("role") or "") == "assistant" and not _is_thought(item):
             return str(item.get("content") or "")
     return ""
 
@@ -172,7 +216,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
             message = gr.Textbox(
                 label="Message",
                 placeholder="Ask about the attached media…",
-                info="Enter the next user turn. Qwen3-Omni can also chat without media.",
+                info="Enter the next user turn; attachments are sent with the turn they accompany. Qwen3-Omni can also chat without media.",
                 lines=3,
                 max_lines=8,
                 autofocus=False,
@@ -191,7 +235,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 copy_last = action_button("⧉ Copy last answer", "blue", size="md", scale=2)
                 save = action_button("💾 Save conversation", "green", size="md", scale=2)
             status = gr.Markdown("<span class='vc-ok'>Ready.</span>", elem_classes=["vc-status"])
-            tokens = gr.Markdown("**Tokens:** — · **Speed:** —", elem_classes=["vc-help"])
+            tokens = gr.Markdown(_tokens_line(), elem_classes=["vc-help"])
         with gr.Column(scale=4, min_width=420):
             with gr.Group(elem_classes=["vc-card"]):
                 gr.Markdown("### Media", elem_classes=["vc-section-title"])
@@ -328,7 +372,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 enable_thinking = gr.Checkbox(
                     value=False,
                     label="Enable thinking",
-                    info="Shows Qwen3-Omni Thinking reasoning separately in the collapsed Reasoning panel.",
+                    info="Streams Qwen3-Omni Thinking reasoning live as a thought block above the answer and keeps a copy in the Reasoning panel.",
                     interactive=False,
                 )
                 controls["chat_enable_thinking"] = ctx.reg(
@@ -341,6 +385,12 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                     in_preset=True,
                     in_metadata=False,
                 )
+            gr.Markdown(
+                "The model comes from the Caption tab's Model variant. The system prompt and generation "
+                "values above are saved and applied with the universal preset bar; the shipped Chat presets "
+                "select a chat-capable Qwen3-Omni model.",
+                elem_classes=["vc-help"],
+            )
     stop_timer = gr.Timer(1.0)
     conversation_state = gr.State(dict(_INITIAL_STATE))
     handles = ChatTabHandles(
@@ -462,13 +512,34 @@ def wire(ctx: "UiContext") -> None:
         handles.reasoning_accordion,
         handles.conversation_state,
         handles.stop,
+        handles.files,
+        handles.path,
+        handles.attachment_status,
     ]
 
-    def response_display(messages: list[dict[str, Any]], text: str) -> list[dict[str, str]]:
+    def response_display(
+        messages: list[dict[str, Any]],
+        text: str,
+        reasoning: str = "",
+        *,
+        reasoning_done: bool = True,
+        reasoning_s: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """History plus the live turn: a thought block while reasoning streams, then the answer."""
+
         display = _chatbot_messages(messages)
+        if reasoning:
+            display.append(_thought_message(reasoning, done=reasoning_done, seconds=reasoning_s))
         if text:
             display.append({"role": "assistant", "content": text})
         return display
+
+    def composer_reset(mode: str) -> tuple[Any, Any, Any]:
+        """Clear sent attachments after a multi-turn exchange; single-turn Q&A keeps its video."""
+
+        if mode != "multi":
+            return gr.skip(), gr.skip(), gr.skip()
+        return gr.update(value=None), "", "<span class='vc-help'>No media attached.</span>"
 
     def send_message(*args: Any):
         settings = registry.values_to_dict(args[:value_count])
@@ -478,43 +549,31 @@ def wire(ctx: "UiContext") -> None:
         message = str(args[value_count + 3] or "").strip()
         model_key = str(settings.get("model_key") or "qwen3_omni_instruct_int8")
         mode, model_note = model_chat_support(model_key)
-        if mode == "unsupported":
-            yield (
+        keep_composer = (gr.skip(), gr.skip(), gr.skip())
+
+        def rejected(status_html: str, tokens_html: Any = gr.skip()) -> tuple[Any, ...]:
+            return (
                 gr.skip(),
                 gr.skip(),
-                model_note,
-                "**Tokens:** — · **Speed:** —",
+                status_html,
+                tokens_html,
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
                 gr.update(value="⏹ Stop", interactive=False),
+                *keep_composer,
             )
+
+        if mode == "unsupported":
+            yield rejected(model_note, _tokens_line())
             return
         if not message:
-            yield (
-                gr.skip(),
-                gr.skip(),
-                "<span class='vc-warn'>Enter a message before sending.</span>",
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.update(value="⏹ Stop", interactive=False),
-            )
+            yield rejected("<span class='vc-warn'>Enter a message before sending.</span>")
             return
         try:
             selected_media = resolve_chat_attachments(files, path_text)
         except Exception as exc:
-            yield (
-                gr.skip(),
-                gr.skip(),
-                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.skip(),
-                gr.update(value="⏹ Stop", interactive=False),
-            )
+            yield rejected(f"<span class='vc-err'>{html.escape(str(exc))}</span>")
             return
         previous_messages = list(state.get("messages") or [])
         if str(state.get("model_key") or "") not in {"", model_key}:
@@ -522,37 +581,24 @@ def wire(ctx: "UiContext") -> None:
             state = dict(_INITIAL_STATE)
         if mode == "single":
             previous_messages = []
-        prior_media = [str(value) for value in state.get("media") or []]
-        if previous_messages:
-            media = prior_media
-            attachment_note = (
-                " Attachments remain fixed to the first turn; clear history to replace them."
-                if selected_media and selected_media != prior_media
-                else ""
-            )
-        else:
-            media = selected_media
-            attachment_note = ""
-        if mode == "single":
-            if len(media) != 1 or probe_media(media[0]).kind not in {"video", "video_no_audio"}:
-                yield (
-                    gr.skip(),
-                    gr.skip(),
+            if len(selected_media) != 1 or probe_media(selected_media[0]).kind not in {"video", "video_no_audio"}:
+                yield rejected(
                     f"<span class='vc-warn'>{html.escape(MODEL_SPECS[variant_to_family(model_key)].label)} "
-                    "chat requires exactly one video attachment.</span>",
-                    gr.skip(),
-                    gr.skip(),
-                    gr.skip(),
-                    gr.skip(),
-                    gr.update(value="⏹ Stop", interactive=False),
+                    "chat requires exactly one video attachment.</span>"
                 )
                 return
         history = [
-            {"role": str(item.get("role")), "content": str(item.get("content") or "")}
+            {
+                "role": str(item.get("role")),
+                "content": str(item.get("content") or ""),
+                "media": [str(value) for value in (item.get("media") or [])],
+            }
             for item in previous_messages
             if str(item.get("role")) in {"user", "assistant"}
         ]
-        history.append({"role": "user", "content": message})
+        # Attachments belong to the turn they are sent with, so any turn can add media.
+        history.append({"role": "user", "content": message, "media": list(selected_media)})
+        media = [value for item in history for value in (item.get("media") or [])]
         generation = {
             "temperature": float(settings.get("chat_temperature", 0.2)),
             "top_p": float(settings.get("chat_top_p", 0.95)),
@@ -564,7 +610,7 @@ def wire(ctx: "UiContext") -> None:
             {
                 "settings": settings,
                 "history": history,
-                "media": media,
+                "media": [],
                 "generation": generation,
                 "system_prompt": str(settings.get("chat_system_prompt") or ""),
             }
@@ -590,8 +636,29 @@ def wire(ctx: "UiContext") -> None:
         thread.start()
         current_text = ""
         current_reasoning = ""
-        current_status = f"Starting chat.{attachment_note}"
-        token_line = "**Tokens:** generating · **Speed:** —"
+        current_status = "Starting chat."
+        context_used: Any = None
+        context_limit: Any = None
+        token_line = _tokens_line("generating")
+        reasoning_started: float | None = None
+        reasoning_s: float | None = None
+
+        def live_display(*, done: bool) -> list[dict[str, Any]]:
+            seconds = reasoning_s
+            if seconds is None and reasoning_started is not None and (done or current_text):
+                seconds = time.monotonic() - reasoning_started
+            return response_display(
+                history,
+                current_text,
+                current_reasoning,
+                reasoning_done=done or bool(current_text),
+                reasoning_s=seconds,
+            )
+
+        def live_status(css_class: str = "vc-ok") -> str:
+            phase = "Thinking · " if current_reasoning and not current_text else ""
+            return f"<span class='{css_class}'>{html.escape(phase + current_status)}</span>"
+
         yield (
             response_display(history, ""),
             "",
@@ -601,6 +668,7 @@ def wire(ctx: "UiContext") -> None:
             gr.update(visible=False),
             state,
             gr.update(value="⏹ Stop", interactive=True),
+            *keep_composer,
         )
         last_emit = 0.0
         try:
@@ -612,6 +680,10 @@ def wire(ctx: "UiContext") -> None:
                 if kind == "delta":
                     current_text = str(event.get("text") or current_text)
                     current_reasoning = str(event.get("reasoning") or current_reasoning)
+                    if current_reasoning and reasoning_started is None:
+                        reasoning_started = time.monotonic()
+                    if current_text and reasoning_started is not None and reasoning_s is None:
+                        reasoning_s = time.monotonic() - reasoning_started
                 elif kind == "status":
                     current_status = str(event.get("message") or current_status)
                     data = dict(event.get("data") or {})
@@ -622,7 +694,10 @@ def wire(ctx: "UiContext") -> None:
                         speed_text = f"{float(speed):.2f} tok/s" if speed is not None else "—"
                     except (TypeError, ValueError):
                         speed_text = "—"
-                    token_line = f"**Tokens:** {token_text} · **Speed:** {speed_text}"
+                    if data.get("prompt_tokens") is not None:
+                        context_used = data.get("prompt_tokens")
+                        context_limit = data.get("context_limit", context_limit)
+                    token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
                 elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
                     current_status = str(event.get("text") or current_status)
                 now = time.monotonic()
@@ -630,14 +705,15 @@ def wire(ctx: "UiContext") -> None:
                     continue
                 last_emit = now
                 yield (
-                    response_display(history, current_text),
+                    live_display(done=False),
                     "",
-                    f"<span class='vc-ok'>{html.escape(current_status)}</span>",
+                    live_status(),
                     token_line,
                     current_reasoning,
                     gr.update(visible=bool(current_reasoning)),
                     state,
                     gr.update(value="⏹ Stop", interactive=True),
+                    *keep_composer,
                 )
             thread.join()
             if "error" in terminal:
@@ -645,6 +721,8 @@ def wire(ctx: "UiContext") -> None:
             result: ChatResponse = terminal["result"]
             current_text = result.text
             current_reasoning = result.reasoning
+            if reasoning_s is None and reasoning_started is not None and current_reasoning:
+                reasoning_s = time.monotonic() - reasoning_started
             saved_messages = list(history)
             if current_text:
                 saved_messages.append(
@@ -652,6 +730,7 @@ def wire(ctx: "UiContext") -> None:
                         "role": "assistant",
                         "content": current_text,
                         "reasoning": current_reasoning,
+                        "reasoning_s": reasoning_s,
                         "result": result.to_dict(),
                     }
                 )
@@ -675,19 +754,27 @@ def wire(ctx: "UiContext") -> None:
                 f"{'Stopped' if result.cancelled else 'Complete'}: {result.new_tokens} tokens, "
                 f"{result.tokens_per_s:.2f} tok/s, finish={result.finish_reason}.{trim_note} {warning}"
             ).strip()
+            # The turn (and its attachments) is now part of the conversation, so
+            # the composer starts clean for the next one.
             yield (
-                response_display(history, current_text),
+                live_display(done=True),
                 "",
                 f"<span class='{status_class}'>{html.escape(final_status)}</span>",
-                f"**Tokens:** {result.new_tokens} · **Speed:** {result.tokens_per_s:.2f} tok/s",
+                _tokens_line(
+                    result.new_tokens,
+                    f"{result.tokens_per_s:.2f} tok/s",
+                    result.context_tokens or result.prompt_tokens,
+                    getattr(result, "context_limit", 0),
+                ),
                 current_reasoning,
                 gr.update(visible=bool(current_reasoning)),
                 new_state,
                 gr.update(value="⏹ Stop", interactive=False),
+                *composer_reset(mode),
             )
         except (CancelledError, KeyboardInterrupt) as exc:
             yield (
-                response_display(history, current_text),
+                live_display(done=True),
                 "",
                 f"<span class='vc-warn'>{html.escape(str(exc))}</span>",
                 token_line,
@@ -695,11 +782,12 @@ def wire(ctx: "UiContext") -> None:
                 gr.update(visible=bool(current_reasoning)),
                 state,
                 gr.update(value="⏹ Stop", interactive=False),
+                *keep_composer,
             )
         except BaseException as exc:
             ctx.app_log.exception(f"Chat failed: {exc}", scope="chat")
             yield (
-                response_display(history, current_text),
+                live_display(done=True),
                 "",
                 f"<span class='vc-err'>{html.escape(str(exc))}</span>",
                 token_line,
@@ -707,6 +795,7 @@ def wire(ctx: "UiContext") -> None:
                 gr.update(visible=bool(current_reasoning)),
                 state,
                 gr.update(value="⏹ Stop", interactive=False),
+                *keep_composer,
             )
         finally:
             ctx.clear_active_cancel(token)
@@ -814,7 +903,7 @@ def wire(ctx: "UiContext") -> None:
         outputs=handles.status,
         js=(
             "(history) => { const rows = Array.isArray(history) ? history : []; "
-            "const item = [...rows].reverse().find(x => x && x.role === 'assistant'); "
+            "const item = [...rows].reverse().find(x => x && x.role === 'assistant' && !(x.metadata && x.metadata.title)); "
             "if (item && item.content) navigator.clipboard.writeText(String(item.content)); "
             "return [history]; }"
         ),

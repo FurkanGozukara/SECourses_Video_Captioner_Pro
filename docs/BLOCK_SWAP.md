@@ -25,6 +25,14 @@ per-token weight allocations and no host-side synchronization in these hooks.
   Windows may page allocations into shared GPU memory.
 - `gpu_layers: N` keeps exactly the first `N` decoder layers resident, capped at the model's layer
   count, and swaps the rest.
+- The UI exposes the same policy as two controls in the Model panel's `Block swap & offload plan`
+  section. `Automatic block swap` (`block_swap_auto`) maps to `auto`; when it is on, the
+  `Decoder layers to block-swap` slider (`blocks_to_swap`) is read-only and shows the swapped count
+  the loader is expected to choose, previewed from the checkpoint header, the config, the media
+  budget, and free VRAM (measured before the resident model was placed when one is loaded). With
+  it off, the slider sets the swapped count directly: `N = layer_count - blocks_to_swap`, and `0`
+  keeps the whole decoder resident. Presets and run metadata from before v1.3.1 that stored
+  `gpu_layers` are translated on load.
 - `vram_reserve_gb` is dedicated VRAM deliberately left free at the expected peak. The default is
   `2.0` GB.
 - `swap_slots` controls staging depth. `2` provides one-layer lookahead; `3` provides two-layer

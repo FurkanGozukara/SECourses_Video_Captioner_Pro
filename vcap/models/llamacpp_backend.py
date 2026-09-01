@@ -48,6 +48,7 @@ from .base import (
     PreprocessParams,
     PromptSpec,
     TokenUsage,
+    chat_media_parts,
     normalize_chat_history,
     truncate_chat_history,
 )
@@ -256,8 +257,15 @@ def build_llamacpp_chat_messages(
     history: Sequence[ChatMessage | Mapping[str, Any]],
     media_content: Sequence[Mapping[str, Any]] = (),
     system_prompt: str | None = None,
+    *,
+    turn_media: Any = None,
 ) -> list[dict[str, Any]]:
-    """Build OpenAI-compatible messages with media in the first user turn."""
+    """Build OpenAI-compatible messages.
+
+    ``media_content`` goes into the first user turn (legacy first-turn
+    attachments); ``turn_media(index, message)`` returns the encoded content
+    for a message's own attachments, indexed within the non-system messages.
+    """
 
     normalized = normalize_chat_history(history)
     inherited_system = next((item.content for item in normalized if item.role == "system"), "")
@@ -272,8 +280,12 @@ def build_llamacpp_chat_messages(
     if selected_system.strip():
         result.append({"role": "system", "content": selected_system.strip()})
     for index, message in enumerate(text_messages):
+        content: list[dict[str, Any]] = []
         if index == first_user and media_content:
-            content = [dict(item) for item in media_content]
+            content.extend(dict(item) for item in media_content)
+        if turn_media is not None and message.media:
+            content.extend(dict(item) for item in turn_media(index, message))
+        if content:
             if message.content:
                 content.append({"type": "text", "text": message.content})
             result.append({"role": message.role, "content": content})
@@ -1359,19 +1371,25 @@ class LlamaCppCaptioner(BaseCaptioner):
         )
         preprocessing = pre or _default_pre(self.spec.family)
         normalized = normalize_chat_history(history)
-        parts = _parts(media) if media is not None else []
-        if parts:
-            self._validate_parts(parts)
+        # Legacy first-turn media plus each user turn's own attachments, probed once.
+        legacy_parts = _parts(media) if media is not None else []
+        part_by_path: dict[str, MediaPart] = {}
+        for item in normalized:
+            for raw, part in zip(item.media, chat_media_parts(item.media)):
+                part_by_path[raw] = part
+        all_parts = legacy_parts + [part_by_path[raw] for item in normalized for raw in item.media]
+        if all_parts:
+            self._validate_parts(all_parts)
         with self._caption_lock:
             if not self.is_running:
                 self.start(callbacks.progress, callbacks.cancel)
             _emit(callbacks.progress, "Preparing llama.cpp chat context")
-            media_content: list[dict[str, Any]] = []
+            first_content: list[dict[str, Any]] = []
             warnings: list[str] = []
             text_parts: list[str] = []
-            if parts:
-                media_content, warnings, text_parts = self._media_content(
-                    parts,
+            if legacy_parts:
+                first_content, warnings, text_parts = self._media_content(
+                    legacy_parts,
                     preprocessing,
                     callbacks.cancel,
                 )
@@ -1387,6 +1405,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                 merged[first_user] = ChatMessage(
                     "user",
                     "\n\n".join([*text_parts, current.content]).strip(),
+                    current.media,
                 )
                 normalized = merged
 
@@ -1394,8 +1413,9 @@ class LlamaCppCaptioner(BaseCaptioner):
                 characters = sum(len(item.content) for item in candidate)
                 if system_prompt:
                     characters += len(system_prompt)
-                media_allowance = 512 * len(media_content)
-                return max(1, math.ceil(characters / 4) + 12 * len(candidate) + media_allowance)
+                # Each attachment becomes sampled frames and/or audio; budget generously.
+                attachments = len(legacy_parts) + sum(len(item.media) for item in candidate)
+                return max(1, math.ceil(characters / 4) + 12 * len(candidate) + 512 * attachments)
 
             retained, dropped_turns, estimated_tokens = truncate_chat_history(
                 normalized,
@@ -1406,7 +1426,7 @@ class LlamaCppCaptioner(BaseCaptioner):
             if dropped_turns:
                 context_warning = (
                     f"Context limit: dropped {dropped_turns} oldest conversation "
-                    f"turn{'s' if dropped_turns != 1 else ''}; the media turn was kept."
+                    f"turn{'s' if dropped_turns != 1 else ''}; the first turn was kept."
                 )
                 warnings.append(context_warning)
                 _emit(
@@ -1415,7 +1435,26 @@ class LlamaCppCaptioner(BaseCaptioner):
                     dropped_turns=dropped_turns,
                     context_trimmed=True,
                 )
-            messages = build_llamacpp_chat_messages(retained, media_content, system_prompt)
+            # Encode attachments only for the turns that survived truncation.
+            turn_content: list[list[dict[str, Any]]] = []
+            for item in retained:
+                if item.role == "system":
+                    continue
+                content: list[dict[str, Any]] = []
+                if item.media:
+                    content, item_warnings, _ = self._media_content(
+                        [part_by_path[raw] for raw in item.media],
+                        preprocessing,
+                        callbacks.cancel,
+                    )
+                    warnings.extend(item_warnings)
+                turn_content.append(content)
+            messages = build_llamacpp_chat_messages(
+                retained,
+                first_content,
+                system_prompt,
+                turn_media=lambda index, message: turn_content[index],
+            )
             for warning in warnings:
                 if warning == context_warning:
                     continue
@@ -1449,6 +1488,8 @@ class LlamaCppCaptioner(BaseCaptioner):
             tok_per_s=stream.tok_per_s,
             cancelled=stream.cancelled,
             finish_reason=stream.finish_reason,
+            prompt_tokens=stream.prompt_tokens,
+            context_limit=self.context_size,
         )
         return ChatResult(
             text=answer,
@@ -1468,6 +1509,7 @@ class LlamaCppCaptioner(BaseCaptioner):
             retained_history=tuple(retained),
             dropped_turns=dropped_turns,
             context_tokens=stream.prompt_tokens or estimated_tokens,
+            context_limit=self.context_size,
         )
 
     def caption(
@@ -1515,6 +1557,8 @@ class LlamaCppCaptioner(BaseCaptioner):
             tok_per_s=stream.tok_per_s,
             cancelled=stream.cancelled,
             finish_reason=stream.finish_reason,
+            prompt_tokens=stream.prompt_tokens,
+            context_limit=self.context_size,
         )
         return CaptionResult(
             text=post.text,

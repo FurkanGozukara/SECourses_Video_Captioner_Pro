@@ -26,6 +26,7 @@ from vcap.core.captions_post import to_srt
 from vcap.core.media import probe_media
 from vcap.core.paths import normalize_path, open_in_file_manager, reveal_in_file_manager
 from vcap.core.preprocess import fits_context, token_budget_estimate
+from vcap.ui.components import context_usage_text
 from vcap.core.progress import ProgressEvent, format_eta
 from vcap.core.scene_split import (
     SceneDetectParams,
@@ -34,13 +35,23 @@ from vcap.core.scene_split import (
     merge_short_scenes,
 )
 from vcap.core.subprocess_runner import CancelToken, CancelledError, build_child_env
+from vcap.core.gpu import resource_snapshot
 from vcap.models import attention as attention_module
 from vcap.models.attention import ATTENTION_CHOICES
 from vcap.models.downloads import ensure_model
+from vcap.models.offload import (
+    BudgetHint,
+    OffloadPlan,
+    block_swap_to_gpu_layers,
+    family_layer_count,
+    migrate_legacy_gpu_layers,
+    plan_model_folder,
+)
 from vcap.models.registry import (
     MODEL_SPECS,
     all_variant_choices,
     get_variant,
+    resolve_model_dir,
     variant_size_gb,
     variant_is_ready,
     variant_to_family,
@@ -63,6 +74,63 @@ from vcap.models.vram_presets import (
 # inputs at event time, so the UI keeps the global cap and the pipeline clamps
 # max_new_tokens to the selected family's real limit.
 _GLOBAL_MAX_NEW_TOKENS = max(spec.limits.max_new_tokens_cap for spec in MODEL_SPECS.values())
+_GLOBAL_MAX_CONTEXT = max(spec.limits.context_tokens for spec in MODEL_SPECS.values())
+
+
+def _schema_bound(name: str, attribute: str, pick: Any) -> float:
+    return pick(
+        float(getattr(next(item for item in spec.param_schema if item.name == name), attribute))
+        for spec in MODEL_SPECS.values()
+    )
+
+
+# Backend bounds for Number/Slider controls are fixed at construction to the
+# widest value across families and are never narrowed by updates. Gradio
+# validates every incoming value against the *backend* bound, and sibling
+# handlers on one trigger race: one could narrow the bound before the browser
+# applied the value another one still carries, which raised
+# "Value 768 is greater than maximum value 160". Family limits live in help
+# text, in value clamping, and in JobSpec instead.
+_GLOBAL_MAX_FRAMES = int(_schema_bound("max_frames", "max", max))
+_GLOBAL_MIN_PIXELS = int(min(4 * spec.limits.size_multiple**2 for spec in MODEL_SPECS.values()))
+_GLOBAL_MAX_PIXELS = int(_schema_bound("max_pixels", "max", max))
+_GLOBAL_FPS_MIN = _schema_bound("fps", "min", min)
+_GLOBAL_FPS_MAX = _schema_bound("fps", "max", max)
+
+
+def _frames_info(spec: Any) -> str:
+    cap = int(next(item for item in spec.param_schema if item.name == "max_frames").max)
+    return (
+        f"Hard cap applied after sampling; {spec.label} uses at most {cap} frames and higher "
+        "values are clamped at run time. Zero is valid for audio-only presets."
+    )
+
+
+def _family_max_frames(spec: Any) -> int:
+    return int(next(item for item in spec.param_schema if item.name == "max_frames").max)
+
+
+def _context_window(spec: Any, requested: Any) -> int:
+    """Clamp a requested context window to the family cap (blank means the cap)."""
+
+    cap = int(spec.limits.context_tokens)
+    try:
+        value = int(float(requested)) if requested not in (None, "") else cap
+    except (TypeError, ValueError):
+        value = cap
+    return max(1024, min(cap, value)) if value > 0 else cap
+
+
+def _context_info(spec: Any) -> str:
+    """Model-specific help for the context control, including its KV-cache cost."""
+
+    cap = int(spec.limits.context_tokens)
+    return (
+        f"Total window for prompt, media, and reply. {spec.label} allows up to {cap:,} tokens; "
+        f"its KV cache is about {spec.limits.kv_cache_gb(cap):.1f} GB at the full window "
+        f"({spec.limits.kv_cache_gb(cap // 2):.1f} GB at {cap // 2:,}). GGUF servers reserve it "
+        "at load, Transformers grow into it, and long chats are trimmed to fit."
+    )
 from vcap.pipeline.job import InputItem, JobResult, JobSpec, OutputSpec
 from vcap.prompts.presets import (
     TEMPLATE_VARIABLES,
@@ -430,6 +498,246 @@ def _quant_line(variant_key: str) -> str:
         return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
 
 
+_GIB = float(2**30)
+# A fresh worker's CUDA context is not visible to NVML until the worker exists; the
+# loader measures free VRAM after creating it, so the preview budgets for it.
+_CUDA_CONTEXT_ALLOWANCE_BYTES = 384 * 2**20
+_BLOCK_SWAP_SLIDER_MAX = max(family_layer_count(family) for family in MODEL_SPECS)
+
+
+def _blocks_info(layer_count: int) -> str:
+    return (
+        "Decoder layers kept in pinned RAM and streamed through the GPU each token; "
+        f"0 keeps the whole decoder resident. The selected family has {int(layer_count)} layers."
+    )
+
+
+def _media_kinds(modality: Any) -> tuple[str, ...]:
+    text = str(modality or "").strip().casefold()
+    if text.startswith("video"):
+        return ("video",)
+    if text in {"audio", "image"}:
+        return (text,)
+    return ()
+
+
+def _loaded_plan_text(summary: Mapping[str, Any]) -> str:
+    resident = summary.get("resident_layers")
+    total = summary.get("layer_count")
+    swapped = summary.get("swapped_layers")
+    if resident is None or total is None:
+        return ""
+    text = f"{int(resident)}/{int(total)} resident"
+    if swapped is not None:
+        text += f", {int(swapped)} swapped"
+    return text
+
+
+def block_swap_preview(
+    variant_key: str,
+    auto: bool,
+    blocks: Any,
+    *,
+    gpu_index: int,
+    reserve_gb: Any,
+    swap_slots: Any,
+    offload_experts: bool,
+    pin_cpu: bool,
+    fps_value: Any,
+    frames_value: Any,
+    pixels_value: Any,
+    output_tokens: Any,
+    context_value: Any,
+    duration: Any,
+    modality: Any,
+    pong: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Resolve what the block-swap controls mean for the selected variant right now.
+
+    Returns slider update kwargs (value, interactivity, help text) and an HTML
+    status line. With ``auto`` the slider value becomes the swapped-layer count
+    the loader is expected to choose, computed from the same inputs it uses:
+    the safetensors header, the config, the media budget, and free VRAM. ``pong``
+    is the pipeline client's ping result; when a model is resident, the free VRAM
+    measured before it was placed is the figure the next load will see.
+    """
+
+    family = variant_to_family(variant_key)
+    spec = MODEL_SPECS[family]
+    variant = get_variant(variant_key)
+    layer_count = family_layer_count(family)
+    try:
+        manual = int(float(blocks or 0))
+    except (TypeError, ValueError, OverflowError):
+        manual = 0
+    manual = max(0, min(layer_count, manual))
+    slider: dict[str, Any] = {"value": manual, "interactive": not bool(auto), "info": _blocks_info(layer_count)}
+
+    if variant.scheme == "gguf":
+        slider["interactive"] = False
+        return slider, (
+            "<span class='vc-help'>GGUF variants run inside llama-server, which fits its own GPU layer "
+            "count at start (<code>--fit</code>); decoder block swap does not apply.</span>"
+        )
+    if offload_experts:
+        slider["interactive"] = False
+        return slider, (
+            "<span class='vc-warn'>Legacy Accelerate expert offload is enabled; block swap is disabled "
+            "and Accelerate places every decoder layer.</span>"
+        )
+    ready, detail = variant_is_ready(variant_key)
+    if not ready:
+        return slider, (
+            "<span class='vc-help'>Download the checkpoint to preview the automatic plan "
+            f"({html.escape(_display(detail))}).</span>"
+        )
+
+    pong_data = dict(pong or {})
+    loaded_variant = pong_data.get("loaded_variant")
+    raw_summary = pong_data.get("block_swap")
+    loaded_summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else None
+    snapshot = resource_snapshot(int(gpu_index))
+    free_bytes = int(float(snapshot.get("vram_free_gb", 0.0) or 0.0) * _GIB)
+    total_bytes = int(float(snapshot.get("vram_total_gb", 0.0) or 0.0) * _GIB)
+    ram_available = int(float(snapshot.get("ram_free_gb", 0.0) or 0.0) * _GIB) or None
+    if total_bytes <= 0:
+        return slider, "<span class='vc-warn'>GPU telemetry is unavailable; the loader plans at start.</span>"
+    basis = "free VRAM now"
+    if pong_data.get("busy"):
+        basis = "free VRAM while the running job holds its model"
+    elif loaded_variant and loaded_summary and loaded_summary.get("free_vram_gib"):
+        before = int(float(loaded_summary["free_vram_gib"]) * _GIB)
+        if before > free_bytes:
+            free_bytes = before
+            basis = "free VRAM measured before the resident model was placed; it is released first"
+    elif not loaded_variant:
+        free_bytes = max(0, free_bytes - _CUDA_CONTEXT_ALLOWANCE_BYTES)
+
+    try:
+        fps = float(fps_value or spec.limits.default_fps)
+    except (TypeError, ValueError):
+        fps = float(spec.limits.default_fps)
+    try:
+        frames = max(0, int(float(frames_value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        frames = int(spec.limits.max_frames or 0)
+    try:
+        seconds = float(duration or 0.0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0 and frames > 0:
+        frames = min(frames, max(1, int(math.ceil(seconds * max(fps, 0.25)))))
+    try:
+        pixels = int(float(pixels_value or spec.limits.default_max_pixels))
+    except (TypeError, ValueError, OverflowError):
+        pixels = int(spec.limits.default_max_pixels)
+    try:
+        new_tokens = int(float(output_tokens or 0)) or None
+    except (TypeError, ValueError, OverflowError):
+        new_tokens = None
+    hint = BudgetHint(
+        max_frames=frames,
+        max_pixels=pixels,
+        fps=fps,
+        max_new_tokens=new_tokens,
+        context_tokens=_context_window(spec, context_value),
+        media_kinds=_media_kinds(modality),
+    )
+    try:
+        reserve = max(0.0, float(reserve_gb or 0.0))
+    except (TypeError, ValueError):
+        reserve = 2.0
+    try:
+        slots = max(1, min(4, int(float(swap_slots or 2))))
+    except (TypeError, ValueError, OverflowError):
+        slots = 2
+    plan = OffloadPlan(
+        gpu_layers=block_swap_to_gpu_layers(bool(auto), manual, layer_count),
+        offload_experts=False,
+        max_memory=None,
+        pin_cpu=bool(pin_cpu),
+        vram_reserve_gb=reserve,
+        swap_slots=slots,
+    )
+    budget = plan_model_folder(
+        family,
+        variant_key,
+        resolve_model_dir(variant_key),
+        plan,
+        hint,
+        free_vram_bytes=free_bytes,
+        total_vram_bytes=total_bytes,
+        ram_available_bytes=ram_available,
+    )
+
+    resident = int(budget.resident_layers)
+    swapped = int(budget.swapped_layers)
+    total_layers = int(budget.layer_count) or layer_count
+    if auto:
+        slider["value"] = swapped
+    label = "Automatic plan (estimate)" if auto else "Manual plan"
+    head = f"<strong>{label}:</strong> {resident} of {total_layers} decoder layers on GPU"
+    if swapped > 0:
+        head += f", <strong>{swapped} block-swapped</strong> ({budget.pinned_bytes / _GIB:.1f} GiB pinned RAM)"
+    else:
+        head += ", <strong>no block swap</strong>"
+    parts = [
+        head,
+        f"expected peak {budget.expected_peak_bytes / _GIB:.1f} of {budget.free_vram_bytes / _GIB:.1f} GiB free",
+        f"reserve {reserve:.1f} GB",
+    ]
+    if budget.stage_towers:
+        parts.append("audio/vision towers staged on CPU between prefills")
+    line = " · ".join(parts) + f". <span class='vc-help'>Basis: {html.escape(basis)}.</span>"
+    for note in budget.notes[1:]:
+        line += f"<br><span class='vc-warn'>{html.escape(str(note))}</span>"
+    if swapped > 0:
+        line += (
+            "<br><span class='vc-help'>Swapped layers stream from RAM on every token, so decode speed "
+            "falls as the swapped count rises.</span>"
+        )
+    if loaded_variant == variant_key and loaded_summary:
+        loaded_text = _loaded_plan_text(loaded_summary)
+        if loaded_text:
+            line += (
+                f"<br><span class='vc-help'>Loaded now: {html.escape(loaded_text)}; a job reuses the "
+                "resident model while its plan still covers the media.</span>"
+            )
+    return slider, line
+
+
+def _initial_block_swap_note(ctx: "UiContext", variant_key: str, gpu_index: int, tier: int) -> str:
+    """Preview the automatic plan for the build-time defaults of the Model section."""
+
+    try:
+        family = variant_to_family(variant_key)
+        preset = preset_for(family, tier)
+        spec = MODEL_SPECS[family]
+        ping = getattr(ctx.pipeline_client, "ping", None)
+        pong = ping(timeout_s=0.3) if callable(ping) else None
+        _, note = block_swap_preview(
+            variant_key,
+            True,
+            0,
+            gpu_index=int(gpu_index),
+            reserve_gb=preset.offload.vram_reserve_gb,
+            swap_slots=preset.offload.swap_slots,
+            offload_experts=preset.offload.offload_experts,
+            pin_cpu=preset.offload.pin_cpu,
+            fps_value=preset.fps,
+            frames_value=preset.max_frames,
+            pixels_value=preset.max_pixels,
+            output_tokens=preset.max_new_tokens,
+            context_value=spec.limits.context_tokens,
+            duration=0.0,
+            modality="video_audio",
+            pong=pong,
+        )
+        return note
+    except Exception as exc:
+        return f"<span class='vc-help'>Block swap preview unavailable: {html.escape(str(exc))}</span>"
+
+
 def _gpu_inventory() -> tuple[list[Any], int, float, str]:
     from vcap.core.gpu import list_gpus
 
@@ -471,9 +779,18 @@ class CaptionTabHandles:
 
 
 def build(ctx: "UiContext") -> CaptionTabHandles:
-    """Render the complete Caption tab; app assembly wires global handlers later."""
+    """Render the Caption and Processing Pipeline tabs as one linked pair.
+
+    Both tabs share this function's local scope so the pipeline controls stay
+    wired to the same handlers, registry entries, and presets as before; the
+    caller supplies the surrounding ``gr.Tabs`` container. App assembly wires
+    the global (queued) handlers later in :func:`wire`.
+    """
 
     controls: dict[str, Any] = {}
+    # Presets and run metadata written before v1.3.1 stored ``gpu_layers``; translate
+    # it into the block-swap controls whenever such settings are coerced.
+    ctx.settings_registry.add_migration(migrate_legacy_gpu_layers)
     initial_family = variant_to_family(_INITIAL_VARIANT)
     initial_spec = MODEL_SPECS[initial_family]
     initial_prompt = default_preset_for(initial_family, _INITIAL_MODALITY)
@@ -483,879 +800,926 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     data_parallel_gpu_choices = gpu_choices if gpu_total > 0 else []
     detected_tier = auto_tier(gpu_total) if gpu_total else 32
     ctx.states["gpu_index_default"] = gpu_default
-    ctx.states["gpu_index"] = gr.State(gpu_default)
-    prompt_context_state = gr.State([initial_family, _INITIAL_MODALITY])
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=5, min_width=500):
-            media = media_input_block(ctx)
+    with gr.Tab("🎬 Caption", id="caption"):
+        # gr.Tabs() maps its buttons to its direct children, so every component
+        # this function creates - states included - must live inside a gr.Tab.
+        ctx.states["gpu_index"] = gr.State(gpu_default)
+        prompt_context_state = gr.State([initial_family, _INITIAL_MODALITY])
 
-            with gr.Accordion("Trim range", open=False):
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    trim_start = gr.Number(
-                        value=0.0,
-                        minimum=0.0,
-                        step=0.1,
-                        precision=3,
-                        label="Start (seconds)",
-                        info="Applied after any trim made in the media player.",
-                    )
-                    controls["trim_start_s"] = ctx.reg(
-                        "trim_start_s", trim_start, 0.0, section="preprocessing",
-                        description="Start time for numeric trimming in seconds.", kind="float", minimum=0.0,
-                    )
-                    trim_end = gr.Number(
-                        value=None,
-                        minimum=0.0,
-                        step=0.1,
-                        precision=3,
-                        label="End (seconds)",
-                        info="Leave blank to process through the end of the input.",
-                    )
-                    controls["trim_end_s"] = ctx.reg(
-                        "trim_end_s", trim_end, None, section="preprocessing",
-                        description="Optional numeric trim end in seconds.", minimum=0.0,
-                    )
-                gr.Markdown(
-                    "Use the player's built-in trim editor for visual trimming; its edited file becomes the first input automatically.",
-                    elem_classes=["vc-help"],
-                )
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=5, min_width=500):
+                media = media_input_block(ctx)
 
-            with gr.Group(elem_classes=["vc-card", "vc-result-panel"]):
-                gr.Markdown("### Result", elem_classes=["vc-section-title"])
-                caption = gr.Textbox(
-                    label="Caption",
-                    lines=14,
-                    max_lines=14,
-                    buttons=["copy"],
-                    show_label=True,
-                    interactive=False,
-                    autoscroll=True,
-                )
-                with gr.Tabs():
-                    with gr.Tab("JSON"):
-                        structured = gr.JSON(label="Structured result", buttons=["copy"], max_height=410)
-                    with gr.Tab("SRT preview"):
-                        srt = gr.Textbox(
-                            label="Subtitles",
-                            lines=12,
-                            max_lines=16,
-                            buttons=["copy"],
-                            interactive=False,
-                            elem_classes=["vc-mono"],
-                        )
-                    with gr.Tab("Reasoning", visible=False) as reasoning_tab:
-                        reasoning = gr.Textbox(
-                            label="Reasoning",
-                            lines=12,
-                            max_lines=18,
-                            buttons=["copy"],
-                            interactive=False,
-                            elem_classes=["vc-mono"],
-                        )
-                    with gr.Tab("Clips"):
-                        clips = gr.Gallery(
-                            label="Produced clips",
-                            columns=4,
-                            rows=2,
-                            height=330,
-                            object_fit="cover",
-                            allow_preview=True,
-                            type="filepath",
-                            buttons=["download", "fullscreen"],
-                        )
-
-            with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
-                start = action_button("▶ Start Captioning", "emerald", variant="primary", size="lg", scale=3)
-                cancel = action_button(
-                    "⏹ Cancel",
-                    "red",
-                    variant="stop",
-                    size="lg",
-                    scale=2,
-                    elem_id="vc_caption_cancel",
-                    interactive=False,
-                )
-                open_output = action_button("📂 Open Output", "teal", size="md", scale=2)
-                open_caption = action_button("📝 Open Last Caption", "violet", size="md", scale=2)
-                reveal_clip = action_button("🎬 Reveal Clip", "amber", size="md", scale=2)
-            hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")
-            hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
-            cancel_timer = gr.Timer(1.0)
-
-            progress = progress_panel(ctx)
-            item_table = gr.Dataframe(
-                headers=["#", "Input", "Status", "Message", "Elapsed"],
-                value=[],
-                type="array",
-                datatype=["number", "str", "str", "str", "str"],
-                interactive=False,
-                wrap=True,
-                max_height=260,
-                buttons=["copy", "fullscreen"],
-                label="Items",
-            )
-            logs = log_panel(ctx)
-
-        with gr.Column(scale=4, min_width=430):
-            with gr.Accordion("1. Model", open=True):
-                model_key = gr.Dropdown(
-                    choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
-                    value=_INITIAL_VARIANT,
-                    allow_custom_value=True,
-                    label="Model variant",
-                    info="Model family, precision/backend variant, and estimated local checkpoint size.",
-                )
-                controls["model_key"] = ctx.reg(
-                    "model_key", model_key, _INITIAL_VARIANT, section="model",
-                    description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
-                )
-                show_all_variants = gr.Checkbox(
-                    value=False,
-                    label="Show all variants (ignore VRAM tier)",
-                    info="Lists variants above the active VRAM tier; they may require CPU offload or run out of memory.",
-                )
-                controls["show_all_variants"] = ctx.reg(
-                    "show_all_variants", show_all_variants, False, section="model",
-                    description="Show model variants that exceed the active VRAM tier.", kind="bool",
-                )
-                quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
-                    vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
-                    vram_preset = gr.Dropdown(
-                        choices=vram_choices,
-                        value="auto",
-                        label="VRAM preset",
-                        info="Applies a coordinated precision, frame, pixel, token, attention, and offload plan.",
-                    )
-                    controls["vram_preset"] = ctx.reg(
-                        "vram_preset", vram_preset, "auto", section="model",
-                        description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
-                    )
-                    attention = gr.Dropdown(
-                        choices=_attention_choices(),
-                        value="auto",
-                        label="Attention backend",
-                        info="Unavailable optimized backends fall back safely to PyTorch SDPA.",
-                    )
-                    controls["attention_backend"] = ctx.reg(
-                        "attention_backend", attention, "auto", section="model",
-                        description="Requested attention implementation with safe runtime fallback.", choices=ATTENTION_CHOICES, kind="str",
-                    )
-                vram_note = gr.Markdown(
-                    f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
-                )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    gpu_picker = gr.Dropdown(
-                        choices=gpu_choices,
-                        value=gpu_default,
-                        label="GPU",
-                        info="The selected physical GPU is isolated for the caption worker.",
-                    )
-                    controls["gpu_index"] = ctx.reg(
-                        "gpu_index", gpu_picker, gpu_default, section="runtime",
-                        description="Physical NVIDIA GPU index used by the pipeline.", kind="int",
-                        choices=[value for _, value in gpu_choices], in_preset=False,
-                    )
-                    subprocess_mode = gr.Checkbox(
-                        value=True,
-                        label="Subprocess mode",
-                        info="Recommended: isolates CUDA and allows process-tree cancellation.",
-                    )
-                    controls["subprocess_mode"] = ctx.reg(
-                        "subprocess_mode", subprocess_mode, True, section="runtime",
-                        description="Run model inference in an isolated worker process.", kind="bool",
-                    )
-                gpu_indices = gr.CheckboxGroup(
-                    choices=data_parallel_gpu_choices,
-                    value=[],
-                    label="Data-parallel GPUs",
-                    info=(
-                        "Leave empty to use the single GPU above. Selecting 2 or more GPUs splits folder batches "
-                        "across workers, with one model copy loaded per GPU."
-                    ),
-                )
-                controls["gpu_indices"] = ctx.reg(
-                    "gpu_indices", gpu_indices, [], section="runtime",
-                    description="Physical GPU indices used for data-parallel folder batch workers.",
-                    choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
-                )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    keep_loaded = gr.Checkbox(
-                        value=True,
-                        label="Keep model loaded",
-                        info="Reuse the worker and resident model between caption jobs.",
-                    )
-                    controls["keep_model_loaded"] = ctx.reg(
-                        "keep_model_loaded", keep_loaded, True, section="runtime",
-                        description="Keep model weights resident between runs.", kind="bool",
-                    )
-                    idle_minutes = gr.Number(
-                        value=10,
-                        minimum=0,
-                        maximum=1440,
-                        step=1,
-                        precision=1,
-                        label="Idle unload (minutes)",
-                        info="Zero disables automatic idle unload.",
-                    )
-                    controls["idle_unload_minutes"] = ctx.reg(
-                        "idle_unload_minutes", idle_minutes, 10, section="runtime",
-                        description="Minutes before an idle persistent model is unloaded.", kind="float", minimum=0, maximum=1440,
-                    )
-                with gr.Accordion("Offload plan", open=False):
-                    gpu_layers = gr.Dropdown(
-                        choices=["auto", "all", *[str(value) for value in range(0, 49, 4)]],
-                        value="auto",
-                        allow_custom_value=True,
-                        label="Decoder layers on GPU",
-                        info=(
-                            "auto fits the free VRAM minus the reserve; a number keeps that many layers "
-                            "resident and block-swaps the rest from pinned RAM"
-                        ),
-                    )
-                    controls["gpu_layers"] = ctx.reg(
-                        "gpu_layers", gpu_layers, "auto", section="model",
-                        description="Resident decoder layers: automatic fit, all, or an explicit count.",
-                        choices=["auto", "all", *[str(value) for value in range(0, 49, 4)]], kind="str",
-                    )
+                with gr.Accordion("Trim range", open=False):
                     with gr.Row(elem_classes=["vc-compact-row"]):
-                        vram_reserve_gb = gr.Number(
-                            value=2.0,
-                            minimum=0,
-                            maximum=24,
-                            step=0.5,
-                            label="VRAM to keep free (GB)",
-                            info="Dedicated VRAM reserved for activations and runtime peaks.",
+                        trim_start = gr.Number(
+                            value=0.0,
+                            minimum=0.0,
+                            step=0.1,
+                            precision=3,
+                            label="Start (seconds)",
+                            info="Applied after any trim made in the media player.",
                         )
-                        controls["vram_reserve_gb"] = ctx.reg(
-                            "vram_reserve_gb", vram_reserve_gb, 2.0, section="model",
-                            description="Dedicated VRAM kept free at the expected generation peak.",
-                            kind="float", minimum=0, maximum=24,
+                        controls["trim_start_s"] = ctx.reg(
+                            "trim_start_s", trim_start, 0.0, section="preprocessing",
+                            description="Start time for numeric trimming in seconds.", kind="float", minimum=0.0,
                         )
-                        swap_slots = gr.Dropdown(
-                            choices=[2, 3],
-                            value=2,
-                            label="Swap slots",
-                            info="Advanced: GPU staging slots used to prefetch swapped decoder layers.",
+                        trim_end = gr.Number(
+                            value=None,
+                            minimum=0.0,
+                            step=0.1,
+                            precision=3,
+                            label="End (seconds)",
+                            info="Leave blank to process through the end of the input.",
                         )
-                        controls["swap_slots"] = ctx.reg(
-                            "swap_slots", swap_slots, 2, section="model",
-                            description="GPU staging slots allocated for decoder block swap.",
-                            choices=[2, 3], kind="int",
+                        controls["trim_end_s"] = ctx.reg(
+                            "trim_end_s", trim_end, None, section="preprocessing",
+                            description="Optional numeric trim end in seconds.", minimum=0.0,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        offload_experts = gr.Checkbox(
-                            value=False,
-                            label="Offload MoE experts",
-                            info="Legacy Accelerate expert offload; disables block swap",
-                        )
-                        controls["offload_experts"] = ctx.reg(
-                            "offload_experts", offload_experts, False, section="model",
-                            description="Use legacy Accelerate expert offload instead of block swap.", kind="bool",
-                        )
-                        pin_cpu = gr.Checkbox(
-                            value=True,
-                            label="Pin swapped layers in RAM",
-                            info="Use pinned host memory for faster decoder-layer transfers.",
-                        )
-                        controls["pin_cpu"] = ctx.reg(
-                            "pin_cpu", pin_cpu, True, section="model",
-                            description="Pin block-swapped decoder layers in host memory.", kind="bool",
-                        )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    compile_enabled = gr.Checkbox(
-                        value=False,
-                        label="torch.compile",
-                        info=(
-                            "The first generation can spend 1–5 minutes compiling kernels; later runs reuse them. "
-                            "A compile runtime failure restores the loaded model and retries that segment eagerly."
-                        ),
+                    gr.Markdown(
+                        "Use the player's built-in trim editor for visual trimming; its edited file becomes the first input automatically.",
+                        elem_classes=["vc-help"],
                     )
-                    controls["torch_compile"] = ctx.reg(
-                        "torch_compile", compile_enabled, False, section="runtime",
-                        description="Compile the language model forward pass with safe fallbacks.", kind="bool",
-                    )
-                    compile_mode = gr.Dropdown(
-                        choices=compile_mode_choices(),
-                        value=DEFAULT_COMPILE_MODE,
-                        label="Compile mode",
-                        info=(
-                            "Both choices avoid explicit CUDA graph replay, which is incompatible with the "
-                            "DynamicCache used by these decoders. Max autotune has a longer first run."
-                        ),
-                    )
-                    controls["torch_compile_mode"] = ctx.reg(
-                        "torch_compile_mode", compile_mode, DEFAULT_COMPILE_MODE, section="runtime",
-                        description="Requested torch.compile tuning mode.",
-                        choices=list(compile_mode_values()), kind="str",
-                    )
-                compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
-                compile_probe_timer = gr.Timer(1.0)
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    download = action_button("📥 Download / Verify model", "sky", size="md", scale=3)
-                    refresh_ready = action_button("↻ Refresh", "lime", size="md", scale=1)
-                    clear_compile = action_button("⌫ Clear compile caches", "rose", size="md", scale=2)
-                ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
 
-            with gr.Accordion("2. Task & Prompt", open=True):
-                prompt_preset = gr.Dropdown(
-                    choices=_prompt_choices(initial_family, _INITIAL_MODALITY),
-                    value=initial_prompt.id,
-                    allow_custom_value=True,
-                    label="Task / prompt preset",
-                    info="Filtered to the selected model family and first input modality.",
-                )
-                controls["prompt_preset_id"] = ctx.reg(
-                    "prompt_preset_id", prompt_preset, initial_prompt.id, section="prompt",
-                    description="Built-in task and prompt preset identifier.", kind="str",
-                )
-                prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
-                system_prompt = gr.Textbox(
-                    value=initial_system or "",
-                    label="System prompt",
-                    info="Optional system instruction sent before the user request.",
-                    lines=4,
-                    max_lines=8,
-                    elem_classes=["vc-mono"],
-                )
-                controls["system_prompt"] = ctx.reg(
-                    "system_prompt", system_prompt, initial_system, section="prompt",
-                    description="Rendered or custom system instruction.",
-                )
-                user_prompt = gr.Textbox(
-                    value=initial_user,
-                    label="User prompt",
-                    info="The complete model request after template variables are rendered.",
-                    lines=10,
-                    max_lines=16,
-                    elem_classes=["vc-mono"],
-                )
-                controls["user_prompt"] = ctx.reg(
-                    "user_prompt", user_prompt, initial_user, section="prompt",
-                    description="Rendered or custom user instruction.", kind="str",
-                )
-                with gr.Accordion("Template variables", open=False):
-                    trigger_word = gr.Textbox(
-                        value="ohwx",
-                        label="Trigger word",
-                        info="Concept token used in prompt templates and optional caption injection.",
+                with gr.Group(elem_classes=["vc-card", "vc-result-panel"]):
+                    gr.Markdown("### Result", elem_classes=["vc-section-title"])
+                    caption = gr.Textbox(
+                        label="Caption",
+                        lines=14,
+                        max_lines=14,
+                        buttons=["copy"],
+                        show_label=True,
+                        interactive=False,
+                        autoscroll=True,
                     )
-                    controls["trigger_word"] = ctx.reg(
-                        "trigger_word", trigger_word, "ohwx", section="prompt",
-                        description="Concept trigger token used by templates and post-processing.", kind="str",
-                    )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        language = gr.Textbox(value="English", label="Caption language", info="Requested caption language.")
-                        controls["language"] = ctx.reg(
-                            "language", language, "English", section="prompt",
-                            description="Requested caption language.", kind="str",
-                        )
-                        source_language = gr.Textbox(value="English", label="Source language", info="Spoken language in the source audio.")
-                        controls["source_language"] = ctx.reg(
-                            "source_language", source_language, "English", section="prompt",
-                            description="Language spoken in source audio.", kind="str",
-                        )
-                        target_language = gr.Textbox(value="English", label="Target language", info="Translation target language.")
-                        controls["target_language"] = ctx.reg(
-                            "target_language", target_language, "English", section="prompt",
-                            description="Target language for translation tasks.", kind="str",
-                        )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        caption_length = gr.Dropdown(
-                            choices=["short", "medium", "detailed", "very detailed"],
-                            value="detailed",
-                            allow_custom_value=True,
-                            label="Caption length",
-                            info="Natural-language detail target inserted into compatible templates.",
-                        )
-                        controls["caption_length"] = ctx.reg(
-                            "caption_length", caption_length, "detailed", section="prompt",
-                            description="Requested caption length or detail level.", kind="str",
-                        )
-                        subject_class = gr.Textbox(value="person", label="Subject class", info="Generic identity class for LoRA captions.")
-                        controls["subject_class"] = ctx.reg(
-                            "subject_class", subject_class, "person", section="prompt",
-                            description="Generic class noun used by character training prompts.", kind="str",
-                        )
-                    avoid_list = gr.Textbox(
-                        value="",
-                        label="Avoid list",
-                        info="Concepts the generated caption should not mention.",
-                        lines=2,
-                    )
-                    controls["avoid_list"] = ctx.reg(
-                        "avoid_list", avoid_list, "", section="prompt",
-                        description="Comma-separated concepts excluded by compatible prompt templates.", kind="str",
-                    )
-                    extra_instructions = gr.Textbox(
-                        value="",
-                        label="Extra instructions",
-                        info="Optional task-specific directions appended by compatible templates.",
-                        lines=3,
-                    )
-                    controls["extra_instructions"] = ctx.reg(
-                        "extra_instructions", extra_instructions, "", section="prompt",
-                        description="Additional task instructions inserted into prompt templates.", kind="str",
-                    )
-                reset_prompts = action_button("↺ Reset prompts to preset", "purple", size="md")
+                    with gr.Tabs():
+                        with gr.Tab("JSON"):
+                            structured = gr.JSON(label="Structured result", buttons=["copy"], max_height=410)
+                        with gr.Tab("SRT preview"):
+                            srt = gr.Textbox(
+                                label="Subtitles",
+                                lines=12,
+                                max_lines=16,
+                                buttons=["copy"],
+                                interactive=False,
+                                elem_classes=["vc-mono"],
+                            )
+                        with gr.Tab("Reasoning", visible=False) as reasoning_tab:
+                            reasoning = gr.Textbox(
+                                label="Reasoning",
+                                lines=12,
+                                max_lines=18,
+                                buttons=["copy"],
+                                interactive=False,
+                                elem_classes=["vc-mono"],
+                            )
+                        with gr.Tab("Clips"):
+                            clips = gr.Gallery(
+                                label="Produced clips",
+                                columns=4,
+                                rows=2,
+                                height=330,
+                                object_fit="cover",
+                                allow_preview=True,
+                                type="filepath",
+                                buttons=["download", "fullscreen"],
+                            )
 
-            schema = {item.name: item for item in initial_spec.param_schema}
-            with gr.Accordion("3. Generation", open=True):
-                temperature = gr.Slider(
-                    0.0, 2.0, value=float(schema["temperature"].default), step=0.01,
-                    label="Temperature", info=schema["temperature"].description, buttons=["reset"],
-                )
-                controls["temperature"] = ctx.reg(
-                    "temperature", temperature, float(schema["temperature"].default), section="generation",
-                    description=schema["temperature"].description, kind="float", minimum=0, maximum=2,
-                )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    top_p = gr.Slider(0, 1, value=float(schema["top_p"].default), step=0.01, label="Top-p", info=schema["top_p"].description)
-                    controls["top_p"] = ctx.reg(
-                        "top_p", top_p, float(schema["top_p"].default), section="generation",
-                        description=schema["top_p"].description, kind="float", minimum=0, maximum=1,
-                    )
-                    top_k = gr.Slider(0, 200, value=int(schema["top_k"].default), step=1, precision=0, label="Top-k", info=schema["top_k"].description)
-                    controls["top_k"] = ctx.reg(
-                        "top_k", top_k, int(schema["top_k"].default), section="generation",
-                        description=schema["top_k"].description, kind="int", minimum=0, maximum=200,
-                    )
-                repetition = gr.Slider(
-                    0.5, 2.0, value=float(schema["repetition_penalty"].default), step=0.01,
-                    label="Repetition penalty", info=schema["repetition_penalty"].description,
-                )
-                controls["repetition_penalty"] = ctx.reg(
-                    "repetition_penalty", repetition, float(schema["repetition_penalty"].default), section="generation",
-                    description=schema["repetition_penalty"].description, kind="float", minimum=0.5, maximum=2,
-                )
-                max_new_tokens = gr.Slider(
-                    1,
-                    _GLOBAL_MAX_NEW_TOKENS,
-                    value=int(schema["max_new_tokens"].default),
-                    step=1,
-                    precision=0,
-                    label="Maximum new tokens",
-                    info=schema["max_new_tokens"].description,
-                )
-                controls["max_new_tokens"] = ctx.reg(
-                    "max_new_tokens", max_new_tokens, int(schema["max_new_tokens"].default), section="generation",
-                    description=schema["max_new_tokens"].description, kind="int", minimum=1, maximum=32768,
-                )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    do_sample = gr.Checkbox(
-                        value=bool(schema["do_sample"].default),
-                        label="Sample tokens",
-                        info="Prompt presets set this automatically; disable for deterministic greedy decoding.",
-                    )
-                    controls["do_sample"] = ctx.reg(
-                        "do_sample", do_sample, bool(schema["do_sample"].default), section="generation",
-                        description=schema["do_sample"].description, kind="bool",
-                    )
-                    use_cache = gr.Checkbox(
-                        value=True,
-                        label="Use KV cache",
-                        info="Speeds autoregressive decoding at the cost of additional VRAM.",
-                    )
-                    controls["use_cache"] = ctx.reg(
-                        "use_cache", use_cache, True, section="generation",
-                        description="Use the model key/value cache during generation.", kind="bool",
-                    )
-                    enable_thinking = gr.Checkbox(
-                        value=False,
-                        label="Enable thinking",
-                        info="Available only for the Qwen3-Omni Thinking family.",
+                with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
+                    start = action_button("▶ Start Captioning", "emerald", variant="primary", size="lg", scale=3)
+                    cancel = action_button(
+                        "⏹ Cancel",
+                        "red",
+                        variant="stop",
+                        size="lg",
+                        scale=2,
+                        elem_id="vc_caption_cancel",
                         interactive=False,
                     )
-                    controls["enable_thinking"] = ctx.reg(
-                        "enable_thinking", enable_thinking, False, section="generation",
-                        description="Allow the Thinking model to emit a reasoning section.", kind="bool",
-                    )
-                sample_note = gr.Markdown(
-                    "<span class='vc-help'>Sampling is controlled explicitly and may also be overridden by a task preset.</span>"
-                )
+                    open_output = action_button("📂 Open Output", "teal", size="md", scale=2)
+                    open_caption = action_button("📝 Open Last Caption", "violet", size="md", scale=2)
+                    reveal_clip = action_button("🎬 Reveal Clip", "amber", size="md", scale=2)
+                hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")
+                hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
+                cancel_timer = gr.Timer(1.0)
 
-            with gr.Accordion("4. Preprocessing", open=False):
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    fps = gr.Number(
-                        value=initial_spec.limits.default_fps,
-                        minimum=0.25,
-                        maximum=8.0,
-                        step=0.25,
-                        label="Sampling FPS",
-                        info="Actual visual sampling rate passed to the processor.",
-                    )
-                    controls["fps"] = ctx.reg(
-                        "fps", fps, initial_spec.limits.default_fps, section="preprocessing",
-                        description="Video frames sampled per source second.", kind="float", minimum=0.25, maximum=8,
-                    )
-                    max_frames = gr.Number(
-                        value=initial_spec.limits.max_frames or 768,
-                        minimum=0,
-                        maximum=768,
-                        step=2,
-                        precision=0,
-                        label="Maximum frames",
-                        info="Hard cap applied after sampling; zero is valid for audio-only presets.",
-                    )
-                    controls["max_frames"] = ctx.reg(
-                        "max_frames", max_frames, initial_spec.limits.max_frames or 768, section="preprocessing",
-                        description="Maximum decoded frames supplied to the processor; zero disables visual frames for audio workflows.", kind="int", minimum=0, maximum=768,
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    resolution_preset = gr.Dropdown(
-                        choices=[
-                            ("TimeChat default · 297,920", "297920"),
-                            ("AVoCaDO default · 401,408", "401408"),
-                            ("Qwen3 · 256·32·32", "262144"),
-                            ("Low VRAM · 128·32·32", "131072"),
-                            ("Custom", "custom"),
-                        ],
-                        value="262144",
-                        label="Pixel preset",
-                        info="Sets the maximum resized area per decoded frame.",
-                    )
-                    controls["resolution_preset"] = ctx.reg(
-                        "resolution_preset", resolution_preset, "262144", section="preprocessing",
-                        description="Convenient model-aware maximum-pixel preset.",
-                        choices=["297920", "401408", "262144", "131072", "custom"], kind="str",
-                    )
-                    max_pixels = gr.Number(
-                        value=initial_spec.limits.default_max_pixels,
-                        minimum=4 * 28 * 28,
-                        maximum=1280 * 32 * 32,
-                        step=1024,
-                        precision=0,
-                        label="Maximum pixels",
-                        info="Maximum resized frame area while preserving aspect ratio.",
-                    )
-                    controls["max_pixels"] = ctx.reg(
-                        "max_pixels", max_pixels, initial_spec.limits.default_max_pixels, section="preprocessing",
-                        description="Maximum resized pixel area for every sampled frame.", kind="int", minimum=3136, maximum=1310720,
-                    )
-                    min_pixels = gr.Number(
-                        value=initial_spec.limits.min_pixels,
-                        minimum=4 * 28 * 28,
-                        maximum=1280 * 32 * 32,
-                        step=1024,
-                        precision=0,
-                        label="Minimum pixels",
-                        info="Lower bound used by the model-aware smart resize rule.",
-                    )
-                    controls["min_pixels"] = ctx.reg(
-                        "min_pixels", min_pixels, initial_spec.limits.min_pixels, section="preprocessing",
-                        description="Minimum resized pixel area for every sampled frame.", kind="int", minimum=3136, maximum=1310720,
-                    )
-                sampling = gr.Dropdown(
-                    choices=[
-                        ("Target FPS", "fps"),
-                        ("Uniform across duration", "uniform"),
-                        ("Keyframe biased", "keyframe"),
-                        ("Adaptive motion", "adaptive"),
-                    ],
-                    value="fps",
-                    label="Sampling strategy",
-                    info="Controls how the frame budget is distributed over the clip.",
-                )
-                controls["sampling_strategy"] = ctx.reg(
-                    "sampling_strategy", sampling, "fps", section="preprocessing",
-                    description="Frame timestamp planning strategy.", choices=["fps", "uniform", "keyframe", "adaptive"], kind="str",
-                )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    normalize_clip = gr.Checkbox(
-                        value=False,
-                        label="Normalize clip",
-                        info="Create deterministic H.264, exact-FPS, model-divisible media before inference.",
-                    )
-                    controls["normalize_clip"] = ctx.reg(
-                        "normalize_clip", normalize_clip, False, section="preprocessing",
-                        description="Normalize video codec, cadence, geometry, and audio before captioning.", kind="bool",
-                    )
-                    use_audio = gr.Checkbox(
-                        value=True,
-                        label="Use video audio",
-                        info="Interleave the video's audio features when supported by the selected model.",
-                    )
-                    controls["use_audio_in_video"] = ctx.reg(
-                        "use_audio_in_video", use_audio, True, section="preprocessing",
-                        description="Include and align a video's audio stream with visual tokens.", kind="bool",
-                    )
-                    audio_rate = gr.Dropdown(
-                        choices=[("16 kHz", 16000), ("24 kHz", 24000), ("48 kHz", 48000)],
-                        value=16000,
-                        label="Audio sample rate",
-                        info="Worker extraction rate; 16 kHz is the verified model path.",
-                    )
-                    controls["audio_sample_rate"] = ctx.reg(
-                        "audio_sample_rate", audio_rate, 16000, section="preprocessing",
-                        description="Mono audio extraction sample rate.", choices=[16000, 24000, 48000], kind="int",
-                    )
-                with gr.Accordion("Automatic rejection", open=False):
-                    auto_reject = gr.Checkbox(
-                        value=False,
-                        label="Enable automatic rejection",
-                        info="Analyze split clips and skip those failing any enabled quality rule.",
-                    )
-                    controls["auto_reject_enabled"] = ctx.reg(
-                        "auto_reject_enabled", auto_reject, False, section="preprocessing",
-                        description="Enable clip quality rejection before caption generation.", kind="bool",
-                    )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        reject_min_duration = gr.Number(value=0, minimum=0, step=0.1, label="Minimum duration (s)", info="Reject clips shorter than this; zero disables.")
-                        controls["reject_min_duration_s"] = ctx.reg(
-                            "reject_min_duration_s", reject_min_duration, 0, section="preprocessing",
-                            description="Reject clips shorter than this many seconds.", kind="float", minimum=0,
-                        )
-                        reject_black = gr.Slider(0, 1, value=0.98, step=0.01, label="Maximum black ratio", info="Reject clips with a larger near-black pixel fraction.")
-                        controls["reject_max_black_ratio"] = ctx.reg(
-                            "reject_max_black_ratio", reject_black, 0.98, section="preprocessing",
-                            description="Maximum allowed sampled near-black pixel ratio.", kind="float", minimum=0, maximum=1,
-                        )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        reject_static = gr.Number(value=-1, step=0.1, label="Minimum motion score", info="Reject at or below this frame-difference score; -1 disables.")
-                        controls["reject_max_static_score"] = ctx.reg(
-                            "reject_max_static_score", reject_static, -1, section="preprocessing",
-                            description="Reject clips whose sampled motion score is at or below this value.", kind="float",
-                        )
-                        reject_sharp = gr.Number(value=0, minimum=0, step=1, label="Minimum sharpness", info="Reject clips below this Laplacian-variance score; zero disables.")
-                        controls["reject_min_sharpness"] = ctx.reg(
-                            "reject_min_sharpness", reject_sharp, 0, section="preprocessing",
-                            description="Minimum acceptable sampled sharpness score.", kind="float", minimum=0,
-                        )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        reject_audio = gr.Checkbox(value=False, label="Require audio", info="Reject video clips without an audio stream.")
-                        controls["reject_require_audio"] = ctx.reg(
-                            "reject_require_audio", reject_audio, False, section="preprocessing",
-                            description="Reject clips lacking audio.", kind="bool",
-                        )
-                        reject_silence = gr.Slider(0, 1, value=1, step=0.01, label="Maximum silence ratio", info="Reject audio above this sampled silence fraction.")
-                        controls["reject_max_silence_ratio"] = ctx.reg(
-                            "reject_max_silence_ratio", reject_silence, 1, section="preprocessing",
-                            description="Maximum allowed sampled silence ratio.", kind="float", minimum=0, maximum=1,
-                        )
-                token_budget = gr.Markdown("<span class='vc-help'>Upload media to estimate the live token budget.</span>")
-
-            with gr.Accordion("5. Scene detection & splitting", open=False):
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    scene_enabled = gr.Checkbox(
-                        value=True,
-                        label="Enable scene detection",
-                        info="When Scenes mode is selected, find content cuts before captioning.",
-                    )
-                    controls["scene_detect_enabled"] = ctx.reg(
-                        "scene_detect_enabled", scene_enabled, True, section="splitting",
-                        description="Enable PySceneDetect in scene segmentation mode.", kind="bool",
-                    )
-                    segment_mode = gr.Radio(
-                        choices=[("Whole", "whole"), ("Scenes", "scenes"), ("Fixed", "fixed"), ("Trainer", "trainer")],
-                        value="scenes",
-                        label="Mode",
-                        info="Choose whole input, detected scenes, fixed chunks, or trainer-sized clips.",
-                    )
-                    controls["segment_mode"] = ctx.reg(
-                        "segment_mode", segment_mode, "scenes", section="splitting",
-                        description="Segmentation planning mode.", choices=["whole", "scenes", "fixed", "trainer"], kind="str",
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    detector = gr.Dropdown(
-                        choices=[("Content", "content"), ("Adaptive", "adaptive"), ("Threshold / fades", "threshold")],
-                        value="content",
-                        label="Detector",
-                        info="PySceneDetect algorithm used to find boundaries.",
-                    )
-                    controls["scene_detector"] = ctx.reg(
-                        "scene_detector", detector, "content", section="splitting",
-                        description="PySceneDetect boundary detector algorithm.", choices=["content", "adaptive", "threshold"], kind="str",
-                    )
-                    threshold = gr.Slider(0, 100, value=27, step=0.1, label="Threshold", info="Lower detects more cuts; 27 is the content-detector default.")
-                    controls["scene_threshold"] = ctx.reg(
-                        "scene_threshold", threshold, 27, section="splitting",
-                        description="Scene-change detection sensitivity threshold.", kind="float", minimum=0, maximum=100,
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    scene_min = gr.Number(value=2, minimum=0, step=0.1, label="Minimum scene (s)", info="Minimum detector scene duration.")
-                    controls["scene_min_len_s"] = ctx.reg(
-                        "scene_min_len_s", scene_min, 2, section="splitting",
-                        description="Minimum detected scene length in seconds.", kind="float", minimum=0,
-                    )
-                    scene_max = gr.Number(value=60, minimum=0, step=1, label="Maximum scene (s)", info="Split longer scenes; zero leaves them uncapped before the model limit.")
-                    controls["scene_max_len_s"] = ctx.reg(
-                        "scene_max_len_s", scene_max, 60, section="splitting",
-                        description="Maximum scene length before additional splitting.", kind="float", minimum=0,
-                    )
-                    merge_below = gr.Number(value=2, minimum=0, step=0.1, label="Merge below (s)", info="Merge shorter scenes into their nearest neighbor.")
-                    controls["merge_below_s"] = ctx.reg(
-                        "merge_below_s", merge_below, 2, section="splitting",
-                        description="Duration threshold used when merging short scenes.", kind="float", minimum=0,
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    merge_short = gr.Checkbox(value=True, label="Merge short scenes", info="Combine detected scenes shorter than the merge threshold.")
-                    controls["merge_short_scenes"] = ctx.reg(
-                        "merge_short_scenes", merge_short, True, section="splitting",
-                        description="Merge short scene ranges with an adjacent range.", kind="bool",
-                    )
-                    fade = gr.Checkbox(value=False, label="Detect fades", info="Add threshold-based fade detection to content/adaptive cuts.")
-                    controls["fade_detection"] = ctx.reg(
-                        "fade_detection", fade, False, section="splitting",
-                        description="Detect fades in addition to hard content cuts.", kind="bool",
-                    )
-                    downscale = gr.Number(value=0, minimum=0, maximum=16, step=1, precision=0, label="Detection downscale", info="Zero lets PySceneDetect choose automatically.")
-                    controls["scene_downscale"] = ctx.reg(
-                        "scene_downscale", downscale, 0, section="splitting",
-                        description="Explicit scene-analysis downscale factor; zero is automatic.", kind="int", minimum=0, maximum=16,
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    fixed_chunk = gr.Number(value=30, minimum=0.1, step=0.5, label="Fixed chunk (s)", info="Chunk duration for Fixed mode and custom trainer fallback.")
-                    controls["fixed_chunk_s"] = ctx.reg(
-                        "fixed_chunk_s", fixed_chunk, 30, section="splitting",
-                        description="Fixed segmentation duration in seconds.", kind="float", minimum=0.1,
-                    )
-                    split_mode = gr.Radio(
-                        choices=[("Fast stream copy", "copy"), ("Precise re-encode", "precise")],
-                        value="copy",
-                        label="Cut method",
-                        info="Stream copy is fast; precise mode re-encodes exact boundaries.",
-                    )
-                    controls["split_mode"] = ctx.reg(
-                        "split_mode", split_mode, "copy", section="splitting",
-                        description="Physical clip cutting method.", choices=["copy", "precise"], kind="str",
-                    )
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    max_clip = gr.Number(value=120, minimum=0, step=1, label="Model limit override (s)", info="Zero uses the selected model's computed duration ceiling.")
-                    controls["max_clip_duration_s"] = ctx.reg(
-                        "max_clip_duration_s", max_clip, 120, section="splitting",
-                        description="Maximum clip duration used for automatic model-limit splitting.", kind="float", minimum=0,
-                    )
-                    trainer_target = gr.Dropdown(
-                        choices=[(config["label"], key) for key, config in TRAINER_TARGETS.items()],
-                        value="wan",
-                        label="Trainer target",
-                        info="Uses the trainer's default frame count and FPS to choose clip length.",
-                    )
-                    controls["trainer_target"] = ctx.reg(
-                        "trainer_target", trainer_target, "wan", section="splitting",
-                        description="Target video trainer for trainer-sized sub-splits.", choices=list(TRAINER_TARGETS), kind="str",
-                    )
-                    overlap = gr.Dropdown(
-                        choices=[("No overlap", 0.0), ("0.5 seconds", 0.5), ("1 second", 1.0)],
-                        value=0.5,
-                        label="Sub-split overlap",
-                        info="Overlap between model-limit, fixed, or trainer sub-clips.",
-                    )
-                    controls["sub_split_overlap_s"] = ctx.reg(
-                        "sub_split_overlap_s", overlap, 0.5, section="splitting",
-                        description="Seconds of overlap between adjacent sub-clips.", choices=[0.0, 0.5, 1.0], kind="float",
-                    )
-                save_clips = gr.Checkbox(value=False, label="Save produced clips", info="Persist split clips beside their captions for dataset use.")
-                controls["save_clips"] = ctx.reg(
-                    "save_clips", save_clips, False, section="output",
-                    description="Persist materialized split clips in the output dataset.", kind="bool",
-                )
-                context_carry_over = gr.Checkbox(
-                    value=False,
-                    label="Carry previous chunk context",
-                    info=(
-                        "Feeds the tail of the previous chunk's text into the next chunk prompt for long transcriptions; "
-                        "not used by Captioner or TimeChat."
-                    ),
-                )
-                controls["context_carry_over"] = ctx.reg(
-                    "context_carry_over", context_carry_over, False, section="splitting",
-                    description="Carry the previous transcription chunk's text into the next chunk prompt.", kind="bool",
-                )
-                initial_model_limit = initial_spec.limits.compute_max_duration(
-                    fps=initial_spec.limits.default_fps,
-                    max_pixels=initial_spec.limits.default_max_pixels,
-                    reserve_tokens=int(schema["max_new_tokens"].default),
-                    include_audio=True,
-                )
-                model_limit_info = gr.Markdown(
-                    f"Model-limit auto-split ceiling: **{initial_model_limit:.1f} s** at the current FPS, pixel, audio, and output-token budget.",
-                    elem_classes=["vc-help"],
-                )
-                detect_now = action_button("◫ Detect scenes now (preview)", "indigo", size="md")
-                scene_status = gr.Markdown("<span class='vc-help'>Preview uses the first selected video.</span>")
-                scene_table = gr.Dataframe(
-                    headers=["#", "Start", "End", "Duration", "Warning"],
+                progress = progress_panel(ctx)
+                item_table = gr.Dataframe(
+                    headers=["#", "Input", "Status", "Message", "Elapsed"],
                     value=[],
                     type="array",
-                    datatype=["number", "number", "number", "number", "str"],
+                    datatype=["number", "str", "str", "str", "str"],
                     interactive=False,
-                    max_height=280,
-                    label="Scene preview",
+                    wrap=True,
+                    max_height=260,
                     buttons=["copy", "fullscreen"],
+                    label="Items",
                 )
+                logs = log_panel(ctx)
 
-            with gr.Accordion("6. Post-processing", open=False):
-                with gr.Row(elem_classes=["vc-compact-row"]):
-                    caption_prefix = gr.Textbox(value="", label="Prefix", info="Text prepended to the final model caption.")
-                    controls["caption_prefix"] = ctx.reg(
-                        "caption_prefix", caption_prefix, "", section="postprocessing",
-                        description="Text prepended to finalized captions.", kind="str",
+            with gr.Column(scale=4, min_width=430):
+                with gr.Accordion("1. Model", open=True):
+                    model_key = gr.Dropdown(
+                        choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
+                        value=_INITIAL_VARIANT,
+                        allow_custom_value=True,
+                        label="Model variant",
+                        info="Model family, precision/backend variant, and estimated local checkpoint size.",
                     )
-                    caption_suffix = gr.Textbox(value="", label="Suffix", info="Text appended to the final model caption.")
-                    controls["caption_suffix"] = ctx.reg(
-                        "caption_suffix", caption_suffix, "", section="postprocessing",
-                        description="Text appended to finalized captions.", kind="str",
+                    controls["model_key"] = ctx.reg(
+                        "model_key", model_key, _INITIAL_VARIANT, section="model",
+                        description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
                     )
-                    trigger_mode = gr.Dropdown(
-                        choices=[("Prefix", "prefix"), ("Suffix", "suffix"), ("Prompt only / none", "none")],
-                        value="none",
-                        label="Trigger injection",
-                        info="Places the template trigger word before, after, or outside the saved caption.",
+                    show_all_variants = gr.Checkbox(
+                        value=False,
+                        label="Show all variants (ignore VRAM tier)",
+                        info="Lists variants above the active VRAM tier; they may require CPU offload or run out of memory.",
                     )
-                    controls["trigger_mode"] = ctx.reg(
-                        "trigger_mode", trigger_mode, "none", section="postprocessing",
-                        description="Position where the trigger word is injected into final captions.", choices=["prefix", "suffix", "none"], kind="str",
+                    controls["show_all_variants"] = ctx.reg(
+                        "show_all_variants", show_all_variants, False, section="model",
+                        description="Show model variants that exceed the active VRAM tier.", kind="bool",
                     )
-                gr.Markdown("The **Trigger word** in Template variables is shared with caption injection.", elem_classes=["vc-help"])
-                replacements = replace_words_editor()
-                controls["replace_words"] = ctx.reg(
-                    "replace_words", replacements.text, "", section="postprocessing",
-                    description="One find;replace transformation per line.", kind="str",
-                )
-                controls["replace_case_insensitive"] = ctx.reg(
-                    "replace_case_insensitive", replacements.case_insensitive, True, section="postprocessing",
-                    description="Match replacement rules without case sensitivity.", kind="bool",
-                )
-                controls["replace_whole_words"] = ctx.reg(
-                    "replace_whole_words", replacements.whole_words, True, section="postprocessing",
-                    description="Restrict replacement matches to whole words.", kind="bool",
-                )
-                controls["replace_regex"] = ctx.reg(
-                    "replace_regex", replacements.regex, False, section="postprocessing",
-                    description="Interpret replacement find values as regular expressions.", kind="bool",
-                )
-                collapse = gr.Checkbox(value=False, label="Collapse whitespace", info="Normalize runs of spaces and line breaks in model text before injection.")
-                controls["collapse_whitespace"] = ctx.reg(
-                    "collapse_whitespace", collapse, False, section="postprocessing",
-                    description="Collapse model-caption whitespace before adding prefix and suffix.", kind="bool",
-                )
-                formats = gr.CheckboxGroup(
-                    choices=[("Plain text", "txt"), ("JSON", "json"), ("SRT", "srt"), ("WebVTT", "vtt"), ("Dataset JSONL", "jsonl")],
-                    value=["txt", "json"],
-                    label="Output formats",
-                    info="Plain text is always written even when not explicitly selected.",
-                    show_select_all=True,
-                )
-                controls["output_formats"] = ctx.reg(
-                    "output_formats", formats, ["txt", "json"], section="output",
-                    description="Caption and dataset file formats written for every item.",
-                )
-                save_reasoning = gr.Checkbox(
-                    value=True,
-                    label="Save reasoning",
-                    info="Persist Thinking-model reasoning separately; it remains hidden from the caption.",
-                )
-                controls["save_reasoning"] = ctx.reg(
-                    "save_reasoning", save_reasoning, True, section="output",
-                    description="Write Thinking-model reasoning to a separate text file.", kind="bool",
-                )
+                    quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
+                        vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
+                        vram_preset = gr.Dropdown(
+                            choices=vram_choices,
+                            value="auto",
+                            label="VRAM preset",
+                            info="Applies a coordinated precision, frame, pixel, token, attention, and offload plan.",
+                        )
+                        controls["vram_preset"] = ctx.reg(
+                            "vram_preset", vram_preset, "auto", section="model",
+                            description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
+                        )
+                        attention = gr.Dropdown(
+                            choices=_attention_choices(),
+                            value="auto",
+                            label="Attention backend",
+                            info="Unavailable optimized backends fall back safely to PyTorch SDPA.",
+                        )
+                        controls["attention_backend"] = ctx.reg(
+                            "attention_backend", attention, "auto", section="model",
+                            description="Requested attention implementation with safe runtime fallback.", choices=ATTENTION_CHOICES, kind="str",
+                        )
+                    vram_note = gr.Markdown(
+                        f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
+                    )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        gpu_picker = gr.Dropdown(
+                            choices=gpu_choices,
+                            value=gpu_default,
+                            label="GPU",
+                            info="The selected physical GPU is isolated for the caption worker.",
+                        )
+                        controls["gpu_index"] = ctx.reg(
+                            "gpu_index", gpu_picker, gpu_default, section="runtime",
+                            description="Physical NVIDIA GPU index used by the pipeline.", kind="int",
+                            choices=[value for _, value in gpu_choices], in_preset=False,
+                        )
+                        subprocess_mode = gr.Checkbox(
+                            value=True,
+                            label="Subprocess mode",
+                            info="Recommended: isolates CUDA and allows process-tree cancellation.",
+                        )
+                        controls["subprocess_mode"] = ctx.reg(
+                            "subprocess_mode", subprocess_mode, True, section="runtime",
+                            description="Run model inference in an isolated worker process.", kind="bool",
+                        )
+                    gpu_indices = gr.CheckboxGroup(
+                        choices=data_parallel_gpu_choices,
+                        value=[],
+                        label="Data-parallel GPUs",
+                        info=(
+                            "Leave empty to use the single GPU above. Selecting 2 or more GPUs splits folder batches "
+                            "across workers, with one model copy loaded per GPU."
+                        ),
+                    )
+                    controls["gpu_indices"] = ctx.reg(
+                        "gpu_indices", gpu_indices, [], section="runtime",
+                        description="Physical GPU indices used for data-parallel folder batch workers.",
+                        choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
+                    )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        keep_loaded = gr.Checkbox(
+                            value=True,
+                            label="Keep model loaded",
+                            info="Reuse the worker and resident model between caption jobs.",
+                        )
+                        controls["keep_model_loaded"] = ctx.reg(
+                            "keep_model_loaded", keep_loaded, True, section="runtime",
+                            description="Keep model weights resident between runs.", kind="bool",
+                        )
+                        idle_minutes = gr.Number(
+                            value=10,
+                            minimum=0,
+                            maximum=1440,
+                            step=1,
+                            precision=1,
+                            label="Idle unload (minutes)",
+                            info="Zero disables automatic idle unload.",
+                        )
+                        controls["idle_unload_minutes"] = ctx.reg(
+                            "idle_unload_minutes", idle_minutes, 10, section="runtime",
+                            description="Minutes before an idle persistent model is unloaded.", kind="float", minimum=0, maximum=1440,
+                        )
+                    with gr.Accordion("Block swap & offload plan", open=True):
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            block_swap_auto = gr.Checkbox(
+                                value=True,
+                                label="Automatic block swap",
+                                info=(
+                                    "Fits the decoder to free VRAM minus the reserve at load time and shows the "
+                                    "resulting swapped-layer count; uncheck to set the count yourself."
+                                ),
+                                scale=2,
+                            )
+                            controls["block_swap_auto"] = ctx.reg(
+                                "block_swap_auto", block_swap_auto, True, section="model",
+                                description="Let the loader choose how many decoder layers to block-swap.", kind="bool",
+                            )
+                            blocks_to_swap = gr.Slider(
+                                minimum=0,
+                                maximum=_BLOCK_SWAP_SLIDER_MAX,
+                                step=1,
+                                value=0,
+                                interactive=False,
+                                label="Decoder layers to block-swap",
+                                info=_blocks_info(family_layer_count(initial_family)),
+                                scale=3,
+                            )
+                            controls["blocks_to_swap"] = ctx.reg(
+                                "blocks_to_swap", blocks_to_swap, 0, section="model",
+                                description="Decoder layers kept in pinned RAM when automatic block swap is off.",
+                                kind="int", minimum=0, maximum=_BLOCK_SWAP_SLIDER_MAX,
+                            )
+                        block_swap_note = gr.Markdown(
+                            _initial_block_swap_note(ctx, _INITIAL_VARIANT, gpu_default, detected_tier),
+                            elem_classes=["vc-status"],
+                        )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            vram_reserve_gb = gr.Number(
+                                value=2.0,
+                                minimum=0,
+                                maximum=24,
+                                step=0.5,
+                                label="VRAM to keep free (GB)",
+                                info="Dedicated VRAM reserved for activations and runtime peaks.",
+                            )
+                            controls["vram_reserve_gb"] = ctx.reg(
+                                "vram_reserve_gb", vram_reserve_gb, 2.0, section="model",
+                                description="Dedicated VRAM kept free at the expected generation peak.",
+                                kind="float", minimum=0, maximum=24,
+                            )
+                            swap_slots = gr.Dropdown(
+                                choices=[2, 3],
+                                value=2,
+                                label="Swap slots",
+                                info="Advanced: GPU staging slots used to prefetch swapped decoder layers.",
+                            )
+                            controls["swap_slots"] = ctx.reg(
+                                "swap_slots", swap_slots, 2, section="model",
+                                description="GPU staging slots allocated for decoder block swap.",
+                                choices=[2, 3], kind="int",
+                            )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            offload_experts = gr.Checkbox(
+                                value=False,
+                                label="Offload MoE experts",
+                                info="Legacy Accelerate expert offload; disables block swap",
+                            )
+                            controls["offload_experts"] = ctx.reg(
+                                "offload_experts", offload_experts, False, section="model",
+                                description="Use legacy Accelerate expert offload instead of block swap.", kind="bool",
+                            )
+                            pin_cpu = gr.Checkbox(
+                                value=True,
+                                label="Pin swapped layers in RAM",
+                                info="Use pinned host memory for faster decoder-layer transfers.",
+                            )
+                            controls["pin_cpu"] = ctx.reg(
+                                "pin_cpu", pin_cpu, True, section="model",
+                                description="Pin block-swapped decoder layers in host memory.", kind="bool",
+                            )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        compile_enabled = gr.Checkbox(
+                            value=False,
+                            label="torch.compile",
+                            info=(
+                                "The first generation can spend 1–5 minutes compiling kernels; later runs reuse them. "
+                                "A compile runtime failure restores the loaded model and retries that segment eagerly."
+                            ),
+                        )
+                        controls["torch_compile"] = ctx.reg(
+                            "torch_compile", compile_enabled, False, section="runtime",
+                            description="Compile the language model forward pass with safe fallbacks.", kind="bool",
+                        )
+                        compile_mode = gr.Dropdown(
+                            choices=compile_mode_choices(),
+                            value=DEFAULT_COMPILE_MODE,
+                            label="Compile mode",
+                            info=(
+                                "Both choices avoid explicit CUDA graph replay, which is incompatible with the "
+                                "DynamicCache used by these decoders. Max autotune has a longer first run."
+                            ),
+                        )
+                        controls["torch_compile_mode"] = ctx.reg(
+                            "torch_compile_mode", compile_mode, DEFAULT_COMPILE_MODE, section="runtime",
+                            description="Requested torch.compile tuning mode.",
+                            choices=list(compile_mode_values()), kind="str",
+                        )
+                    compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
+                    compile_probe_timer = gr.Timer(1.0)
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        download = action_button("📥 Download / Verify model", "sky", size="md", scale=3)
+                        refresh_ready = action_button("↻ Refresh", "lime", size="md", scale=1)
+                        clear_compile = action_button("⌫ Clear compile caches", "rose", size="md", scale=2)
+                    ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
 
-    last_outputs_state = gr.State({})
-    job_done_hook = gr.HTML("", visible=False, elem_id="vcap-job-done-hook")
-    ctx.states["last_outputs"] = last_outputs_state
+                with gr.Accordion("2. Task & Prompt", open=True):
+                    prompt_preset = gr.Dropdown(
+                        choices=_prompt_choices(initial_family, _INITIAL_MODALITY),
+                        value=initial_prompt.id,
+                        allow_custom_value=True,
+                        label="Task / prompt preset",
+                        info="Filtered to the selected model family and first input modality.",
+                    )
+                    controls["prompt_preset_id"] = ctx.reg(
+                        "prompt_preset_id", prompt_preset, initial_prompt.id, section="prompt",
+                        description="Built-in task and prompt preset identifier.", kind="str",
+                    )
+                    prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
+                    system_prompt = gr.Textbox(
+                        value=initial_system or "",
+                        label="System prompt",
+                        info="Optional system instruction sent before the user request.",
+                        lines=4,
+                        max_lines=8,
+                        elem_classes=["vc-mono"],
+                    )
+                    controls["system_prompt"] = ctx.reg(
+                        "system_prompt", system_prompt, initial_system, section="prompt",
+                        description="Rendered or custom system instruction.",
+                    )
+                    user_prompt = gr.Textbox(
+                        value=initial_user,
+                        label="User prompt",
+                        info="The complete model request after template variables are rendered.",
+                        lines=10,
+                        max_lines=16,
+                        elem_classes=["vc-mono"],
+                    )
+                    controls["user_prompt"] = ctx.reg(
+                        "user_prompt", user_prompt, initial_user, section="prompt",
+                        description="Rendered or custom user instruction.", kind="str",
+                    )
+                    with gr.Accordion("Template variables", open=False):
+                        trigger_word = gr.Textbox(
+                            value="ohwx",
+                            label="Trigger word",
+                            info="Concept token used in prompt templates and optional caption injection.",
+                        )
+                        controls["trigger_word"] = ctx.reg(
+                            "trigger_word", trigger_word, "ohwx", section="prompt",
+                            description="Concept trigger token used by templates and post-processing.", kind="str",
+                        )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            language = gr.Textbox(value="English", label="Caption language", info="Requested caption language.")
+                            controls["language"] = ctx.reg(
+                                "language", language, "English", section="prompt",
+                                description="Requested caption language.", kind="str",
+                            )
+                            source_language = gr.Textbox(value="English", label="Source language", info="Spoken language in the source audio.")
+                            controls["source_language"] = ctx.reg(
+                                "source_language", source_language, "English", section="prompt",
+                                description="Language spoken in source audio.", kind="str",
+                            )
+                            target_language = gr.Textbox(value="English", label="Target language", info="Translation target language.")
+                            controls["target_language"] = ctx.reg(
+                                "target_language", target_language, "English", section="prompt",
+                                description="Target language for translation tasks.", kind="str",
+                            )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            caption_length = gr.Dropdown(
+                                choices=["short", "medium", "detailed", "very detailed"],
+                                value="detailed",
+                                allow_custom_value=True,
+                                label="Caption length",
+                                info="Natural-language detail target inserted into compatible templates.",
+                            )
+                            controls["caption_length"] = ctx.reg(
+                                "caption_length", caption_length, "detailed", section="prompt",
+                                description="Requested caption length or detail level.", kind="str",
+                            )
+                            subject_class = gr.Textbox(value="person", label="Subject class", info="Generic identity class for LoRA captions.")
+                            controls["subject_class"] = ctx.reg(
+                                "subject_class", subject_class, "person", section="prompt",
+                                description="Generic class noun used by character training prompts.", kind="str",
+                            )
+                        avoid_list = gr.Textbox(
+                            value="",
+                            label="Avoid list",
+                            info="Concepts the generated caption should not mention.",
+                            lines=2,
+                        )
+                        controls["avoid_list"] = ctx.reg(
+                            "avoid_list", avoid_list, "", section="prompt",
+                            description="Comma-separated concepts excluded by compatible prompt templates.", kind="str",
+                        )
+                        extra_instructions = gr.Textbox(
+                            value="",
+                            label="Extra instructions",
+                            info="Optional task-specific directions appended by compatible templates.",
+                            lines=3,
+                        )
+                        controls["extra_instructions"] = ctx.reg(
+                            "extra_instructions", extra_instructions, "", section="prompt",
+                            description="Additional task instructions inserted into prompt templates.", kind="str",
+                        )
+                    reset_prompts = action_button("↺ Reset prompts to preset", "purple", size="md")
+
+                schema = {item.name: item for item in initial_spec.param_schema}
+                with gr.Accordion("3. Generation", open=True):
+                    temperature = gr.Slider(
+                        0.0, 2.0, value=float(schema["temperature"].default), step=0.01,
+                        label="Temperature", info=schema["temperature"].description, buttons=["reset"],
+                    )
+                    controls["temperature"] = ctx.reg(
+                        "temperature", temperature, float(schema["temperature"].default), section="generation",
+                        description=schema["temperature"].description, kind="float", minimum=0, maximum=2,
+                    )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        top_p = gr.Slider(0, 1, value=float(schema["top_p"].default), step=0.01, label="Top-p", info=schema["top_p"].description)
+                        controls["top_p"] = ctx.reg(
+                            "top_p", top_p, float(schema["top_p"].default), section="generation",
+                            description=schema["top_p"].description, kind="float", minimum=0, maximum=1,
+                        )
+                        top_k = gr.Slider(0, 200, value=int(schema["top_k"].default), step=1, precision=0, label="Top-k", info=schema["top_k"].description)
+                        controls["top_k"] = ctx.reg(
+                            "top_k", top_k, int(schema["top_k"].default), section="generation",
+                            description=schema["top_k"].description, kind="int", minimum=0, maximum=200,
+                        )
+                    repetition = gr.Slider(
+                        0.5, 2.0, value=float(schema["repetition_penalty"].default), step=0.01,
+                        label="Repetition penalty", info=schema["repetition_penalty"].description,
+                    )
+                    controls["repetition_penalty"] = ctx.reg(
+                        "repetition_penalty", repetition, float(schema["repetition_penalty"].default), section="generation",
+                        description=schema["repetition_penalty"].description, kind="float", minimum=0.5, maximum=2,
+                    )
+                    max_new_tokens = gr.Slider(
+                        1,
+                        _GLOBAL_MAX_NEW_TOKENS,
+                        value=int(schema["max_new_tokens"].default),
+                        step=1,
+                        precision=0,
+                        label="Maximum new tokens",
+                        info=schema["max_new_tokens"].description,
+                    )
+                    controls["max_new_tokens"] = ctx.reg(
+                        "max_new_tokens", max_new_tokens, int(schema["max_new_tokens"].default), section="generation",
+                        description=schema["max_new_tokens"].description, kind="int", minimum=1, maximum=32768,
+                    )
+                    context_tokens = gr.Number(
+                        value=int(initial_spec.limits.context_tokens),
+                        minimum=1024,
+                        maximum=_GLOBAL_MAX_CONTEXT,
+                        step=256,
+                        precision=0,
+                        label="Context length (tokens)",
+                        info=_context_info(initial_spec),
+                    )
+                    controls["context_tokens"] = ctx.reg(
+                        "context_tokens", context_tokens, int(initial_spec.limits.context_tokens), section="generation",
+                        description=(
+                            "Requested context window in tokens; capped by the selected model and, for GGUF, "
+                            "by the VRAM tier and llama.cpp's memory fitter."
+                        ),
+                        kind="int", minimum=1024, maximum=_GLOBAL_MAX_CONTEXT,
+                    )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        do_sample = gr.Checkbox(
+                            value=bool(schema["do_sample"].default),
+                            label="Sample tokens",
+                            info="Prompt presets set this automatically; disable for deterministic greedy decoding.",
+                        )
+                        controls["do_sample"] = ctx.reg(
+                            "do_sample", do_sample, bool(schema["do_sample"].default), section="generation",
+                            description=schema["do_sample"].description, kind="bool",
+                        )
+                        use_cache = gr.Checkbox(
+                            value=True,
+                            label="Use KV cache",
+                            info="Speeds autoregressive decoding at the cost of additional VRAM.",
+                        )
+                        controls["use_cache"] = ctx.reg(
+                            "use_cache", use_cache, True, section="generation",
+                            description="Use the model key/value cache during generation.", kind="bool",
+                        )
+                        enable_thinking = gr.Checkbox(
+                            value=False,
+                            label="Enable thinking",
+                            info="Available only for the Qwen3-Omni Thinking family.",
+                            interactive=False,
+                        )
+                        controls["enable_thinking"] = ctx.reg(
+                            "enable_thinking", enable_thinking, False, section="generation",
+                            description="Allow the Thinking model to emit a reasoning section.", kind="bool",
+                        )
+                    sample_note = gr.Markdown(
+                        "<span class='vc-help'>Sampling is controlled explicitly and may also be overridden by a task preset.</span>"
+                    )
+
+        last_outputs_state = gr.State({})
+        job_done_hook = gr.HTML("", visible=False, elem_id="vcap-job-done-hook")
+        ctx.states["last_outputs"] = last_outputs_state
+
+    with gr.Tab("🎞️ Processing Pipeline", id="processing"):
+        gr.Markdown(
+            "Frame sampling, scene splitting, and caption text shaping for every Caption tab run. "
+            "These controls are saved, loaded, and recovered with presets exactly like the Caption tab.",
+            elem_classes=["vc-help"],
+        )
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1, min_width=380):
+                with gr.Accordion("4. Preprocessing", open=True):
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        fps = gr.Number(
+                            value=initial_spec.limits.default_fps,
+                            minimum=0.25,
+                            maximum=8.0,
+                            step=0.25,
+                            label="Sampling FPS",
+                            info="Actual visual sampling rate passed to the processor.",
+                        )
+                        controls["fps"] = ctx.reg(
+                            "fps", fps, initial_spec.limits.default_fps, section="preprocessing",
+                            description="Video frames sampled per source second.", kind="float", minimum=0.25, maximum=8,
+                        )
+                        max_frames = gr.Number(
+                            value=initial_spec.limits.max_frames or 768,
+                            minimum=0,
+                            maximum=_GLOBAL_MAX_FRAMES,
+                            step=2,
+                            precision=0,
+                            label="Maximum frames",
+                            info=_frames_info(initial_spec),
+                        )
+                        controls["max_frames"] = ctx.reg(
+                            "max_frames", max_frames, initial_spec.limits.max_frames or 768, section="preprocessing",
+                            description="Maximum decoded frames supplied to the processor; zero disables visual frames for audio workflows.", kind="int", minimum=0, maximum=_GLOBAL_MAX_FRAMES,
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        resolution_preset = gr.Dropdown(
+                            choices=[
+                                ("TimeChat default · 297,920", "297920"),
+                                ("AVoCaDO default · 401,408", "401408"),
+                                ("Qwen3 · 256·32·32", "262144"),
+                                ("Low VRAM · 128·32·32", "131072"),
+                                ("Custom", "custom"),
+                            ],
+                            value="262144",
+                            label="Pixel preset",
+                            info="Sets the maximum resized area per decoded frame.",
+                        )
+                        controls["resolution_preset"] = ctx.reg(
+                            "resolution_preset", resolution_preset, "262144", section="preprocessing",
+                            description="Convenient model-aware maximum-pixel preset.",
+                            choices=["297920", "401408", "262144", "131072", "custom"], kind="str",
+                        )
+                        max_pixels = gr.Number(
+                            value=initial_spec.limits.default_max_pixels,
+                            minimum=4 * 28 * 28,
+                            maximum=1280 * 32 * 32,
+                            step=1024,
+                            precision=0,
+                            label="Maximum pixels",
+                            info="Maximum resized frame area while preserving aspect ratio.",
+                        )
+                        controls["max_pixels"] = ctx.reg(
+                            "max_pixels", max_pixels, initial_spec.limits.default_max_pixels, section="preprocessing",
+                            description="Maximum resized pixel area for every sampled frame.", kind="int", minimum=3136, maximum=1310720,
+                        )
+                        min_pixels = gr.Number(
+                            value=initial_spec.limits.min_pixels,
+                            minimum=4 * 28 * 28,
+                            maximum=1280 * 32 * 32,
+                            step=1024,
+                            precision=0,
+                            label="Minimum pixels",
+                            info="Lower bound used by the model-aware smart resize rule.",
+                        )
+                        controls["min_pixels"] = ctx.reg(
+                            "min_pixels", min_pixels, initial_spec.limits.min_pixels, section="preprocessing",
+                            description="Minimum resized pixel area for every sampled frame.", kind="int", minimum=3136, maximum=1310720,
+                        )
+                    sampling = gr.Dropdown(
+                        choices=[
+                            ("Target FPS", "fps"),
+                            ("Uniform across duration", "uniform"),
+                            ("Keyframe biased", "keyframe"),
+                            ("Adaptive motion", "adaptive"),
+                        ],
+                        value="fps",
+                        label="Sampling strategy",
+                        info="Controls how the frame budget is distributed over the clip.",
+                    )
+                    controls["sampling_strategy"] = ctx.reg(
+                        "sampling_strategy", sampling, "fps", section="preprocessing",
+                        description="Frame timestamp planning strategy.", choices=["fps", "uniform", "keyframe", "adaptive"], kind="str",
+                    )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        normalize_clip = gr.Checkbox(
+                            value=False,
+                            label="Normalize clip",
+                            info="Create deterministic H.264, exact-FPS, model-divisible media before inference.",
+                        )
+                        controls["normalize_clip"] = ctx.reg(
+                            "normalize_clip", normalize_clip, False, section="preprocessing",
+                            description="Normalize video codec, cadence, geometry, and audio before captioning.", kind="bool",
+                        )
+                        use_audio = gr.Checkbox(
+                            value=True,
+                            label="Use video audio",
+                            info="Interleave the video's audio features when supported by the selected model.",
+                        )
+                        controls["use_audio_in_video"] = ctx.reg(
+                            "use_audio_in_video", use_audio, True, section="preprocessing",
+                            description="Include and align a video's audio stream with visual tokens.", kind="bool",
+                        )
+                        audio_rate = gr.Dropdown(
+                            choices=[("16 kHz", 16000), ("24 kHz", 24000), ("48 kHz", 48000)],
+                            value=16000,
+                            label="Audio sample rate",
+                            info="Worker extraction rate; 16 kHz is the verified model path.",
+                        )
+                        controls["audio_sample_rate"] = ctx.reg(
+                            "audio_sample_rate", audio_rate, 16000, section="preprocessing",
+                            description="Mono audio extraction sample rate.", choices=[16000, 24000, 48000], kind="int",
+                        )
+                    with gr.Accordion("Automatic rejection", open=True):
+                        auto_reject = gr.Checkbox(
+                            value=False,
+                            label="Enable automatic rejection",
+                            info="Analyze split clips and skip those failing any enabled quality rule.",
+                        )
+                        controls["auto_reject_enabled"] = ctx.reg(
+                            "auto_reject_enabled", auto_reject, False, section="preprocessing",
+                            description="Enable clip quality rejection before caption generation.", kind="bool",
+                        )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            reject_min_duration = gr.Number(value=0, minimum=0, step=0.1, label="Minimum duration (s)", info="Reject clips shorter than this; zero disables.")
+                            controls["reject_min_duration_s"] = ctx.reg(
+                                "reject_min_duration_s", reject_min_duration, 0, section="preprocessing",
+                                description="Reject clips shorter than this many seconds.", kind="float", minimum=0,
+                            )
+                            reject_black = gr.Slider(0, 1, value=0.98, step=0.01, label="Maximum black ratio", info="Reject clips with a larger near-black pixel fraction.")
+                            controls["reject_max_black_ratio"] = ctx.reg(
+                                "reject_max_black_ratio", reject_black, 0.98, section="preprocessing",
+                                description="Maximum allowed sampled near-black pixel ratio.", kind="float", minimum=0, maximum=1,
+                            )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            reject_static = gr.Number(value=-1, step=0.1, label="Minimum motion score", info="Reject at or below this frame-difference score; -1 disables.")
+                            controls["reject_max_static_score"] = ctx.reg(
+                                "reject_max_static_score", reject_static, -1, section="preprocessing",
+                                description="Reject clips whose sampled motion score is at or below this value.", kind="float",
+                            )
+                            reject_sharp = gr.Number(value=0, minimum=0, step=1, label="Minimum sharpness", info="Reject clips below this Laplacian-variance score; zero disables.")
+                            controls["reject_min_sharpness"] = ctx.reg(
+                                "reject_min_sharpness", reject_sharp, 0, section="preprocessing",
+                                description="Minimum acceptable sampled sharpness score.", kind="float", minimum=0,
+                            )
+                        with gr.Row(elem_classes=["vc-compact-row"]):
+                            reject_audio = gr.Checkbox(value=False, label="Require audio", info="Reject video clips without an audio stream.")
+                            controls["reject_require_audio"] = ctx.reg(
+                                "reject_require_audio", reject_audio, False, section="preprocessing",
+                                description="Reject clips lacking audio.", kind="bool",
+                            )
+                            reject_silence = gr.Slider(0, 1, value=1, step=0.01, label="Maximum silence ratio", info="Reject audio above this sampled silence fraction.")
+                            controls["reject_max_silence_ratio"] = ctx.reg(
+                                "reject_max_silence_ratio", reject_silence, 1, section="preprocessing",
+                                description="Maximum allowed sampled silence ratio.", kind="float", minimum=0, maximum=1,
+                            )
+                    token_budget = gr.Markdown("<span class='vc-help'>Upload media to estimate the live token budget.</span>")
+            with gr.Column(scale=1, min_width=380):
+                with gr.Accordion("5. Scene detection & splitting", open=True):
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        scene_enabled = gr.Checkbox(
+                            value=True,
+                            label="Enable scene detection",
+                            info="When Scenes mode is selected, find content cuts before captioning.",
+                        )
+                        controls["scene_detect_enabled"] = ctx.reg(
+                            "scene_detect_enabled", scene_enabled, True, section="splitting",
+                            description="Enable PySceneDetect in scene segmentation mode.", kind="bool",
+                        )
+                        segment_mode = gr.Radio(
+                            choices=[("Whole", "whole"), ("Scenes", "scenes"), ("Fixed", "fixed"), ("Trainer", "trainer")],
+                            value="scenes",
+                            label="Mode",
+                            info="Choose whole input, detected scenes, fixed chunks, or trainer-sized clips.",
+                        )
+                        controls["segment_mode"] = ctx.reg(
+                            "segment_mode", segment_mode, "scenes", section="splitting",
+                            description="Segmentation planning mode.", choices=["whole", "scenes", "fixed", "trainer"], kind="str",
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        detector = gr.Dropdown(
+                            choices=[("Content", "content"), ("Adaptive", "adaptive"), ("Threshold / fades", "threshold")],
+                            value="content",
+                            label="Detector",
+                            info="PySceneDetect algorithm used to find boundaries.",
+                        )
+                        controls["scene_detector"] = ctx.reg(
+                            "scene_detector", detector, "content", section="splitting",
+                            description="PySceneDetect boundary detector algorithm.", choices=["content", "adaptive", "threshold"], kind="str",
+                        )
+                        threshold = gr.Slider(0, 100, value=27, step=0.1, label="Threshold", info="Lower detects more cuts; 27 is the content-detector default.")
+                        controls["scene_threshold"] = ctx.reg(
+                            "scene_threshold", threshold, 27, section="splitting",
+                            description="Scene-change detection sensitivity threshold.", kind="float", minimum=0, maximum=100,
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        scene_min = gr.Number(value=2, minimum=0, step=0.1, label="Minimum scene (s)", info="Minimum detector scene duration.")
+                        controls["scene_min_len_s"] = ctx.reg(
+                            "scene_min_len_s", scene_min, 2, section="splitting",
+                            description="Minimum detected scene length in seconds.", kind="float", minimum=0,
+                        )
+                        scene_max = gr.Number(value=60, minimum=0, step=1, label="Maximum scene (s)", info="Split longer scenes; zero leaves them uncapped before the model limit.")
+                        controls["scene_max_len_s"] = ctx.reg(
+                            "scene_max_len_s", scene_max, 60, section="splitting",
+                            description="Maximum scene length before additional splitting.", kind="float", minimum=0,
+                        )
+                        merge_below = gr.Number(value=2, minimum=0, step=0.1, label="Merge below (s)", info="Merge shorter scenes into their nearest neighbor.")
+                        controls["merge_below_s"] = ctx.reg(
+                            "merge_below_s", merge_below, 2, section="splitting",
+                            description="Duration threshold used when merging short scenes.", kind="float", minimum=0,
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        merge_short = gr.Checkbox(value=True, label="Merge short scenes", info="Combine detected scenes shorter than the merge threshold.")
+                        controls["merge_short_scenes"] = ctx.reg(
+                            "merge_short_scenes", merge_short, True, section="splitting",
+                            description="Merge short scene ranges with an adjacent range.", kind="bool",
+                        )
+                        fade = gr.Checkbox(value=False, label="Detect fades", info="Add threshold-based fade detection to content/adaptive cuts.")
+                        controls["fade_detection"] = ctx.reg(
+                            "fade_detection", fade, False, section="splitting",
+                            description="Detect fades in addition to hard content cuts.", kind="bool",
+                        )
+                        downscale = gr.Number(value=0, minimum=0, maximum=16, step=1, precision=0, label="Detection downscale", info="Zero lets PySceneDetect choose automatically.")
+                        controls["scene_downscale"] = ctx.reg(
+                            "scene_downscale", downscale, 0, section="splitting",
+                            description="Explicit scene-analysis downscale factor; zero is automatic.", kind="int", minimum=0, maximum=16,
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        fixed_chunk = gr.Number(value=30, minimum=0.1, step=0.5, label="Fixed chunk (s)", info="Chunk duration for Fixed mode and custom trainer fallback.")
+                        controls["fixed_chunk_s"] = ctx.reg(
+                            "fixed_chunk_s", fixed_chunk, 30, section="splitting",
+                            description="Fixed segmentation duration in seconds.", kind="float", minimum=0.1,
+                        )
+                        split_mode = gr.Radio(
+                            choices=[("Fast stream copy", "copy"), ("Precise re-encode", "precise")],
+                            value="copy",
+                            label="Cut method",
+                            info="Stream copy is fast; precise mode re-encodes exact boundaries.",
+                        )
+                        controls["split_mode"] = ctx.reg(
+                            "split_mode", split_mode, "copy", section="splitting",
+                            description="Physical clip cutting method.", choices=["copy", "precise"], kind="str",
+                        )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        max_clip = gr.Number(value=120, minimum=0, step=1, label="Model limit override (s)", info="Zero uses the selected model's computed duration ceiling.")
+                        controls["max_clip_duration_s"] = ctx.reg(
+                            "max_clip_duration_s", max_clip, 120, section="splitting",
+                            description="Maximum clip duration used for automatic model-limit splitting.", kind="float", minimum=0,
+                        )
+                        trainer_target = gr.Dropdown(
+                            choices=[(config["label"], key) for key, config in TRAINER_TARGETS.items()],
+                            value="wan",
+                            label="Trainer target",
+                            info="Uses the trainer's default frame count and FPS to choose clip length.",
+                        )
+                        controls["trainer_target"] = ctx.reg(
+                            "trainer_target", trainer_target, "wan", section="splitting",
+                            description="Target video trainer for trainer-sized sub-splits.", choices=list(TRAINER_TARGETS), kind="str",
+                        )
+                        overlap = gr.Dropdown(
+                            choices=[("No overlap", 0.0), ("0.5 seconds", 0.5), ("1 second", 1.0)],
+                            value=0.5,
+                            label="Sub-split overlap",
+                            info="Overlap between model-limit, fixed, or trainer sub-clips.",
+                        )
+                        controls["sub_split_overlap_s"] = ctx.reg(
+                            "sub_split_overlap_s", overlap, 0.5, section="splitting",
+                            description="Seconds of overlap between adjacent sub-clips.", choices=[0.0, 0.5, 1.0], kind="float",
+                        )
+                    save_clips = gr.Checkbox(value=False, label="Save produced clips", info="Persist split clips beside their captions for dataset use.")
+                    controls["save_clips"] = ctx.reg(
+                        "save_clips", save_clips, False, section="output",
+                        description="Persist materialized split clips in the output dataset.", kind="bool",
+                    )
+                    context_carry_over = gr.Checkbox(
+                        value=False,
+                        label="Carry previous chunk context",
+                        info=(
+                            "Feeds the tail of the previous chunk's text into the next chunk prompt for long transcriptions; "
+                            "not used by Captioner or TimeChat."
+                        ),
+                    )
+                    controls["context_carry_over"] = ctx.reg(
+                        "context_carry_over", context_carry_over, False, section="splitting",
+                        description="Carry the previous transcription chunk's text into the next chunk prompt.", kind="bool",
+                    )
+                    initial_model_limit = initial_spec.limits.compute_max_duration(
+                        fps=initial_spec.limits.default_fps,
+                        max_pixels=initial_spec.limits.default_max_pixels,
+                        reserve_tokens=int(schema["max_new_tokens"].default),
+                        include_audio=True,
+                    )
+                    model_limit_info = gr.Markdown(
+                        f"Model-limit auto-split ceiling: **{initial_model_limit:.1f} s** at the current FPS, pixel, audio, and output-token budget.",
+                        elem_classes=["vc-help"],
+                    )
+                    detect_now = action_button("◫ Detect scenes now (preview)", "indigo", size="md")
+                    scene_status = gr.Markdown("<span class='vc-help'>Preview uses the first selected video.</span>")
+                    scene_table = gr.Dataframe(
+                        headers=["#", "Start", "End", "Duration", "Warning"],
+                        value=[],
+                        type="array",
+                        datatype=["number", "number", "number", "number", "str"],
+                        interactive=False,
+                        max_height=280,
+                        label="Scene preview",
+                        buttons=["copy", "fullscreen"],
+                    )
+            with gr.Column(scale=1, min_width=380):
+                with gr.Accordion("6. Post-processing", open=True):
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        caption_prefix = gr.Textbox(value="", label="Prefix", info="Text prepended to the final model caption.")
+                        controls["caption_prefix"] = ctx.reg(
+                            "caption_prefix", caption_prefix, "", section="postprocessing",
+                            description="Text prepended to finalized captions.", kind="str",
+                        )
+                        caption_suffix = gr.Textbox(value="", label="Suffix", info="Text appended to the final model caption.")
+                        controls["caption_suffix"] = ctx.reg(
+                            "caption_suffix", caption_suffix, "", section="postprocessing",
+                            description="Text appended to finalized captions.", kind="str",
+                        )
+                        trigger_mode = gr.Dropdown(
+                            choices=[("Prefix", "prefix"), ("Suffix", "suffix"), ("Prompt only / none", "none")],
+                            value="none",
+                            label="Trigger injection",
+                            info="Places the template trigger word before, after, or outside the saved caption.",
+                        )
+                        controls["trigger_mode"] = ctx.reg(
+                            "trigger_mode", trigger_mode, "none", section="postprocessing",
+                            description="Position where the trigger word is injected into final captions.", choices=["prefix", "suffix", "none"], kind="str",
+                        )
+                    gr.Markdown("The **Trigger word** in Template variables is shared with caption injection.", elem_classes=["vc-help"])
+                    replacements = replace_words_editor()
+                    controls["replace_words"] = ctx.reg(
+                        "replace_words", replacements.text, "", section="postprocessing",
+                        description="One find;replace transformation per line.", kind="str",
+                    )
+                    controls["replace_case_insensitive"] = ctx.reg(
+                        "replace_case_insensitive", replacements.case_insensitive, True, section="postprocessing",
+                        description="Match replacement rules without case sensitivity.", kind="bool",
+                    )
+                    controls["replace_whole_words"] = ctx.reg(
+                        "replace_whole_words", replacements.whole_words, True, section="postprocessing",
+                        description="Restrict replacement matches to whole words.", kind="bool",
+                    )
+                    controls["replace_regex"] = ctx.reg(
+                        "replace_regex", replacements.regex, False, section="postprocessing",
+                        description="Interpret replacement find values as regular expressions.", kind="bool",
+                    )
+                    collapse = gr.Checkbox(value=False, label="Collapse whitespace", info="Normalize runs of spaces and line breaks in model text before injection.")
+                    controls["collapse_whitespace"] = ctx.reg(
+                        "collapse_whitespace", collapse, False, section="postprocessing",
+                        description="Collapse model-caption whitespace before adding prefix and suffix.", kind="bool",
+                    )
+                    formats = gr.CheckboxGroup(
+                        choices=[("Plain text", "txt"), ("JSON", "json"), ("SRT", "srt"), ("WebVTT", "vtt"), ("Dataset JSONL", "jsonl")],
+                        value=["txt", "json"],
+                        label="Output formats",
+                        info="Plain text is always written even when not explicitly selected.",
+                        show_select_all=True,
+                    )
+                    controls["output_formats"] = ctx.reg(
+                        "output_formats", formats, ["txt", "json"], section="output",
+                        description="Caption and dataset file formats written for every item.",
+                    )
+                    save_reasoning = gr.Checkbox(
+                        value=True,
+                        label="Save reasoning",
+                        info="Persist Thinking-model reasoning separately; it remains hidden from the caption.",
+                    )
+                    controls["save_reasoning"] = ctx.reg(
+                        "save_reasoning", save_reasoning, True, section="output",
+                        description="Write Thinking-model reasoning to a separate text file.", kind="bool",
+                    )
 
     handles = CaptionTabHandles(
         media=media,
@@ -1437,7 +1801,9 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     def set_resolution(value: str) -> Any:
         return gr.skip() if value == "custom" else int(value)
 
-    resolution_preset.input(
+    # Gradio 6 dropdowns fire ``input`` on every blur; ``select`` fires only
+    # when the user actually picks an option, which is what these handlers mean.
+    resolution_preset.select(
         set_resolution,
         inputs=resolution_preset,
         outputs=max_pixels,
@@ -1490,7 +1856,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         max_frames,
         max_pixels,
         max_new_tokens,
-        gpu_layers,
+        block_swap_auto,
         vram_reserve_gb,
         swap_slots,
         offload_experts,
@@ -1519,6 +1885,17 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 if variant.scheme == applied["variant_scheme"]
                 and variant.key in allowed_variants(family, resolved_tier)
             ]
+            if switch_variant and get_variant(selected_variant).scheme == "gguf":
+                # A GGUF preset that does not fit steps down to a smaller GGUF
+                # (Q8 -> Q4) so it stays on the fast llama.cpp path instead of
+                # jumping to a Transformers precision.
+                gguf_candidates = [
+                    variant.key
+                    for variant in MODEL_SPECS[family].variants
+                    if variant.scheme == "gguf" and variant.key in allowed_variants(family, resolved_tier)
+                ]
+                if gguf_candidates:
+                    candidates = gguf_candidates
             next_variant = candidates[0] if switch_variant and candidates else selected_variant
             plan_tier = resolved_tier
             kept = ""
@@ -1553,7 +1930,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 preset.max_frames,
                 preset.max_pixels,
                 preset.max_new_tokens,
-                str(offload.gpu_layers),
+                offload.gpu_layers == "auto",
                 offload.vram_reserve_gb,
                 offload.swap_slots,
                 offload.offload_experts,
@@ -1621,7 +1998,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     ) -> tuple[Any, ...]:
         return apply_auto_vram(selected_variant, selected_tier, selected_gpu, show_all, keep_variant=False)
 
-    vram_preset.input(
+    vram_preset.select(
         apply_vram,
         inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
         outputs=vram_outputs,
@@ -1656,8 +2033,53 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     ctx.states["caption_auto_vram_binding"] = {
         "fn": apply_auto_vram_startup,
         "inputs": [model_key, vram_preset, gpu_picker, show_all_variants],
+        # Preset-owned inputs come from the settings a preset load just applied;
+        # None keeps the live component value (the GPU choice is not in presets).
+        "input_keys": ["model_key", "vram_preset", None, "show_all_variants"],
         "outputs": vram_outputs,
     }
+
+    def preset_max_frames(settings: dict[str, Any]) -> Any:
+        """Ship a preset's frame cap together with the family bound it must satisfy.
+
+        A plain value would reach the frontend before ``model_constraints``
+        raises the bound, and Gradio rejects inputs above the old maximum.
+        """
+
+        try:
+            spec = MODEL_SPECS[variant_to_family(str(settings.get("model_key") or _INITIAL_VARIANT))]
+        except KeyError:
+            return settings.get("max_frames")
+        cap = _family_max_frames(spec)
+        try:
+            value = int(settings.get("max_frames") or 0)
+        except (TypeError, ValueError):
+            value = cap
+        return gr.update(
+            value=max(0, min(value, cap)),
+            minimum=0,
+            maximum=_GLOBAL_MAX_FRAMES,
+            step=2,
+            info=_frames_info(spec),
+        )
+
+    ctx.states.setdefault("preset_value_adapters", {})["max_frames"] = preset_max_frames
+
+    def preset_context_tokens(settings: dict[str, Any]) -> Any:
+        """Clamp a preset's context window to the family cap and ship the bound with it."""
+
+        try:
+            spec = MODEL_SPECS[variant_to_family(str(settings.get("model_key") or _INITIAL_VARIANT))]
+        except KeyError:
+            return settings.get("context_tokens")
+        return gr.update(
+            value=_context_window(spec, settings.get("context_tokens")),
+            minimum=1024,
+            maximum=_GLOBAL_MAX_CONTEXT,
+            info=_context_info(spec),
+        )
+
+    ctx.states["preset_value_adapters"]["context_tokens"] = preset_context_tokens
 
     def model_defaults(variant_key: str) -> tuple[Any, ...]:
         spec = MODEL_SPECS[variant_to_family(variant_key)]
@@ -1671,11 +2093,23 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             gr.update(value=values["max_new_tokens"].default, minimum=1, maximum=_GLOBAL_MAX_NEW_TOKENS, step=1),
             gr.update(value=values["do_sample"].default),
             gr.update(value=bool(values.get("enable_thinking") and values["enable_thinking"].default), interactive=thinking),
-            gr.update(value=values["fps"].default, minimum=values["fps"].min, maximum=values["fps"].max, step=values["fps"].step),
-            gr.update(value=values["max_frames"].default, minimum=0, maximum=values["max_frames"].max, step=values["max_frames"].step),
-            gr.update(value=values["max_pixels"].default, minimum=values["max_pixels"].min, maximum=values["max_pixels"].max, step=values["max_pixels"].step),
-            gr.update(value=spec.limits.min_pixels, minimum=4 * spec.limits.size_multiple**2),
+            gr.update(value=values["fps"].default, minimum=_GLOBAL_FPS_MIN, maximum=_GLOBAL_FPS_MAX, step=values["fps"].step),
+            gr.update(
+                value=min(int(values["max_frames"].default), _family_max_frames(spec)),
+                minimum=0,
+                maximum=_GLOBAL_MAX_FRAMES,
+                step=values["max_frames"].step,
+                info=_frames_info(spec),
+            ),
+            gr.update(value=values["max_pixels"].default, minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS, step=values["max_pixels"].step),
+            gr.update(value=spec.limits.min_pixels, minimum=_GLOBAL_MIN_PIXELS),
             gr.update(value=values["use_audio_in_video"].default, interactive="video_audio" in spec.capabilities),
+            gr.update(
+                value=int(spec.limits.context_tokens),
+                minimum=1024,
+                maximum=_GLOBAL_MAX_CONTEXT,
+                info=_context_info(spec),
+            ),
         )
 
     def model_constraints(variant_key: str) -> tuple[Any, ...]:
@@ -1693,26 +2127,27 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 value=bool(thinking.default) if thinking is not None else False,
                 interactive=thinking is not None,
             ),
-            gr.update(minimum=values["fps"].min, maximum=values["fps"].max, step=values["fps"].step),
-            gr.update(minimum=0, maximum=values["max_frames"].max, step=values["max_frames"].step),
-            gr.update(minimum=values["max_pixels"].min, maximum=values["max_pixels"].max, step=values["max_pixels"].step),
-            gr.update(minimum=4 * spec.limits.size_multiple**2, maximum=values["max_pixels"].max),
+            gr.update(minimum=_GLOBAL_FPS_MIN, maximum=_GLOBAL_FPS_MAX, step=values["fps"].step),
+            gr.update(minimum=0, maximum=_GLOBAL_MAX_FRAMES, step=values["max_frames"].step, info=_frames_info(spec)),
+            gr.update(minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS, step=values["max_pixels"].step),
+            gr.update(minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS),
             gr.update(interactive="video_audio" in spec.capabilities),
+            gr.update(minimum=1024, maximum=_GLOBAL_MAX_CONTEXT, info=_context_info(spec)),
         )
 
     model_key.change(
         model_constraints,
         inputs=model_key,
-        outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio],
+        outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio, context_tokens],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
 
-    model_defaults_event = model_key.input(
+    model_defaults_event = model_key.select(
         model_defaults,
         inputs=model_key,
-        outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio],
+        outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio, context_tokens],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -1764,7 +2199,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         except Exception:
             return description, system, user, *[gr.skip() for _ in range(6)]
 
-    prompt_preset.input(
+    prompt_preset.select(
         select_prompt,
         inputs=[prompt_preset, model_key, *variable_components],
         outputs=[prompt_description, system_prompt, user_prompt, temperature, top_p, top_k, repetition, max_new_tokens, do_sample],
@@ -1870,7 +2305,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         user_prompt,
         prompt_context_state,
     ]
-    model_key.input(
+    model_key.select(
         sync_prompt_context,
         inputs=prompt_sync_inputs,
         outputs=prompt_sync_outputs,
@@ -1898,13 +2333,26 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         api_visibility="private",
     )
 
-    def budget_line(variant_key: str, fps_value: float, frames_value: int, pixels_value: int, duration: float, output_tokens: int, include_audio: bool) -> str:
+    def budget_line(
+        variant_key: str,
+        fps_value: float,
+        frames_value: int,
+        pixels_value: int,
+        duration: float,
+        output_tokens: int,
+        include_audio: bool,
+        context_value: Any = None,
+    ) -> str:
         if float(duration or 0) <= 0:
             return "<span class='vc-help'>Upload media to estimate the live token budget.</span>"
         try:
             family = variant_to_family(variant_key)
             spec = MODEL_SPECS[family]
-            frame_count = min(max(1, int(frames_value or 1)), max(1, int(math.ceil(float(duration) * float(fps_value)))))
+            frame_count = min(
+                max(1, int(frames_value or 1)),
+                _family_max_frames(spec),
+                max(1, int(math.ceil(float(duration) * float(fps_value)))),
+            )
             factor = spec.limits.size_multiple
             width = max(factor, int(pixels_value or spec.limits.default_max_pixels) // factor)
             budget_family = "qwen3-omni" if family.startswith("qwen3") else family
@@ -1916,16 +2364,18 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 float(duration) if include_audio else 0.0,
             )
             total = int(estimate["total_input_tokens"])
-            ok = fits_context(estimate, spec.limits.context_tokens, int(output_tokens or 0))
+            window = _context_window(spec, context_value)
+            ok = fits_context(estimate, window, int(output_tokens or 0))
             css, word = ("vc-ok", "OK") if ok else ("vc-err", "OVER BUDGET")
             return (
-                f"≈ {total:,} input tokens of {spec.limits.context_tokens:,} — "
+                f"≈ {total:,} input tokens of {window:,} — "
                 f"<span class='{css}'>{word}</span> · {frame_count} frames · reserves {int(output_tokens or 0):,} output tokens"
+                f" · KV cache ≈ {spec.limits.kv_cache_gb(window):.1f} GB at this window"
             )
         except Exception as exc:
             return f"<span class='vc-warn'>Token estimate unavailable: {html.escape(str(exc))}</span>"
 
-    budget_inputs = [model_key, fps, max_frames, max_pixels, media.duration_state, max_new_tokens, use_audio]
+    budget_inputs = [model_key, fps, max_frames, max_pixels, media.duration_state, max_new_tokens, use_audio, context_tokens]
     for event_component in budget_inputs:
         event_component.change(
             budget_line,
@@ -1936,17 +2386,113 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             api_visibility="private",
         )
 
-    def limit_line(variant_key: str, fps_value: float, pixels_value: int, reserve: int, include_audio: bool) -> str:
+    block_swap_inputs = [
+        model_key,
+        block_swap_auto,
+        blocks_to_swap,
+        gpu_picker,
+        vram_reserve_gb,
+        swap_slots,
+        offload_experts,
+        pin_cpu,
+        fps,
+        max_frames,
+        max_pixels,
+        max_new_tokens,
+        context_tokens,
+        media.duration_state,
+        media.modality_state,
+    ]
+
+    def refresh_block_swap(
+        variant_key: str,
+        auto: bool,
+        blocks: Any,
+        selected_gpu: int,
+        reserve: Any,
+        slots: Any,
+        experts: bool,
+        pin: bool,
+        fps_value: Any,
+        frames_value: Any,
+        pixels_value: Any,
+        output_tokens: Any,
+        context_value: Any,
+        duration: Any,
+        modality: Any,
+    ) -> tuple[Any, str]:
+        """Show what the block-swap controls resolve to and keep the slider in step."""
+
+        try:
+            ping = getattr(ctx.pipeline_client, "ping", None)
+            pong = ping(timeout_s=0.3) if callable(ping) else None
+            slider, note = block_swap_preview(
+                str(variant_key),
+                bool(auto),
+                blocks,
+                gpu_index=int(selected_gpu or 0),
+                reserve_gb=reserve,
+                swap_slots=slots,
+                offload_experts=bool(experts),
+                pin_cpu=bool(pin),
+                fps_value=fps_value,
+                frames_value=frames_value,
+                pixels_value=pixels_value,
+                output_tokens=output_tokens,
+                context_value=context_value,
+                duration=duration,
+                modality=modality,
+                pong=pong,
+            )
+            return gr.update(**slider), note
+        except Exception as exc:
+            return gr.skip(), f"<span class='vc-warn'>Block swap preview unavailable: {html.escape(str(exc))}</span>"
+
+    block_swap_outputs = [blocks_to_swap, block_swap_note]
+    # The slider is an output here, so it listens on ``input`` (user edits only)
+    # while every other dependency listens on ``change`` so preset loads refresh
+    # the preview too; the programmatic slider update never re-triggers itself.
+    for event_component in block_swap_inputs:
+        if event_component is blocks_to_swap:
+            continue
+        event_component.change(
+            refresh_block_swap,
+            inputs=block_swap_inputs,
+            outputs=block_swap_outputs,
+            queue=False,
+            trigger_mode="always_last",
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    blocks_to_swap.input(
+        refresh_block_swap,
+        inputs=block_swap_inputs,
+        outputs=block_swap_outputs,
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def limit_line(
+        variant_key: str,
+        fps_value: float,
+        pixels_value: int,
+        reserve: int,
+        include_audio: bool,
+        context_value: Any = None,
+    ) -> str:
         spec = MODEL_SPECS[variant_to_family(variant_key)]
         limit = spec.limits.compute_max_duration(
             fps=float(fps_value or spec.limits.default_fps),
             max_pixels=int(pixels_value or spec.limits.default_max_pixels),
+            context=_context_window(spec, context_value),
             reserve_tokens=int(reserve or 0),
             include_audio=bool(include_audio),
         )
         return f"Model-limit auto-split ceiling: **{limit:.1f} s** at the current FPS, pixel, audio, and output-token budget."
 
-    limit_inputs = [model_key, fps, max_pixels, max_new_tokens, use_audio]
+    limit_inputs = [model_key, fps, max_pixels, max_new_tokens, use_audio, context_tokens]
     for event_component in limit_inputs:
         event_component.change(
             limit_line,
@@ -2304,7 +2850,7 @@ def wire(ctx: "UiContext") -> None:
                     render_progress_html(0, "Input required", message),
                     f"<span class='vc-err'>{message}</span>",
                     "**ETA:** —",
-                    "**Speed:** —",
+                    "**Speed:** — · **Context:** —",
                     [],
                     *[gr.skip() for _ in range(7)],
                     "",
@@ -2416,6 +2962,7 @@ def wire(ctx: "UiContext") -> None:
         last_message = "Starting caption job"
         last_eta = "—"
         last_speed = "—"
+        last_context = "—"
         processed_count = 0
         total_count = len(items)
         remaining_count = total_count
@@ -2431,7 +2978,7 @@ def wire(ctx: "UiContext") -> None:
             ),
             "**Status:** Starting caption worker",
             "**ETA:** —",
-            "**Speed:** —",
+            "**Speed:** — · **Context:** —",
             item_rows,
             "",
             None,
@@ -2462,6 +3009,8 @@ def wire(ctx: "UiContext") -> None:
                     speed = data.get("tok_per_s") or data.get("tokens_per_second")
                     if speed is not None:
                         last_speed = f"{float(speed):.2f} tok/s"
+                    if data.get("prompt_tokens") is not None:
+                        last_context = context_usage_text(data.get("prompt_tokens"), data.get("context_limit"))
                     raw_index = data.get("item_index", event.item_index)
                     index = int(raw_index or 0)
                     if 0 <= index < len(item_rows):
@@ -2515,7 +3064,7 @@ def wire(ctx: "UiContext") -> None:
                     render_progress_html(last_fraction, last_message, progress_detail),
                     f"**Status:** {html.escape(last_message)}",
                     f"**ETA:** {last_eta}",
-                    f"**Speed:** {last_speed}",
+                    f"**Speed:** {last_speed} · **Context:** {last_context}",
                     item_rows,
                     *[gr.skip() for _ in range(6)],
                     dict(live_outputs) if live_dirty else gr.skip(),
@@ -2543,7 +3092,7 @@ def wire(ctx: "UiContext") -> None:
                 render_progress_html(1, terminal_label, message),
                 f"<span class='{status_class}'>**Status:** {html.escape(message)}</span>",
                 f"**ETA:** {eta_text}",
-                f"**Speed:** {last_speed}",
+                f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
                 final_caption,
                 structured,
@@ -2561,7 +3110,7 @@ def wire(ctx: "UiContext") -> None:
                 render_progress_html(last_fraction, "Cancelled", str(exc)),
                 f"<span class='vc-warn'>**Status:** {html.escape(str(exc))}</span>",
                 "**ETA:** cancelled",
-                f"**Speed:** {last_speed}",
+                f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
                 *[gr.skip() for _ in range(6)],
                 gr.skip(),
@@ -2574,7 +3123,7 @@ def wire(ctx: "UiContext") -> None:
                 render_progress_html(last_fraction, "Failed", str(exc)),
                 f"<span class='vc-err'>**Status:** {html.escape(str(exc))}</span>",
                 "**ETA:** failed",
-                f"**Speed:** {last_speed}",
+                f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
                 *[gr.skip() for _ in range(7)],
                 _job_done_payload("Job failed", settings),

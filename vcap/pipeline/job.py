@@ -97,6 +97,15 @@ def _optional_float(value: Any) -> float | None:
     return parsed if parsed > 0 else None
 
 
+def _context_tokens(value: Any) -> int | None:
+    """Return a positive requested context window; None means the model cap."""
+
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = _int(value, 0)
+    return parsed if parsed > 0 else None
+
+
 def _gpu_indices(value: Any, fallback: int) -> tuple[int, ...]:
     if value is None or value == "":
         return (int(fallback),)
@@ -216,6 +225,8 @@ class GenParams:
     do_sample: bool = False
     use_cache: bool = True
     enable_thinking: bool = True
+    # Requested context window; None defers to the model's cap.
+    context_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -405,8 +416,25 @@ class JobSpec:
             offload_data = dict(raw_offload)
         else:
             offload_data = {}
+        raw_gpu_layers = _setting(source, "gpu_layers", "layers_on_gpu", default=None)
+        if raw_gpu_layers is None and ("block_swap_auto" in source or "blocks_to_swap" in source):
+            # The UI stores the block-swap controls; translate them with the
+            # selected family's layer count (the loader caps the count again).
+            layer_count = 48
+            try:
+                from vcap.models.offload import block_swap_to_gpu_layers, family_layer_count
+                from vcap.models.registry import variant_to_family
+
+                layer_count = family_layer_count(variant_to_family(variant_key))
+            except (KeyError, ValueError):
+                from vcap.models.offload import block_swap_to_gpu_layers
+            raw_gpu_layers = block_swap_to_gpu_layers(
+                _bool(source.get("block_swap_auto"), True),
+                _int(source.get("blocks_to_swap"), 0),
+                layer_count,
+            )
         gpu_layers = _gpu_layers(
-            _setting(source, "gpu_layers", "layers_on_gpu", default=offload_data.get("gpu_layers", "auto"))
+            offload_data.get("gpu_layers", "auto") if raw_gpu_layers is None else raw_gpu_layers
         )
         raw_max_memory = _setting(source, "offload_max_memory", "max_memory", default=offload_data.get("max_memory"))
         max_memory = (
@@ -491,11 +519,16 @@ class JobSpec:
             do_sample=_bool(generation_value("do_sample", False), False),
             use_cache=_bool(generation_value("use_cache", True), True),
             enable_thinking=_bool(generation_value("enable_thinking", True), True),
+            context_tokens=_context_tokens(_setting(source, "context_tokens", default=None)),
         )
+        # ``family_defaults["max_frames"]`` is the family cap; the UI keeps a
+        # global bound so switching models never rejects a stale value, and the
+        # cap is enforced here instead.
         default_frames = max(1, _int(family_defaults.get("max_frames", 160), 160))
         selected_frames = _int(_setting(source, "max_frames", default=default_frames), default_frames)
         if selected_frames <= 0:
             selected_frames = default_frames
+        selected_frames = min(selected_frames, default_frames)
         preprocess = PreprocessSpec(
             trim_start_s=max(0.0, _float(_setting(source, "trim_start_s", "trim_start", default=0.0), 0.0)),
             trim_end_s=_optional_float(_setting(source, "trim_end_s", "trim_end", default=None)),

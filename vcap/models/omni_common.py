@@ -40,6 +40,8 @@ from .base import (
     PreprocessParams,
     PromptSpec,
     TokenUsage,
+    chat_media_parts,
+    chat_media_placeholders,
     normalize_chat_history,
     truncate_chat_history,
 )
@@ -134,7 +136,11 @@ def split_thinking(text: str) -> tuple[str, str]:
     """Separate Qwen3 Thinking's generated reasoning and final answer."""
 
     if "</think>" not in text:
-        return "", text.strip()
+        stripped = text.strip()
+        if stripped.startswith("<think>"):
+            # Generation stopped inside the reasoning block, so none of it is an answer.
+            return stripped[len("<think>") :].strip(), ""
+        return "", stripped
     reasoning, answer = text.split("</think>", 1)
     return reasoning.replace("<think>", "", 1).strip(), answer.strip()
 
@@ -143,8 +149,16 @@ def build_chat_conversation(
     history: Sequence[ChatMessage | Mapping[str, Any]],
     media_content: Sequence[Mapping[str, Any]] = (),
     system_prompt: str | None = None,
+    *,
+    turn_media: Any = None,
 ) -> list[dict[str, Any]]:
-    """Render normalized history with media attached to its first user turn only."""
+    """Render normalized history as a chat-template conversation.
+
+    ``media_content`` is attached to the first user turn (legacy first-turn
+    attachments). ``turn_media(index, message)`` returns the content entries
+    for a message's own attachments, indexed within the non-system messages,
+    so any later turn can carry media as well.
+    """
 
     messages = normalize_chat_history(history)
     system_from_history = next((item.content for item in messages if item.role == "system"), "")
@@ -164,6 +178,8 @@ def build_chat_conversation(
         content: list[dict[str, Any]] = []
         if index == first_user:
             content.extend(dict(item) for item in media_content)
+        if turn_media is not None and message.media:
+            content.extend(dict(item) for item in turn_media(index, message))
         if message.content:
             content.append({"type": "text", "text": message.content})
         if not content:
@@ -543,14 +559,24 @@ class OmniCaptionerBase(BaseCaptioner):
             )
         return post, reasoning
 
+    def _context_limit(self, gen: GenParams) -> int:
+        """Return the effective context window: the request capped by the model."""
+
+        cap = int(self.spec.limits.context_tokens)
+        requested = getattr(gen, "context_tokens", None)
+        return min(cap, int(requested)) if requested else cap
+
     def _render_chat(
         self,
         history: Sequence[ChatMessage | Mapping[str, Any]],
-        prepared: _Prepared,
+        media_content: Sequence[Mapping[str, Any]],
         system_prompt: str | None,
         gen: GenParams,
+        turn_media: Any = None,
     ) -> tuple[list[dict[str, Any]], str, int]:
-        conversation = build_chat_conversation(history, prepared.content, system_prompt)
+        conversation = build_chat_conversation(
+            history, media_content, system_prompt, turn_media=turn_media
+        )
         template_kwargs: dict[str, Any] = {}
         if self.thinking_mode:
             template_kwargs["enable_thinking"] = bool(gen.enable_thinking)
@@ -693,27 +719,47 @@ class OmniCaptionerBase(BaseCaptioner):
                 item.role == "assistant" for item in conversational
             ):
                 raise ValueError(f"{self.spec.label} supports single-turn video Q&A only")
-        parts = _parts(media) if media is not None else []
-        if parts:
-            self._validate_capabilities(parts)
+        # Legacy first-turn media plus each user turn's own attachments, probed once.
+        legacy_parts = _parts(media) if media is not None else []
+        part_by_path: dict[str, MediaPart] = {}
+        for item in normalized:
+            for raw, part in zip(item.media, chat_media_parts(item.media)):
+                part_by_path[raw] = part
+        all_parts = legacy_parts + [part_by_path[raw] for item in normalized for raw in item.media]
+        if all_parts:
+            self._validate_capabilities(all_parts)
         if self.spec.family in {"timechat", "avocado"} and (
-            len(parts) != 1 or parts[0].type not in {"video", "video_audio"}
+            len(all_parts) != 1 or all_parts[0].type not in {"video", "video_audio"}
         ):
             raise ValueError(f"{self.spec.label} chat requires exactly one video")
-        prepared = self._prepare_media(parts, preprocessing)
+        first_turn_content = chat_media_placeholders(legacy_parts)
+
+        def turn_media(index: int, message: ChatMessage) -> list[dict[str, str]]:
+            del index
+            return chat_media_placeholders([part_by_path[raw] for raw in message.media])
+
+        context_limit = self._context_limit(generation_params)
 
         def count_tokens(candidate: Sequence[ChatMessage]) -> int:
-            return self._render_chat(candidate, prepared, system_prompt, generation_params)[2]
+            return self._render_chat(
+                candidate, first_turn_content, system_prompt, generation_params, turn_media
+            )[2]
 
         retained, dropped_turns, rendered_tokens = truncate_chat_history(
             normalized,
             count_tokens,
-            self.spec.limits.context_tokens,
+            context_limit,
         )
+        # Decode media only for the turns that survived truncation, in the order
+        # the template will reference them (legacy media leads the first turn).
+        retained_parts = list(legacy_parts) + [
+            part_by_path[raw] for item in retained for raw in item.media
+        ]
+        prepared = self._prepare_media(retained_parts, preprocessing)
         if dropped_turns:
             warning = (
                 f"Context limit: dropped {dropped_turns} oldest conversation "
-                f"turn{'s' if dropped_turns != 1 else ''}; the media turn was kept."
+                f"turn{'s' if dropped_turns != 1 else ''}; the first turn was kept."
             )
             prepared.warnings.append(warning)
             get_log().warn(warning, scope="chat")
@@ -726,14 +772,15 @@ class OmniCaptionerBase(BaseCaptioner):
             )
         _, rendered, rendered_tokens = self._render_chat(
             retained,
-            prepared,
+            first_turn_content,
             system_prompt,
             generation_params,
+            turn_media,
         )
-        if rendered_tokens > int(self.spec.limits.context_tokens * 0.9):
+        if rendered_tokens > int(context_limit * 0.9):
             warning = (
                 f"Rendered chat prompt uses about {rendered_tokens} of "
-                f"{self.spec.limits.context_tokens} context tokens."
+                f"{context_limit} context tokens."
             )
             prepared.warnings.append(warning)
             _callback(callbacks.progress, warning, level="warning")
@@ -753,11 +800,11 @@ class OmniCaptionerBase(BaseCaptioner):
             if "attention_mask" in inputs
             else input_length
         )
-        remaining = self.spec.limits.context_tokens - prompt_tokens
+        remaining = context_limit - prompt_tokens
         if remaining <= 0:
             raise ValueError(
                 f"The media and retained conversation use {prompt_tokens} tokens, exceeding the "
-                f"{self.spec.limits.context_tokens}-token context window."
+                f"{context_limit}-token context window."
             )
         if generation_params.max_new_tokens > remaining:
             warning = f"Reduced this response to {remaining} tokens to stay within the context window."
@@ -877,6 +924,8 @@ class OmniCaptionerBase(BaseCaptioner):
             tok_per_s=speed,
             cancelled=cancelled,
             finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            context_limit=context_limit,
         )
         return ChatResult(
             text=answer,
@@ -890,6 +939,7 @@ class OmniCaptionerBase(BaseCaptioner):
             retained_history=tuple(retained),
             dropped_turns=dropped_turns,
             context_tokens=prompt_tokens,
+            context_limit=context_limit,
         )
 
     def caption(
@@ -1061,6 +1111,8 @@ class OmniCaptionerBase(BaseCaptioner):
             tok_per_s=speed,
             cancelled=cancelled,
             finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            context_limit=self._context_limit(gen),
         )
         return CaptionResult(
             text=post.text,

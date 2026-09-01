@@ -50,6 +50,17 @@ class ModelLimits:
     single_audio_only: bool
     supports_batch: bool
     size_multiple: int = 28
+    # bf16/f16 key+value bytes per cached token (layers x kv_heads x head_dim x 4).
+    kv_bytes_per_token: int = 0
+
+    def kv_cache_gb(self, tokens: int) -> float:
+        """Estimate the key-value cache for ``tokens`` positions in GiB.
+
+        llama.cpp reserves this at load for its configured context; the
+        Transformers backends grow into it during generation.
+        """
+
+        return max(0, int(tokens)) * max(0, int(self.kv_bytes_per_token)) / 2**30
 
     def compute_max_duration(
         self,
@@ -239,9 +250,14 @@ def _gguf_variants(
 
 _QWEN3_ALL = frozenset({"video", "video_audio", "image", "audio", "text"})
 
-_TIMECHAT_LIMITS = ModelLimits(60.0, 2.0, 297_920, 100_352, 160, 32_768, 9_216, 25.0, True, False, False, 28)
-_AVOCADO_LIMITS = ModelLimits(100.0, 2.0, 401_408, 100_352, 256, 32_768, 2_048, 25.0, False, False, False, 28)
-_QWEN3_LIMITS = ModelLimits(None, 2.0, 256 * 32 * 32, 4 * 32 * 32, 768, 32_768, 32_768, 13.0, False, False, True, 32)
+# Qwen2.5-Omni-7B thinker: 28 layers x 4 KV heads x 128 head_dim x 4 bytes (K+V, bf16).
+_SEVEN_B_KV_BYTES = 28 * 4 * 128 * 4
+# Qwen3-Omni-30B-A3B thinker: 48 layers x 4 KV heads x 128 head_dim x 4 bytes.
+_QWEN3_KV_BYTES = 48 * 4 * 128 * 4
+
+_TIMECHAT_LIMITS = ModelLimits(60.0, 2.0, 297_920, 100_352, 160, 32_768, 9_216, 25.0, True, False, False, 28, _SEVEN_B_KV_BYTES)
+_AVOCADO_LIMITS = ModelLimits(100.0, 2.0, 401_408, 100_352, 256, 32_768, 2_048, 25.0, False, False, False, 28, _SEVEN_B_KV_BYTES)
+_QWEN3_LIMITS = ModelLimits(None, 2.0, 256 * 32 * 32, 4 * 32 * 32, 768, 32_768, 32_768, 13.0, False, False, True, 32, _QWEN3_KV_BYTES)
 _QWEN3_INSTRUCT_LIMITS = replace(_QWEN3_LIMITS, max_new_tokens_cap=8_192)
 _CAPTIONER_LIMITS = replace(
     _QWEN3_LIMITS,

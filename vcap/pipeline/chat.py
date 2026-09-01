@@ -97,6 +97,7 @@ class ChatResponse:
     dropped_turns: int = 0
     context_tokens: int = 0
     retained_history: tuple[ChatMessage, ...] = ()
+    context_limit: int = 0
 
     @classmethod
     def from_result(cls, model_key: str, result: ChatResult) -> "ChatResponse":
@@ -118,6 +119,7 @@ class ChatResponse:
             dropped_turns=int(result.dropped_turns),
             context_tokens=int(result.context_tokens),
             retained_history=tuple(result.retained_history),
+            context_limit=int(getattr(result, "context_limit", 0) or 0),
         )
 
     @classmethod
@@ -200,7 +202,7 @@ def _partial_thinking(raw: str) -> tuple[str, str]:
         reasoning, answer = stripped.split("</think>", 1)
         return reasoning.removeprefix("<think>").strip(), answer
     if stripped.startswith("<think>"):
-        return stripped[len("<think>") :], ""
+        return stripped[len("<think>") :].strip(), ""
     if stripped and "<think>".startswith(stripped):
         return "", ""
     return "", raw[leading:]
@@ -246,7 +248,13 @@ class _StreamAccumulator:
         )
 
 
+def _halves(text: str) -> list[str]:
+    middle = max(1, len(text) // 2)
+    return [text[:middle], text[middle:]]
+
+
 def _fake_chat(request: ChatRequest, emit: EventCallback, cancel: CancelToken) -> ChatResponse:
+    model_key = str(request.settings.get("model_key") or "qwen3_omni_instruct_int4")
     last_user = next(item.content for item in reversed(request.history) if item.role == "user")
     prior = next(
         (item.content for item in reversed(request.history[:-1]) if item.role == "assistant"),
@@ -255,29 +263,62 @@ def _fake_chat(request: ChatRequest, emit: EventCallback, cancel: CancelToken) -
     answer = f"Mock answer to: {last_user}"
     if prior:
         answer += f" Previous context: {prior}"
-    pieces = [answer[: max(1, len(answer) // 2)], answer[max(1, len(answer) // 2) :]]
+    # The Thinking family streams a reasoning block before its answer, exactly
+    # like the real model, so the UI's live thought rendering can be exercised.
+    thinking = variant_to_family(model_key) == "qwen3_omni_thinking" and bool(
+        request.generation.get(
+            "enable_thinking", request.settings.get("chat_enable_thinking", False)
+        )
+    )
+    reasoning_pieces = _halves(f"Mock reasoning about: {last_user}") if thinking else []
     built = ""
+    built_reasoning = ""
     started = time.perf_counter()
     try:
         delay_s = max(0.0, float(os.environ.get("VCAP_FAKE_CHAT_DELAY", "0") or 0.0))
     except ValueError:
         delay_s = 0.0
-    for piece in pieces:
+
+    def wait_turn() -> bool:
         deadline = time.monotonic() + delay_s
         while time.monotonic() < deadline and not _is_cancelled(cancel):
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-        if _is_cancelled(cancel):
+        return not _is_cancelled(cancel)
+
+    for piece in reasoning_pieces:
+        if not wait_turn():
+            break
+        built_reasoning += piece
+        emit(
+            {
+                "ev": "delta",
+                "delta": "",
+                "reasoning_delta": piece,
+                "text": "",
+                "reasoning": built_reasoning,
+            }
+        )
+    for piece in _halves(answer):
+        if _is_cancelled(cancel) or not wait_turn():
             break
         built += piece
-        emit({"ev": "delta", "delta": piece, "reasoning_delta": "", "text": built, "reasoning": ""})
+        emit(
+            {
+                "ev": "delta",
+                "delta": piece,
+                "reasoning_delta": "",
+                "text": built,
+                "reasoning": built_reasoning,
+            }
+        )
     elapsed = time.perf_counter() - started
     cancelled = _is_cancelled(cancel)
-    tokens = max(1, math.ceil(len(built) / 4))
+    tokens = max(1, math.ceil((len(built) + len(built_reasoning)) / 4))
     return ChatResponse(
-        model_key=str(request.settings.get("model_key") or "qwen3_omni_instruct_int4"),
+        model_key=model_key,
         text=built,
-        raw_text=built,
-        reasoning="",
+        raw_text=f"<think>\n{built_reasoning}\n</think>\n\n{built}" if thinking else built,
+        reasoning=built_reasoning,
         prompt_tokens=max(1, sum(len(item.content) for item in request.history) // 4),
         new_tokens=tokens,
         finish_reason="cancelled" if cancelled else "eos",
@@ -311,12 +352,13 @@ def run_chat(
     if not selected.history or selected.history[-1].role != "user":
         raise ValueError("Chat history must end with the current user message")
     if family in {"timechat", "avocado"}:
-        if len(selected.media) != 1:
+        # Single-turn video Q&A: the current user turn and its one video only.
+        current = next(item for item in reversed(selected.history) if item.role == "user")
+        if len(selected.media) + len(current.media) != 1:
             raise ValueError(f"{MODEL_SPECS[family].label} chat requires exactly one video")
         selected = ChatRequest(
             selected.settings,
-            tuple(item for item in selected.history if item.role == "system")
-            + (next(item for item in reversed(selected.history) if item.role == "user"),),
+            tuple(item for item in selected.history if item.role == "system") + (current,),
             selected.media,
             selected.generation,
             selected.system_prompt,
@@ -351,6 +393,10 @@ def run_chat(
     media = _media_input(selected.media)
     values = dict(selected.generation)
     temperature = float(values.get("temperature", settings.get("chat_temperature", 0.2)) or 0.0)
+    try:
+        requested_context = int(values.get("context_tokens", settings.get("context_tokens")) or 0)
+    except (TypeError, ValueError):
+        requested_context = 0
     generation = GenParams(
         temperature=temperature,
         top_p=float(values.get("top_p", settings.get("chat_top_p", 0.95)) or 1.0),
@@ -367,6 +413,7 @@ def run_chat(
         enable_thinking=bool(
             values.get("enable_thinking", settings.get("chat_enable_thinking", True))
         ),
+        context_tokens=requested_context if requested_context > 0 else None,
     )
     pre = job.preprocess
     preprocessing = PreprocessParams(

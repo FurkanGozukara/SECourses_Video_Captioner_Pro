@@ -64,6 +64,9 @@ class GenParams:
     do_sample: bool = False
     use_cache: bool = True
     enable_thinking: bool = True
+    # Requested total token window (prompt, media, and response); None means
+    # the model's own context cap. Backends never exceed the cap.
+    context_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -94,10 +97,15 @@ ChatRole = Literal["system", "user", "assistant"]
 
 @dataclass(frozen=True)
 class ChatMessage:
-    """One text message in a multimodal conversation history."""
+    """One message in a multimodal conversation history.
+
+    ``media`` lists the local video, audio, or image files attached to this
+    turn, in order; only user turns carry media.
+    """
 
     role: ChatRole
     content: str
+    media: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,6 +171,8 @@ class ChatResult:
     retained_history: tuple[ChatMessage, ...] = ()
     dropped_turns: int = 0
     context_tokens: int = 0
+    # Effective context window the backend enforced for this turn.
+    context_limit: int = 0
 
 
 def _message_text(value: Any) -> str:
@@ -194,14 +204,66 @@ def normalize_chat_history(
             role = str(value.get("role") or "").strip().casefold()
             if role not in {"system", "user", "assistant"}:
                 raise ValueError(f"Chat message {index + 1} has an unsupported role: {role or '<empty>'}")
-            message = ChatMessage(role, _message_text(value.get("content")))  # type: ignore[arg-type]
+            message = ChatMessage(  # type: ignore[arg-type]
+                role,
+                _message_text(value.get("content")),
+                _message_media(value.get("media"), index),
+            )
         else:
             raise TypeError(f"Chat message {index + 1} must be a mapping or ChatMessage")
         role = str(message.role).casefold()
         if role not in {"system", "user", "assistant"}:
             raise ValueError(f"Chat message {index + 1} has an unsupported role: {role}")
-        normalized.append(ChatMessage(role, str(message.content)))  # type: ignore[arg-type]
+        media = tuple(str(item) for item in (message.media or ()) if str(item).strip())
+        if media and role != "user":
+            raise ValueError(f"Chat message {index + 1}: only user messages can carry media")
+        normalized.append(ChatMessage(role, str(message.content), media))  # type: ignore[arg-type]
     return normalized
+
+
+def _message_media(value: Any, index: int) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, Path)):
+        return (str(value),)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return tuple(str(item) for item in value if str(item).strip())
+    raise TypeError(f"Chat message {index + 1} media must be a path or a list of paths")
+
+
+def chat_media_parts(paths: Sequence[str | Path]) -> list[MediaPart]:
+    """Map chat attachment paths to typed media parts by probing each file."""
+
+    from vcap.core.media import probe_media  # local: keeps this module import-light
+
+    parts: list[MediaPart] = []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise ValueError(f"Chat attachment is not a file: {path}")
+        info = probe_media(path)
+        kind = {
+            "video": "video_audio",
+            "video_no_audio": "video",
+            "audio": "audio",
+            "image": "image",
+        }.get(info.kind)
+        if kind is None:
+            raise ValueError(
+                f"Unsupported chat attachment {path.name}: choose video, audio, or image media."
+            )
+        parts.append(MediaPart(kind, path))  # type: ignore[arg-type]
+    return parts
+
+
+def chat_media_placeholders(parts: Sequence[MediaPart]) -> list[dict[str, str]]:
+    """Return chat-template content entries (without payloads) for media parts."""
+
+    return [
+        {"type": "video" if part.type in {"video", "video_audio"} else str(part.type)}
+        for part in parts
+        if part.type != "text"
+    ]
 
 
 def truncate_chat_history(
@@ -211,10 +273,12 @@ def truncate_chat_history(
     *,
     threshold: float = 0.9,
 ) -> tuple[list[ChatMessage], int, int]:
-    """Drop oldest complete turns while preserving the media and current turns.
+    """Drop oldest complete turns while preserving the first and current turns.
 
-    The first user/assistant pair is the media turn. The final user turn is the
-    request being answered. System messages and both boundary turns are retained.
+    The first user/assistant pair anchors the conversation (it carries the
+    legacy first-turn media). The final user turn is the request being
+    answered. System messages and both boundary turns are retained; dropped
+    turns take their own attachments with them.
     """
 
     working = normalize_chat_history(history)

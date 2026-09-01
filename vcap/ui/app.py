@@ -171,8 +171,8 @@ def build_app() -> gr.Blocks:
 
         preset_bar(context)
         with gr.Tabs(selected="caption", elem_id="vc-main-tabs"):
-            with gr.Tab("🎬 Caption", id="caption"):
-                caption_tab.build(context)
+            # Renders both "🎬 Caption" and its sibling "🎞️ Processing Pipeline".
+            caption_tab.build(context)
             with gr.Tab("💬 Chat", id="chat"):
                 chat_tab.build(context)
             with gr.Tab("✏️ Caption Editor", id="editor"):

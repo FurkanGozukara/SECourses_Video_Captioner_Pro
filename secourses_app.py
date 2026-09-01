@@ -26,8 +26,17 @@ from vcap.ui.theme import HOTKEYS_HEAD, build_css, build_theme
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--share", action="store_true", help="Create a temporary public Gradio share link.")
-    parser.add_argument("--server-name", default="127.0.0.1", help="Interface/address for the Gradio server.")
-    parser.add_argument("--server-port", type=int, default=7860, help="TCP port for the Gradio server.")
+    parser.add_argument(
+        "--server-name",
+        default=None,
+        help="Interface/address for the Gradio server. Omitted by default so Gradio picks its own.",
+    )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=None,
+        help="TCP port for the Gradio server. Omitted by default so Gradio takes the next free port.",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Do not open the local URL automatically.")
     parser.add_argument("--inbrowser", action="store_true", help="Open the local URL automatically.")
     return parser
@@ -65,10 +74,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     demo = build_app()
     gr.set_static_paths([APP_DIR])
     favicon = APP_DIR / "assets" / "favicon.svg"
+    # Passing server_name/server_port pins Gradio to exactly that address and port,
+    # so an occupied port aborts the launch instead of rolling to the next one.
+    # Leave both out unless the user asked for them.
+    server_kwargs: dict[str, object] = {}
+    if args.server_name is not None:
+        server_kwargs["server_name"] = str(args.server_name)
+    if args.server_port is not None:
+        server_kwargs["server_port"] = int(args.server_port)
+
     demo.queue(default_concurrency_limit=1, max_size=64).launch(
         share=bool(args.share),
-        server_name=str(args.server_name),
-        server_port=int(args.server_port),
+        **server_kwargs,
         inbrowser=bool(args.inbrowser or not args.no_browser),
         show_error=True,
         theme=build_theme(),

@@ -2,11 +2,11 @@
   "_meta": {
     "format": "secourses_vcap_preset",
     "version": 1,
-    "name": "Default - Qwen3-Omni Instruct video",
-    "description": "Balanced dense audiovisual captioning with the INT8 Qwen3-Omni Instruct model."
+    "name": "Chat assistant fast (Qwen3-Omni Instruct GGUF Q8)",
+    "description": "Multi-turn multimodal chat through the private llama-server with the Q8_0 GGUF Qwen3-Omni Instruct model: about five times the interactive decode speed of INT8 ConvRot on a 32 GB GPU. Video is sent as sampled frames plus audio; the tier plan falls back to a smaller variant on GPUs under 32 GB."
   },
   "settings": {
-    "model_key": "qwen3_omni_instruct_int8",
+    "model_key": "qwen3_omni_instruct_gguf_q8",
     "prompt_preset_id": "qwen3_video_dense",
     "system_prompt": null,
     "user_prompt": "Describe the video in one {{CAPTION_LENGTH}} {{LANGUAGE}} paragraph, integrating visible and audible events in chronological order. Ground the caption in subjects, clothing, objects, setting, physical action, interactions, camera framing and movement, lighting, readable screen text, speech with speaker cues, music, sound effects, and environmental sound. Align each sound with the event or interval it accompanies, quote only clearly intelligible speech, and mark uncertain details rather than guessing. Use objective present tense with no heading, bullet list, analysis, or unsupported intent. {{AVOID}} {{EXTRA_INSTRUCTIONS}}",
@@ -21,7 +21,7 @@
     "top_k": 1,
     "repetition_penalty": 1.0,
     "max_new_tokens": 8192,
-    "context_tokens": 32768,
+    "context_tokens": 24576,
     "do_sample": false,
     "fps": 1.0,
     "max_frames": 240,
@@ -48,12 +48,12 @@
     "attention_backend": "auto",
     "subprocess_mode": true,
     "keep_model_loaded": true,
-    "idle_unload_minutes": 10,
-    "chat_system_prompt": "",
-    "chat_temperature": 0.2,
-    "chat_top_p": 0.95,
+    "idle_unload_minutes": 30,
+    "chat_system_prompt": "You are a helpful assistant who can watch video, listen to audio, and look at images attached to this conversation. When media is attached, ground every statement about it in what is actually visible or audible, quote speech only when it is clearly intelligible, and say plainly when something is uncertain, not shown, or not heard. When no media is attached, answer as a capable general assistant from your own knowledge, never claim to see or hear anything, and do not ask for an attachment unless the question cannot be answered without one. Treat attachments from earlier turns as still-available context, answer exactly what was asked, and keep replies concise unless more detail is requested.",
+    "chat_temperature": 0.7,
+    "chat_top_p": 0.8,
     "chat_top_k": 20,
-    "chat_max_new_tokens": 1024,
+    "chat_max_new_tokens": 2048,
     "chat_enable_thinking": false
   }
 }

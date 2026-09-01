@@ -22,13 +22,22 @@ def test_build_app_registry_and_presets_smoke(tmp_path: Path, monkeypatch) -> No
         assert defaults["desktop_notification_on_finish"] is False
         assert defaults["play_sound_on_finish"] is False
         assert defaults["open_output_folder_on_single_finish"] is False
-        assert defaults["gpu_layers"] == "auto"
+        assert "gpu_layers" not in defaults
+        assert defaults["block_swap_auto"] is True
+        assert defaults["blocks_to_swap"] == 0
         assert defaults["vram_reserve_gb"] == 2.0
         assert defaults["swap_slots"] == 2
         assert defaults["pin_cpu"] is True
         entries = {entry.key: entry for entry in registry.entries()}
         assert entries["vram_reserve_gb"].section == "model"
         assert entries["swap_slots"].choices == (2, 3)
+        assert entries["blocks_to_swap"].maximum == 48
+        # Presets saved before the block-swap controls existed still apply.
+        legacy, legacy_warnings = registry.coerce(
+            {"model_key": "qwen3_omni_instruct_int8", "gpu_layers": "36"}
+        )
+        assert not legacy_warnings
+        assert (legacy["block_swap_auto"], legacy["blocks_to_swap"]) == (False, 12)
         assert demo.vcap_context.preset_store.list_presets()
         first = demo.vcap_context.preset_store.list_presets()[0]
         assert first.name == "Default - Qwen3-Omni Instruct video"
@@ -38,6 +47,17 @@ def test_build_app_registry_and_presets_smoke(tmp_path: Path, monkeypatch) -> No
         values = registry.dict_to_values(loaded)
         roundtrip = registry.values_to_dict(values)
         assert all(roundtrip[key] == value for key, value in loaded.items())
+        # Every shipped preset must apply through the full registry without a
+        # single adjustment, including the Chat tab's preset-owned controls.
+        chat_keys = {entry.key for entry in registry.entries() if entry.section == "chat"}
+        assert chat_keys and all(entries[key].in_preset for key in chat_keys)
+        for entry in demo.vcap_context.preset_store.list_presets():
+            if not entry.is_default:
+                continue
+            shipped = demo.vcap_context.preset_store.load(entry.name)
+            assert chat_keys <= set(shipped), entry.name
+            _, warnings = registry.coerce(shipped)
+            assert not warnings, (entry.name, warnings)
     finally:
         demo.vcap_context.pipeline_client.shutdown()
         if marker_existed:

@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import gradio as gr
 
@@ -37,6 +37,24 @@ def action_button(label: str, hue: str, **kwargs: Any) -> gr.Button:
     classes = list(kwargs.pop("elem_classes", []) or [])
     classes.extend(["vc-btn", f"vc-btn-{hue}"])
     return gr.Button(label, elem_classes=classes, **kwargs)
+
+
+def context_usage_text(used: Any, limit: Any) -> str:
+    """Format used/total context tokens for a status line ('—' when unknown)."""
+
+    try:
+        used_value = int(used) if used is not None else 0
+    except (TypeError, ValueError):
+        used_value = 0
+    if used_value <= 0:
+        return "—"
+    try:
+        limit_value = int(limit) if limit is not None else 0
+    except (TypeError, ValueError):
+        limit_value = 0
+    if limit_value > 0:
+        return f"{used_value:,} / {limit_value:,} ({100.0 * used_value / limit_value:.0f}%)"
+    return f"{used_value:,}"
 
 
 @dataclass
@@ -69,7 +87,7 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
             choices=choices,
             value=initial,
             label="Universal preset",
-            info="Defaults are marked with a star and are read-only.",
+            info="Selecting a preset applies it immediately. Defaults are marked with a star and are read-only.",
             scale=4,
             min_width=260,
         )
@@ -103,17 +121,42 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         raise RuntimeError("preset_bar() must be built before it is wired")
     registry = ctx.settings_registry
     components = registry.components()
+    adapters: dict[str, Callable[[dict[str, Any]], Any]] = dict(
+        ctx.states.get("preset_value_adapters") or {}
+    )
+    # What the latest load, reset, or startup pushed into the UI: the preset
+    # name guards the dropdown's change event against the programmatic updates
+    # made after save/delete/startup, and the coerced settings let follow-ups
+    # read the loaded values instead of component values that the browser may
+    # not have applied yet.
+    applied_state = gr.State({"name": "", "settings": {}})
+
+    def applied(name: str | None, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"name": str(name or ""), "settings": dict(settings or {})}
+
+    def skipped() -> list[Any]:
+        return [gr.skip() for _ in components]
 
     def preset_values(settings: dict[str, Any]) -> list[Any]:
-        """Apply presets only to controls that participate in preset storage."""
+        """Apply presets only to controls that participate in preset storage.
+
+        Tabs may register adapters (``ctx.states["preset_value_adapters"]``) for
+        controls whose bounds depend on other settings; those ship the value
+        together with its bounds so no handler sees a value outside them.
+        """
 
         values = registry.dict_to_values(settings)
-        return [
-            value if entry.in_preset else gr.skip()
-            for entry, value in zip(registry.entries(), values)
-        ]
+        result: list[Any] = []
+        for entry, value in zip(registry.entries(), values):
+            if not entry.in_preset:
+                result.append(gr.skip())
+            elif entry.key in adapters:
+                result.append(adapters[entry.key](settings))
+            else:
+                result.append(value)
+        return result
 
-    def save_preset(name: str, *values: Any) -> tuple[Any, str, str]:
+    def save_preset(name: str, *values: Any) -> tuple[Any, str, str, Any]:
         try:
             requested = str(name or "").strip()
             if not requested:
@@ -124,9 +167,10 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
                 gr.update(choices=_preset_choices(ctx), value=saved),
                 saved,
                 f"<span class='vc-ok'>Saved preset: {html.escape(saved)}</span>",
+                applied(saved),
             )
         except Exception as exc:
-            return gr.skip(), str(name or ""), f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+            return gr.skip(), str(name or ""), f"<span class='vc-err'>{html.escape(str(exc))}</span>", gr.skip()
 
     def load_preset(name: str) -> tuple[Any, ...]:
         try:
@@ -135,32 +179,46 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             loaded = ctx.preset_store.load(str(name))
             coerced, warnings = registry.coerce(loaded)
             suffix = f" ({len(warnings)} value adjustment(s))" if warnings else ""
-            return (*preset_values(coerced), f"<span class='vc-ok'>Loaded {html.escape(str(name))}{suffix}</span>")
+            return (
+                *preset_values(coerced),
+                f"<span class='vc-ok'>Loaded {html.escape(str(name))}{suffix}</span>",
+                applied(name, coerced),
+            )
         except Exception as exc:
-            return (*[gr.skip() for _ in components], f"<span class='vc-err'>{html.escape(str(exc))}</span>")
+            return (*skipped(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", applied(""))
 
-    def delete_preset(name: str) -> tuple[Any, str]:
+    def select_preset(name: str, state: dict[str, Any] | None) -> tuple[Any, ...]:
+        """Apply a preset the moment it is picked; ignore re-selection of the applied one."""
+
+        current = str((state or {}).get("name") or "")
+        if not name or str(name) == current:
+            return (*skipped(), gr.skip(), applied(current))
+        return load_preset(str(name))
+
+    def delete_preset(name: str) -> tuple[Any, str, Any]:
         try:
             if not name:
                 raise PresetError("Choose a preset to delete")
             deleted = ctx.preset_store.delete(str(name))
-            choices = _preset_choices(ctx)
-            selected = choices[0][1] if choices else None
             message = f"Deleted {html.escape(str(name))}." if deleted else "Preset was already absent."
-            return gr.update(choices=choices, value=selected), f"<span class='vc-ok'>{message}</span>"
+            # Leave nothing selected: picking any preset afterwards applies it.
+            return gr.update(choices=_preset_choices(ctx), value=None), f"<span class='vc-ok'>{message}</span>", applied("")
         except Exception as exc:
-            return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+            return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", gr.skip()
 
     def reset_settings() -> tuple[Any, ...]:
-        return (*preset_values(registry.defaults()), "<span class='vc-ok'>Restored preset defaults.</span>")
+        defaults = registry.defaults()
+        return (*preset_values(defaults), "<span class='vc-ok'>Restored preset defaults.</span>", applied("", defaults))
 
     def startup_preset() -> tuple[Any, ...]:
         startup_name = ctx.preset_store.startup_preset_name()
         if not startup_name:
+            defaults = registry.defaults()
             return (
-                *preset_values(registry.defaults()),
+                *preset_values(defaults),
                 gr.update(choices=_preset_choices(ctx)),
                 "<span class='vc-ok'>Ready with application defaults.</span>",
+                applied("", defaults),
             )
         try:
             loaded = ctx.preset_store.load(startup_name)
@@ -170,18 +228,21 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
                 *preset_values(coerced),
                 gr.update(choices=_preset_choices(ctx), value=startup_name),
                 f"<span class='vc-ok'>Auto-loaded {html.escape(startup_name)}{suffix}.</span>",
+                applied(startup_name, coerced),
             )
         except Exception as exc:
+            defaults = registry.defaults()
             return (
-                *preset_values(registry.defaults()),
+                *preset_values(defaults),
                 gr.update(choices=_preset_choices(ctx)),
                 f"<span class='vc-warn'>Last preset could not load: {html.escape(str(exc))}</span>",
+                applied("", defaults),
             )
 
     handles.save.click(
         save_preset,
         inputs=[handles.save_as, *components],
-        outputs=[handles.dropdown, handles.save_as, handles.status],
+        outputs=[handles.dropdown, handles.save_as, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -189,7 +250,18 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     load_event = handles.load.click(
         load_preset,
         inputs=handles.dropdown,
-        outputs=[*components, handles.status],
+        outputs=[*components, handles.status, applied_state],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    # Selecting a preset applies it at once; Load re-applies the selection after
+    # manual edits. Gradio 6 dropdowns fire ``input`` on every blur (twice per
+    # mouse pick), so the binding uses ``change`` guarded by the applied name.
+    select_event = handles.dropdown.change(
+        select_preset,
+        inputs=[handles.dropdown, applied_state],
+        outputs=[*components, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -197,31 +269,47 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     handles.delete.click(
         delete_preset,
         inputs=handles.dropdown,
-        outputs=[handles.dropdown, handles.status],
+        outputs=[handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     reset_event = handles.reset.click(
         reset_settings,
-        outputs=[*components, handles.status],
+        outputs=[*components, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     startup_event = demo.load(
         startup_preset,
-        outputs=[*components, handles.dropdown, handles.status],
+        outputs=[*components, handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     auto_vram = ctx.states.get("caption_auto_vram_binding")
     if isinstance(auto_vram, dict):
-        for dependency in (load_event, reset_event, startup_event):
+        input_keys = list(auto_vram.get("input_keys") or [])
+        output_count = len(auto_vram["outputs"])
+
+        def follow_up(state: dict[str, Any] | None, *values: Any) -> tuple[Any, ...]:
+            """Run the tier plan on the settings that were just applied, or skip."""
+
+            settings = dict((state or {}).get("settings") or {})
+            if not settings:
+                return tuple(gr.skip() for _ in range(output_count))
+            keys = input_keys + [None] * (len(values) - len(input_keys))
+            resolved = [
+                settings[key] if key and key in settings else value
+                for key, value in zip(keys, values)
+            ]
+            return tuple(auto_vram["fn"](*resolved))
+
+        for dependency in (load_event, select_event, reset_event, startup_event):
             dependency.then(
-                auto_vram["fn"],
-                inputs=auto_vram["inputs"],
+                follow_up,
+                inputs=[applied_state, *auto_vram["inputs"]],
                 outputs=auto_vram["outputs"],
                 queue=False,
                 show_progress="hidden",
@@ -841,7 +929,7 @@ def progress_panel(ctx: "UiContext") -> ProgressPanelHandles:
         with gr.Row(elem_classes=["vc-compact-row"]):
             status = gr.Markdown("**Status:** Ready", scale=5)
             eta = gr.Markdown("**ETA:** —", scale=2)
-            tokens = gr.Markdown("**Speed:** —", scale=2)
+            tokens = gr.Markdown("**Speed:** — · **Context:** —", scale=2)
     return ProgressPanelHandles(bars, status, eta, tokens)
 
 

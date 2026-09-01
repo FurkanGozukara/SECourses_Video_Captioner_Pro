@@ -12,6 +12,18 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.3.1",
+        "2026-09-02",
+        """
+### Block swap is visible and adjustable
+
+- The Model panel now opens a `Block swap & offload plan` section by default. With `Automatic block swap` on, the `Decoder layers to block-swap` slider shows the swapped-layer count the loader is expected to choose for the selected variant, GPU, media budget, reserve, and slots, and the line under it reports resident layers, pinned RAM, the expected peak against free VRAM, tower staging, and any overflow warnings. The preview reruns whenever those inputs change.
+- Uncheck `Automatic block swap` to set the swapped count yourself (0 keeps the whole decoder resident); the slider starts from the automatic value so small adjustments are easy. GGUF variants and the legacy expert offload keep the slider disabled with a note explaining why.
+- When a model is resident, the preview uses the free VRAM measured before that model was placed (the figure the next load will see) and also reports the loaded plan. Presets and run metadata saved before this version that stored `gpu_layers` are translated on load; the Recover tab's model-only mode includes the new controls.
+- GGUF loads now pass the `VRAM to keep free (GB)` control to `llama-server`'s fit target; previously the backend used its own 2 GB default regardless of the setting.
+""".strip(),
+    ),
+    (
         "v1.3.0",
         "2026-09-01",
         """

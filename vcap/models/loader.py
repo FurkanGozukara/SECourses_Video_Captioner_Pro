@@ -329,6 +329,7 @@ def _load_llamacpp_model(
     offload: OffloadPlan | None,
     progress_cb: ProgressCallback | None,
     model_dir: str | os.PathLike[str] | None,
+    context_size: int | None = None,
 ) -> LoadedModel:
     """Start a local llama-server and wrap it in the common load contract."""
 
@@ -348,6 +349,7 @@ def _load_llamacpp_model(
         raise FileNotFoundError(f"GGUF model files are incomplete in {folder}")
     _emit(progress_cb, f"Loading {spec.label} / {variant.label} with llama.cpp", 0.0)
     server = ensure_llamacpp(progress_cb)
+    plan = offload or OffloadPlan()
     backend = LlamaCppCaptioner(
         family,
         variant_key=variant.key,
@@ -358,6 +360,11 @@ def _load_llamacpp_model(
         vram_total_gb=float(
             resource_snapshot(gpu_index).get("vram_total_gb", 0.0) or 0.0
         ),
+        # The UI's "VRAM to keep free" sets llama.cpp's fit target; the backend's
+        # own default must never stand in for the value the user configured.
+        vram_reserve_gb=float(plan.vram_reserve_gb),
+        # The requested window; the tier plan and llama.cpp's fitter may shrink it.
+        **({"context_size": int(context_size)} if context_size else {}),
     )
     backend.start(progress_cb)
     report = LoadReport(
@@ -378,7 +385,7 @@ def _load_llamacpp_model(
         str(device),
         None,
         "llamacpp",
-        offload or OffloadPlan(),
+        plan,
         folder,
         gpu_index,
     )
@@ -675,6 +682,7 @@ def load_model(
             offload=offload,
             progress_cb=progress_cb,
             model_dir=hf_dir,
+            context_size=int(getattr(budget_hint, "context_tokens", 0) or 0) or None,
         )
     import torch
 
@@ -1052,6 +1060,14 @@ class ModelCache:
         """Reuse an identical model or unload before switching variants/options."""
 
         offload = kwargs.get("offload") or OffloadPlan()
+        # A llama-server is started with a fixed context, so a different requested
+        # window needs a restart; Transformers apply the window per call instead.
+        context_key = 0
+        try:
+            if get_variant(variant_key).scheme == "gguf":
+                context_key = int(getattr(kwargs.get("budget_hint"), "context_tokens", 0) or 0)
+        except KeyError:
+            context_key = 0
         key = (
             variant_key,
             str(kwargs.get("device", "cuda:0")),
@@ -1063,6 +1079,7 @@ class ModelCache:
             bool(kwargs.get("compile_model", False)),
             str(kwargs.get("compile_mode", DEFAULT_COMPILE_MODE)),
             repr(kwargs.get("last_token_logits", True)),
+            context_key,
         )
         with self._lock:
             if self._loaded is not None and self._key == key and self._loaded.model is not None:

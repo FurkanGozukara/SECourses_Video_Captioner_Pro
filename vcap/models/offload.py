@@ -178,6 +178,164 @@ _FAMILY_LAYOUTS: dict[str, tuple[int, tuple[str, ...]]] = {
 }
 
 
+def family_layer_count(family: str) -> int:
+    """Return the decoder-layer count of a model family."""
+
+    try:
+        return _FAMILY_LAYOUTS[family][0]
+    except KeyError as exc:
+        raise KeyError(f"Unknown model family for block swap: {family}") from exc
+
+
+def block_swap_to_gpu_layers(auto: bool, blocks_to_swap: int, layer_count: int) -> int | str:
+    """Translate the block-swap controls into an :class:`OffloadPlan` ``gpu_layers`` value.
+
+    ``auto`` keeps the loader's fit-to-free-VRAM policy; otherwise ``blocks_to_swap``
+    decoder layers (capped at the family's layer count) stay in pinned RAM and the
+    rest remain resident. Zero swapped layers keeps the whole decoder on the GPU.
+    """
+
+    if auto:
+        return "auto"
+    layers = max(0, int(layer_count))
+    try:
+        swapped = int(blocks_to_swap)
+    except (TypeError, ValueError, OverflowError):
+        swapped = 0
+    return layers - min(layers, max(0, swapped))
+
+
+def gpu_layers_to_block_swap(gpu_layers: int | str | None, layer_count: int) -> tuple[bool, int]:
+    """Translate a ``gpu_layers`` value into ``(automatic, blocks_to_swap)``.
+
+    ``auto`` (and anything unparseable) maps to the automatic plan, ``all`` to zero
+    swapped layers, and a resident count ``N`` to ``layer_count - N`` swapped layers.
+    """
+
+    if gpu_layers is None or isinstance(gpu_layers, bool):
+        return True, 0
+    if isinstance(gpu_layers, str):
+        text = gpu_layers.strip().casefold()
+        if not text or text == "auto":
+            return True, 0
+        if text == "all":
+            return False, 0
+        try:
+            resident = int(float(text))
+        except ValueError:
+            return True, 0
+    else:
+        try:
+            resident = int(gpu_layers)
+        except (TypeError, ValueError, OverflowError):
+            return True, 0
+    layers = max(0, int(layer_count))
+    return False, layers - min(layers, max(0, resident))
+
+
+def migrate_legacy_gpu_layers(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite a legacy ``gpu_layers`` setting into the block-swap controls.
+
+    Older presets and run metadata stored ``gpu_layers`` (``auto``/``all``/count).
+    The UI now stores ``block_swap_auto`` and ``blocks_to_swap`` instead; when only
+    the legacy key is present it is translated using the selected family's layer
+    count and removed. The input mapping is never mutated.
+    """
+
+    result = dict(settings)
+    if "gpu_layers" not in result:
+        return result
+    legacy = result.pop("gpu_layers")
+    if "block_swap_auto" in result or "blocks_to_swap" in result:
+        return result
+    layer_count = 48
+    variant = result.get("model_key") or result.get("variant_key")
+    if variant:
+        try:
+            from .registry import variant_to_family
+
+            layer_count = family_layer_count(variant_to_family(str(variant)))
+        except KeyError:
+            pass
+    auto, swapped = gpu_layers_to_block_swap(legacy, layer_count)
+    result["block_swap_auto"] = auto
+    result["blocks_to_swap"] = swapped
+    return result
+
+
+def planning_config(folder: str | Path) -> dict[str, Any]:
+    """Read the thinker configuration from ``config.json`` without Transformers.
+
+    Qwen3-Omni checkpoints nest the thinker under ``thinker_config``; Qwen2.5-Omni
+    thinkers expose ``text_config`` at the root. Either shape satisfies
+    :func:`estimate_activation_bytes`.
+    """
+
+    path = Path(folder) / "config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid model config in {path}: expected a JSON object")
+    inner = payload.get("thinker_config")
+    return inner if isinstance(inner, dict) else payload
+
+
+_LAYOUT_CACHE: dict[str, tuple[tuple[int, int], CheckpointLayout]] = {}
+
+
+def cached_checkpoint_layout(safetensors_path: str | Path) -> CheckpointLayout:
+    """Return :func:`checkpoint_layout` for a file, reusing it while size and mtime match."""
+
+    path = Path(safetensors_path)
+    stat = path.stat()
+    signature = (int(stat.st_size), int(stat.st_mtime_ns))
+    key = str(path.resolve(strict=False))
+    cached = _LAYOUT_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    layout = checkpoint_layout(path)
+    _LAYOUT_CACHE[key] = (signature, layout)
+    return layout
+
+
+def plan_model_folder(
+    family: str,
+    variant_key: str,
+    folder: str | Path,
+    plan: OffloadPlan,
+    hint: BudgetHint | None,
+    *,
+    free_vram_bytes: int,
+    total_vram_bytes: int,
+    ram_available_bytes: int | None = None,
+) -> BlockSwapBudget:
+    """Resolve the residency plan for a local checkpoint folder without loading it.
+
+    This mirrors the loader's planning inputs (safetensors header, config, activation
+    estimate with the variant's observed ratio) so the UI can preview what ``auto``
+    will resolve to before a job starts.
+    """
+
+    root = Path(folder)
+    config = planning_config(root)
+    activation = int(
+        estimate_activation_bytes(
+            family,
+            config,
+            hint,
+            observed_ratio=observed_activation_ratio(variant_key),
+        )
+    )
+    layout = cached_checkpoint_layout(root / "model.safetensors")
+    return plan_block_swap(
+        plan,
+        layout,
+        free_vram_bytes=free_vram_bytes,
+        total_vram_bytes=total_vram_bytes,
+        activation_bytes=activation,
+        ram_available_bytes=ram_available_bytes,
+    )
+
+
 def _memory_limits(
     plan: OffloadPlan,
     vram_free_gb: float,
@@ -767,13 +925,20 @@ __all__ = [
     "CheckpointLayout",
     "DeviceMapPlan",
     "OffloadPlan",
+    "block_swap_to_gpu_layers",
     "build_device_map",
+    "cached_checkpoint_layout",
     "checkpoint_layout",
     "estimate_activation_bytes",
     "estimate_layers_on_gpu",
+    "family_layer_count",
+    "gpu_layers_to_block_swap",
+    "migrate_legacy_gpu_layers",
     "observed_activation_bytes",
     "observed_activation_ratio",
     "plan_block_swap",
+    "plan_model_folder",
+    "planning_config",
     "record_observed_activation_bytes",
     "vram_budget_gb",
 ]

@@ -2,8 +2,8 @@
   "_meta": {
     "format": "secourses_vcap_preset",
     "version": 1,
-    "name": "Default - Qwen3-Omni Instruct video",
-    "description": "Balanced dense audiovisual captioning with the INT8 Qwen3-Omni Instruct model."
+    "name": "Chat assistant (Qwen3-Omni Instruct)",
+    "description": "Multi-turn multimodal chat with the INT8 Qwen3-Omni Instruct model: the fastest chat-capable family, Qwen3 non-thinking sampling, and a 30-minute idle unload so the model stays resident between turns."
   },
   "settings": {
     "model_key": "qwen3_omni_instruct_int8",
@@ -48,12 +48,12 @@
     "attention_backend": "auto",
     "subprocess_mode": true,
     "keep_model_loaded": true,
-    "idle_unload_minutes": 10,
-    "chat_system_prompt": "",
-    "chat_temperature": 0.2,
-    "chat_top_p": 0.95,
+    "idle_unload_minutes": 30,
+    "chat_system_prompt": "You are a helpful assistant who can watch video, listen to audio, and look at images attached to this conversation. When media is attached, ground every statement about it in what is actually visible or audible, quote speech only when it is clearly intelligible, and say plainly when something is uncertain, not shown, or not heard. When no media is attached, answer as a capable general assistant from your own knowledge, never claim to see or hear anything, and do not ask for an attachment unless the question cannot be answered without one. Treat attachments from earlier turns as still-available context, answer exactly what was asked, and keep replies concise unless more detail is requested.",
+    "chat_temperature": 0.7,
+    "chat_top_p": 0.8,
     "chat_top_k": 20,
-    "chat_max_new_tokens": 1024,
+    "chat_max_new_tokens": 2048,
     "chat_enable_thinking": false
   }
 }

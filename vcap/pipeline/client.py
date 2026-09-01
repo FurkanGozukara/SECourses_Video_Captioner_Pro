@@ -594,6 +594,61 @@ class PipelineClient:
             with self._state_lock:
                 self._idle_unloaded = True
 
+    def ping(self, timeout_s: float = 0.6) -> dict[str, Any]:
+        """Report the resident model and its block-swap summary without loading anything.
+
+        Returns a ``pong`` mapping (``loaded_variant`` and ``block_swap`` may be
+        ``None``), ``{"busy": True}`` while a job owns the worker, or
+        ``{"error": ...}`` when the worker did not answer in time.
+        """
+
+        if not self.subprocess_mode:
+            try:
+                from .runner import loaded_block_swap_summary, loaded_variant_key
+
+                return {
+                    "ev": "pong",
+                    "loaded_variant": loaded_variant_key(),
+                    "block_swap": loaded_block_swap_summary(),
+                }
+            except Exception as exc:
+                return {"error": str(exc)}
+
+        with self._state_lock:
+            worker = self._worker
+            busy = self._busy
+        if busy:
+            return {"busy": True}
+        if worker is None or not worker.is_alive():
+            return {"ev": "pong", "loaded_variant": None, "block_swap": None}
+        if not self._run_lock.acquire(blocking=False):
+            return {"busy": True}
+        deferred: list[Any] = []
+        try:
+            with self._state_lock:
+                if self._busy:
+                    return {"busy": True}
+            worker.send({"cmd": "ping"})
+            deadline = time.monotonic() + max(0.05, float(timeout_s))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    event = self._events.get(timeout=min(0.1, remaining))
+                except queue.Empty:
+                    continue
+                if isinstance(event, Mapping) and event.get("ev") == "pong":
+                    return dict(event)
+                deferred.append(event)
+            return {"error": "Worker health ping timed out"}
+        except Exception as exc:
+            return {"error": str(exc)}
+        finally:
+            for event in deferred:
+                self._events.put(event)
+            self._run_lock.release()
+
     def _idle_loop(self) -> None:
         while not self._shutdown.wait(0.25):
             with self._state_lock:

@@ -948,7 +948,7 @@ class _ModelSession:
             max_pixels=self.spec.preprocess.max_pixels,
             fps=self.spec.preprocess.fps,
             max_new_tokens=self.spec.generation.max_new_tokens,
-            context_tokens=model_spec.limits.context_tokens,
+            context_tokens=_context_limit(self.spec, model_spec),
             media_kinds=hint_kinds,
         )
         physical_gpu_index = int(self.spec.runtime.gpu_index)
@@ -1094,10 +1094,19 @@ def unload_cached_model() -> None:
         pass
 
 
+def _context_limit(spec: JobSpec, model: ModelSpec) -> int:
+    """Return the job's effective context window: the request capped by the model."""
+
+    cap = int(model.limits.context_tokens)
+    requested = getattr(spec.generation, "context_tokens", None)
+    return min(cap, int(requested)) if requested else cap
+
+
 def _effective_model_limit(spec: JobSpec, model: ModelSpec, include_audio: bool) -> float | None:
     registry_limit = model.limits.compute_max_duration(
         spec.preprocess.fps,
         spec.preprocess.max_pixels,
+        context=_context_limit(spec, model),
         reserve_tokens=spec.generation.max_new_tokens,
         include_audio=include_audio,
     )

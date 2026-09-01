@@ -356,6 +356,12 @@ def _pipeline_ping(ctx: "UiContext", timeout_s: float = 0.6) -> dict[str, Any]:
     """Read model health from the local cache or an idle persistent worker."""
 
     client = ctx.pipeline_client
+    ping = getattr(client, "ping", None)
+    if callable(ping):
+        try:
+            return dict(ping(timeout_s=timeout_s))
+        except Exception as exc:
+            return {"error": str(exc)}
     if not bool(getattr(client, "subprocess_mode", True)):
         try:
             from vcap.pipeline.runner import loaded_block_swap_summary, loaded_variant_key

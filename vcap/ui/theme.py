@@ -412,6 +412,7 @@ HOTKEYS_HEAD = r"""
     const label = (selected && selected.textContent ? selected.textContent : '').toLowerCase();
     if (label.includes('caption editor')) return 'editor';
     if (label.includes('caption')) return 'caption';
+    if (label.includes('processing pipeline')) return 'caption';
     const panels = root.querySelectorAll('[role="tabpanel"]');
     for (const panel of panels) {
       const style = window.getComputedStyle(panel);

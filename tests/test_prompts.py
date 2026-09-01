@@ -373,15 +373,29 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
         "subprocess_mode",
         "keep_model_loaded",
         "idle_unload_minutes",
+        "chat_system_prompt",
+        "chat_temperature",
+        "chat_top_p",
+        "chat_top_k",
+        "chat_max_new_tokens",
+        "chat_enable_thinking",
+        "context_tokens",
     }
+    # Only Thinking presets spell out the caption-side reasoning switch.
+    optional_keys = {"enable_thinking"}
     preset_files = sorted((Path(__file__).parents[1] / "presets_default").glob("*.json"))
-    assert len(preset_files) == 9
+    assert len(preset_files) == 13
 
     for preset_file in preset_files:
         payload = json.loads(preset_file.read_text(encoding="utf-8"))
         assert payload["_meta"]["format"] == "secourses_vcap_preset"
         assert payload["_meta"]["version"] == 1
-        assert set(payload["settings"]) == required_keys
+        keys = set(payload["settings"])
+        assert required_keys <= keys <= required_keys | optional_keys, preset_file.name
+        if "thinking" in payload["settings"]["model_key"]:
+            assert payload["settings"]["enable_thinking"] is True, preset_file.name
+        else:
+            assert "enable_thinking" not in keys, preset_file.name
         assert payload["settings"]["prompt_preset_id"] in EXPECTED_PRESET_IDS
         assert payload["settings"]["split_mode"] in {"copy", "precise"}
         assert set(payload["settings"]["output_formats"]) <= {"txt", "json", "srt"}

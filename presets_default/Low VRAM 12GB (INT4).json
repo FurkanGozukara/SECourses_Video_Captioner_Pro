@@ -21,6 +21,7 @@
     "top_k": 1,
     "repetition_penalty": 1.0,
     "max_new_tokens": 4096,
+    "context_tokens": 32768,
     "do_sample": false,
     "fps": 1.0,
     "max_frames": 80,
@@ -47,6 +48,12 @@
     "attention_backend": "auto",
     "subprocess_mode": true,
     "keep_model_loaded": true,
-    "idle_unload_minutes": 10
+    "idle_unload_minutes": 10,
+    "chat_system_prompt": "",
+    "chat_temperature": 0.2,
+    "chat_top_p": 0.95,
+    "chat_top_k": 20,
+    "chat_max_new_tokens": 1024,
+    "chat_enable_thinking": false
   }
 }

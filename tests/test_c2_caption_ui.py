@@ -303,3 +303,85 @@ def test_caption_tab_action_button_hues_are_distinct() -> None:
         assert len(hues) == len(set(hues)), action_buttons
     finally:
         client.shutdown()
+
+
+def test_model_switch_handlers_never_narrow_backend_bounds() -> None:
+    """Every handler that reshapes numeric controls must keep the backend bounds.
+
+    Gradio validates incoming values against the *backend* bound of a Number or
+    Slider, and sibling handlers on one trigger race each other, so an update
+    that narrowed a bound could make another handler's stale value fail with
+    "Value 768 is greater than maximum value 160". Bounds therefore stay at
+    their construction-time (global) values; family limits are clamped values.
+    """
+
+    from vcap.models.registry import MODEL_SPECS
+    from vcap.models.vram_presets import VRAM_TIERS
+
+    client = PipelineClient(subprocess_mode=True)
+    ctx = UiContext(
+        settings_registry=SettingsRegistry(),
+        preset_store=PresetStore(Path("presets"), Path("presets_default")),
+        pipeline_client=client,
+        app_log=get_log(),
+    )
+    try:
+        with gr.Blocks() as demo:
+            caption_tab.build(ctx)
+        config = demo.get_config_file()
+        bounds = {
+            component["id"]: (component["props"].get("minimum"), component["props"].get("maximum"))
+            for component in config["components"]
+            if component.get("type") in {"number", "slider"}
+        }
+        checked = 0
+
+        def check(component_id: int, value: object, context: str) -> None:
+            nonlocal checked
+            if component_id not in bounds:
+                return
+            low, high = bounds[component_id]
+            if isinstance(value, dict):
+                if "minimum" in value:
+                    assert value["minimum"] == low, (context, component_id, value)
+                if "maximum" in value:
+                    assert value["maximum"] == high, (context, component_id, value)
+                value = value.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return
+            if low is not None:
+                assert value >= low, (context, component_id, value, low)
+            if high is not None:
+                assert value <= high, (context, component_id, value, high)
+            checked += 1
+
+        variants = [variant.key for spec in MODEL_SPECS.values() for variant in spec.variants]
+        tiers = ["auto", *[str(tier) for tier in VRAM_TIERS]]
+        for dependency in config["dependencies"]:
+            fn = demo.fns[dependency["id"]].fn
+            name = getattr(fn, "__name__", "")
+            if name in {"model_defaults", "model_constraints"}:
+                for variant in variants:
+                    for component_id, value in zip(dependency["outputs"], fn(variant)):
+                        check(component_id, value, f"{name}({variant})")
+            elif name in {"apply_vram", "apply_auto_vram"}:
+                for variant in variants:
+                    for tier in tiers:
+                        outputs = fn(variant, tier, 0, False)
+                        for component_id, value in zip(dependency["outputs"], outputs):
+                            check(component_id, value, f"{name}({variant}, {tier})")
+        binding = ctx.states["caption_auto_vram_binding"]
+        for variant in variants:
+            for tier in tiers:
+                outputs = binding["fn"](variant, tier, 0, False)
+                for component, value in zip(binding["outputs"], outputs):
+                    check(component._id, value, f"auto_vram_startup({variant}, {tier})")
+        components = {entry.key: entry.component for entry in ctx.settings_registry.entries()}
+        for key, adapter in ctx.states["preset_value_adapters"].items():
+            for path in sorted(Path("presets_default").glob("*.json")):
+                settings = json.loads(path.read_text(encoding="utf-8"))["settings"]
+                for variant in variants:
+                    check(components[key]._id, adapter({**settings, "model_key": variant}), f"adapter {key} {path.name} {variant}")
+        assert checked > 500
+    finally:
+        client.shutdown()

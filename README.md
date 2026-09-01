@@ -14,8 +14,8 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Produce UTF-8 TXT, structured JSON, SRT, VTT, JSONL, optional Thinking reasoning, `run_log.txt`, and collision-safe single or batch output directories.
 - Review source-backed or caption-only items in the Caption Editor with autosave, filters, approval flags, regeneration diffs, find/replace, bulk edits, and approved-only export with explicit no-media counts.
 - Use Dataset & Export for trainer frame-fit suggestions, crop/pad bucket previews, timestamped fitness plans, an overlap-aware video sub-split tool, and Kohya/Musubi TOML generation.
-- Chat through the shared resident worker with streamed Qwen3-Omni multimodal multi-turn history or single-turn TimeChat/AVoCaDO video Q&A, then save the conversation as JSON and Markdown.
-- Use protected shipped presets, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
+- Chat through the shared resident worker with streamed Qwen3-Omni multimodal multi-turn history (video, audio, or images can be attached to any turn) or single-turn TimeChat/AVoCaDO video Q&A, watch the answer stream into the conversation (Thinking models stream their reasoning first as a collapsible thought block), track tokens, speed, and context usage per reply, then save the conversation as JSON and Markdown.
+- Use protected shipped presets that also cover Chat, apply any preset the moment it is selected, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
 - Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention plans with automatic decoder block swap that keeps 2 GB of dedicated VRAM free instead of paging into Windows shared GPU memory, recover from supported OOM cases, inspect live VRAM/RAM/shared-memory and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
 - Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server` that fits itself to device memory, while 63.4 GB Qwen3 BF16 checkpoints run through pinned-RAM block swap on smaller GPUs.
 
@@ -89,7 +89,7 @@ Both shell installers use `apt-get` for missing Git, FFmpeg, CMake, and a C++ bu
 
 ## First Run and Models
 
-`Windows_Run_Video_Captioner_Pro.bat` opens the local app at `http://127.0.0.1:7860`. A missing model is downloaded and validated when it is first used for captioning; interrupted downloads retain their resumable `.part` state.
+`Windows_Run_Video_Captioner_Pro.bat` opens the local app at `http://127.0.0.1:7860`, or the next free port if 7860 is taken; pass `--server-name` and `--server-port` to pin a specific address and port. The terminal prints the URL actually used. A missing model is downloaded and validated when it is first used for captioning; interrupted downloads retain their resumable `.part` state.
 
 To choose models in advance or resume downloads manually, run this from the distribution folder:
 
@@ -105,12 +105,20 @@ SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py
 
 The downloader menu includes Qwen3-Omni Instruct, Thinking, and Captioner in both GGUF Q4_K_M and Q8_0 forms. On Linux the model files can be downloaded from this menu, but the pinned `llama-server` runtime must be built with CMake and a C++ compiler and selected with `VCAP_LLAMACPP_SERVER`; see [docs/GGUF_BACKEND.md](docs/GGUF_BACKEND.md).
 
-The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, and attention plan. Decoder placement is `auto` on every tier: at load time the app measures free VRAM, estimates the job's activation peak from the media it will process, keeps 2 GB free, and block-swaps the remaining decoder layers from pinned RAM through a prefetching ring of GPU slots (see [docs/BLOCK_SWAP.md](docs/BLOCK_SWAP.md)). `Decoder layers on GPU`, `VRAM to keep free (GB)`, and `Swap slots` in the Offload plan section override this per job.
+The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, and attention plan. Decoder placement is automatic on every tier: at load time the app measures free VRAM, estimates the job's activation peak from the media it will process, keeps 2 GB free, and block-swaps the remaining decoder layers from pinned RAM through a prefetching ring of GPU slots (see [docs/BLOCK_SWAP.md](docs/BLOCK_SWAP.md)). The `Block swap & offload plan` section of the Model panel shows what that resolves to: with `Automatic block swap` on, the `Decoder layers to block-swap` slider displays the swapped-layer count the loader is expected to choose for the selected variant, GPU, media budget, and reserve, and the line under it reports the expected peak against free VRAM. Uncheck `Automatic block swap` to set the swapped count yourself (0 keeps the whole decoder on the GPU); `VRAM to keep free (GB)` and `Swap slots` tune the automatic plan.
 
 ## Presets and Persistence
 
 - `presets_default/` contains shipped read-only presets; the UI refuses to overwrite or delete them.
 - `presets/` contains user presets and the last-used marker; saving or loading a preset marks it as last used, and startup loads it automatically.
+- Selecting a preset in the universal preset dropdown applies it immediately; Load re-applies the selected preset after manual edits, and Reset restores application defaults. Task / prompt presets in the Caption tab apply on selection as well.
+- Every preset also stores the Chat tab's system prompt and generation settings plus the context window. Four shipped presets select chat-capable models: `Chat assistant (Qwen3-Omni Instruct)` and `Chat with reasoning (Qwen3-Omni Thinking)` use the INT8 ConvRot Transformers path with native video, while the `… fast (… GGUF Q8)` variants run through the private `llama-server` for several times the decode speed with video sent as sampled frames plus audio. Qwen3-Omni Instruct and Thinking hold multi-turn conversations over video, audio, images, and text; TimeChat and AVoCaDO answer one question about exactly one video per Send; the Qwen3-Omni Captioner has no chat mode.
+
+## Context Length
+
+`Context length (tokens)` in the Caption tab's Generation section sets the total window for prompt, media, and reply. It is model-specific like the other generation controls (every shipped family allows 32,768) and is saved with universal presets. The window bounds the caption auto-split ceiling, trims the oldest chat turns to fit, and caps the reply so it never runs past the window.
+
+Memory follows the backend: `llama-server` reserves the KV cache for the whole window at load (Qwen3-Omni needs about 96 KB per token, so 32k costs about 3 GB and 16k about 1.5 GB; TimeChat and AVoCaDO need about 56 KB per token), the VRAM tier clamps GGUF windows to 8k/16k/32k, and llama.cpp's fitter may shrink it further. Changing the window restarts the GGUF server; the Transformers backends grow the cache during generation and only fold the window into the block-swap activation budget. The control's help text shows each model's cost, the Caption tab's budget line shows the KV estimate at the current window, and the Speed line (Caption) and Tokens line (Chat) report `Context: used / window` after every reply. The GGUF chat presets request 24,576 tokens to leave more room for resident decoder layers.
 - `app_settings.json` stores the outputs, temporary, and models directories plus the save-processed-files and recursive-scan preferences; environment variables still take precedence for application directories.
 - Recover Settings reads `metadata.json` and restores compatible controls, while source paths require an explicit opt-in and unavailable GPU indices are skipped.
 
@@ -124,8 +132,8 @@ Shortcuts are scoped to the active tab.
 
 | Tab | Shortcut | Action |
 |---|---|---|
-| Caption | `F9` | Start captioning. |
-| Caption | `Esc` | Arm cancellation for six seconds; press again to confirm while a caption job is active. |
+| Caption, Processing Pipeline | `F9` | Start captioning. |
+| Caption, Processing Pipeline | `Esc` | Arm cancellation for six seconds; press again to confirm while a caption job is active. |
 | Caption Editor | `←` / `→` | Previous / next item when focus is outside a text field. |
 | Caption Editor | `Ctrl+S` | Save the current caption, including while editing its textbox. |
 | Caption Editor | `Ctrl+Enter` | Approve the current item. |

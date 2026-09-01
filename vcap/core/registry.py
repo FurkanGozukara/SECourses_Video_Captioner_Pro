@@ -6,7 +6,7 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,19 @@ class SettingsRegistry:
     def __init__(self) -> None:
         self._entries: list[SettingEntry] = []
         self._by_key: dict[str, SettingEntry] = {}
+        self._migrations: list[Callable[[dict[str, Any]], dict[str, Any] | None]] = []
+
+    def add_migration(self, migrate: Callable[[dict[str, Any]], dict[str, Any] | None]) -> None:
+        """Register a translation applied to raw settings before coercion.
+
+        Migrations rewrite keys that older presets or run metadata stored under a
+        name the UI no longer registers. Each callable receives a copy of the
+        mapping and returns the rewritten mapping (or ``None`` to keep it as is).
+        """
+
+        if not callable(migrate):
+            raise TypeError("migration must be callable")
+        self._migrations.append(migrate)
 
     def register(
         self,
@@ -180,7 +193,11 @@ class SettingsRegistry:
     def coerce(self, d: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
         """Cast, clamp, validate, and default a settings mapping."""
 
-        source = d if isinstance(d, dict) else {}
+        source = dict(d) if isinstance(d, dict) else {}
+        for migrate in self._migrations:
+            migrated = migrate(dict(source))
+            if isinstance(migrated, dict):
+                source = migrated
         result: dict[str, Any] = {}
         warnings: list[str] = []
         for key in source:
