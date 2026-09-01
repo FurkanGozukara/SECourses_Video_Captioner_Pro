@@ -352,6 +352,111 @@ def _compile_report(force: bool = False) -> str:
     )
 
 
+def _pipeline_ping(ctx: "UiContext", timeout_s: float = 0.6) -> dict[str, Any]:
+    """Read model health from the local cache or an idle persistent worker."""
+
+    client = ctx.pipeline_client
+    if not bool(getattr(client, "subprocess_mode", True)):
+        try:
+            from vcap.pipeline.runner import loaded_block_swap_summary, loaded_variant_key
+
+            return {
+                "ev": "pong",
+                "loaded_variant": loaded_variant_key(),
+                "block_swap": loaded_block_swap_summary(),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    state_lock = getattr(client, "_state_lock", None)
+    try:
+        if state_lock is not None:
+            with state_lock:
+                worker = getattr(client, "_worker", None)
+                busy = bool(getattr(client, "_busy", False))
+        else:
+            worker = getattr(client, "_worker", None)
+            busy = bool(getattr(client, "_busy", False))
+    except Exception as exc:
+        return {"error": str(exc)}
+    if busy:
+        return {"busy": True}
+    if worker is None or not worker.is_alive():
+        return {"ev": "pong", "loaded_variant": None, "block_swap": None}
+
+    run_lock = getattr(client, "_run_lock", None)
+    if run_lock is None or not run_lock.acquire(blocking=False):
+        return {"busy": True}
+    events = getattr(client, "_events", None)
+    deferred: list[Any] = []
+    try:
+        if bool(getattr(client, "_busy", False)):
+            return {"busy": True}
+        worker.send({"cmd": "ping"})
+        deadline = time.monotonic() + max(0.05, float(timeout_s))
+        while time.monotonic() < deadline:
+            try:
+                event = events.get(timeout=min(0.1, deadline - time.monotonic()))
+            except queue.Empty:
+                continue
+            if isinstance(event, Mapping) and event.get("ev") == "pong":
+                return dict(event)
+            deferred.append(event)
+        return {"error": "Worker health ping timed out"}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if events is not None:
+            for event in deferred:
+                events.put(event)
+        run_lock.release()
+
+
+def render_model_health(pong: Mapping[str, Any] | None) -> str:
+    """Format a worker pong as compact loaded-model and block-swap status."""
+
+    data = dict(pong or {})
+    if data.get("busy"):
+        return "**Loaded model:** worker is busy; status will refresh after the active job."
+    if data.get("error"):
+        return f"<span class='vc-warn'>Model health unavailable: {html.escape(str(data['error']))}</span>"
+    loaded = data.get("loaded_variant")
+    if not loaded:
+        return "**Loaded model:** none"
+    lines = [f"**Loaded model:** `{html.escape(str(loaded))}`"]
+    summary = data.get("block_swap")
+    if not isinstance(summary, Mapping):
+        lines.append("**Block swap:** not active or unavailable")
+        return "  \n".join(lines)
+
+    mode = html.escape(str(summary.get("mode") or "active"))
+    resident = summary.get("resident_layers")
+    total = summary.get("layer_count")
+    swapped = summary.get("swapped_layers")
+    slots = summary.get("slots")
+    details: list[str] = []
+    if resident is not None and total is not None:
+        details.append(f"{int(resident)}/{int(total)} resident")
+    if swapped is not None:
+        details.append(f"{int(swapped)} swapped")
+    if slots is not None:
+        details.append(f"{int(slots)} slot(s)")
+    if summary.get("pinned_gib") is not None:
+        details.append(f"{float(summary['pinned_gib']):.2f} GiB pinned")
+    lines.append(f"**Block swap:** `{mode}`" + (f"; {', '.join(details)}" if details else ""))
+    peak = summary.get("expected_peak_gib")
+    reserve = summary.get("reserve_gib")
+    if peak is not None or reserve is not None:
+        peak_text = f"{float(peak):.2f} GiB" if peak is not None else "unknown"
+        reserve_text = f"{float(reserve):.2f} GiB" if reserve is not None else "unknown"
+        lines.append(f"**Expected peak:** {peak_text}; **reserve:** {reserve_text}")
+    return "  \n".join(lines)
+
+
+def _model_health_report(ctx: "UiContext") -> str:
+    return render_model_health(_pipeline_ping(ctx))
+
+
 def build(ctx: "UiContext") -> None:
     """Render live health information and streaming model actions."""
 
@@ -395,6 +500,11 @@ def build(ctx: "UiContext") -> None:
             gr.Markdown("### torch.compile toolchain")
             compile_status = gr.Markdown(_compile_report(), elem_classes=["vc-status"])
             clear_compile = action_button("Clear compile caches", "orange", size="md")
+            gr.Markdown("### Loaded model & block swap")
+            model_health_status = gr.Markdown(
+                _model_health_report(ctx), elem_classes=["vc-status"]
+            )
+            refresh_model_health = action_button("Refresh model status", "cyan", size="md")
 
     gr.Markdown("### Models")
     initial_rows, initial_keys = model_inventory()
@@ -425,6 +535,7 @@ def build(ctx: "UiContext") -> None:
     )
 
     meter_timer = gr.Timer(2.0)
+    model_health_timer = gr.Timer(3.0)
     gpu_index_state = ctx.states.get("gpu_index")
     if gpu_index_state is not None:
         meter_timer.tick(
@@ -442,6 +553,20 @@ def build(ctx: "UiContext") -> None:
         fn=None, inputs=report, outputs=[],
         js="(text) => { navigator.clipboard.writeText(text || ''); return []; }",
         queue=False, show_progress="hidden", api_visibility="private",
+    )
+    refresh_model_health.click(
+        lambda: _model_health_report(ctx),
+        outputs=model_health_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    model_health_timer.tick(
+        lambda: _model_health_report(ctx),
+        outputs=model_health_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
 
     def install_runtime_handler():
@@ -783,6 +908,7 @@ __all__ = [
     "build",
     "environment_report",
     "model_inventory",
+    "render_model_health",
     "selected_model_action_key",
     "verify_local_files",
     "verify_local_gguf",

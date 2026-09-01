@@ -83,6 +83,53 @@ def _delta_callback(callback: Any, delta: str = "", reasoning_delta: str = "") -
             continue
 
 
+def _record_generation_memory(
+    loaded: Any,
+    model: Any,
+    torch: Any,
+    device: Any,
+    *,
+    scope: str,
+) -> None:
+    """Persist activation peaks and emit swap counters without affecting generation."""
+
+    try:
+        if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
+            # Reserved bytes are what the card actually loses (allocator fragmentation
+            # included), so the feedback ratio is based on them.
+            peak_bytes = max(
+                int(torch.cuda.max_memory_allocated(device)),
+                int(torch.cuda.max_memory_reserved(device)),
+            )
+            resident_bytes = int(getattr(loaded.load_report, "resident_bytes", 0) or 0)
+            planned = int(getattr(loaded.load_report, "activation_estimate_bytes", 0) or 0)
+            observed = peak_bytes - resident_bytes
+            if observed > 0:
+                from .offload import record_observed_activation_bytes
+
+                record_observed_activation_bytes(loaded.variant.key, observed, planned_bytes=planned)
+    except Exception:
+        pass
+
+    try:
+        manager = getattr(model, "_vcap_block_swap_manager", None)
+        if manager is None:
+            return
+        stats = manager.stats()
+        layer_loads = int(stats.get("layer_loads", 0) or 0)
+        bytes_h2d = int(stats.get("bytes_h2d", 0) or 0)
+        get_log().debug(
+            f"Block swap: {layer_loads} layer loads, "
+            f"{bytes_h2d / 2**30:.1f} GiB H2D this generation",
+            scope=scope,
+        )
+        reset = getattr(manager, "reset_stats", None)
+        if callable(reset):
+            reset()
+    except Exception:
+        pass
+
+
 def split_thinking(text: str) -> tuple[str, str]:
     """Separate Qwen3 Thinking's generated reasoning and final answer."""
 
@@ -776,6 +823,13 @@ class OmniCaptionerBase(BaseCaptioner):
                 callbacks,
                 input_length,
             )
+        _record_generation_memory(
+            self.loaded,
+            self.loaded.model,
+            torch,
+            device,
+            scope="chat",
+        )
         sequences = getattr(output, "sequences", output)
         new_ids = sequences[:, input_length:]
         raw = self.loaded.processor.batch_decode(
@@ -950,6 +1004,7 @@ class OmniCaptionerBase(BaseCaptioner):
                     )
         finally:
             console_progress.finalize_progress_line(key=progress_key)
+        _record_generation_memory(self.loaded, model, torch, device, scope="caption")
         ended = time.perf_counter()
         sequences = getattr(output, "sequences", output)
         new_ids = sequences[:, input_length:]

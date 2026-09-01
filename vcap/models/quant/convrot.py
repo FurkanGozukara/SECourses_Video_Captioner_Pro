@@ -708,6 +708,37 @@ def _run_linear_kernel(
         return F.linear(x, dequantized, bias)
     if kernel != "int_mm":
         raise ValueError(kernel)
+    rows = int(x.shape[0])
+    chunk = _int_mm_row_chunk(rows, int(int8_weight.shape[0]), int(x.shape[1]))
+    if rows <= chunk:
+        return _int_mm_linear_rows(x, int8_weight, scale, bias)
+    # Prefill: bound the int32/fp32 temporaries of the [rows, N] product. Activation
+    # scales are per row, so chunking reproduces the unchunked result exactly.
+    output = torch.empty((rows, int(int8_weight.shape[0])), device=x.device, dtype=x.dtype)
+    for start in range(0, rows, chunk):
+        stop = min(rows, start + chunk)
+        output[start:stop] = _int_mm_linear_rows(x[start:stop], int8_weight, scale, bias)
+    return output
+
+
+_INT_MM_CHUNK_BUDGET_BYTES = 256 * 2**20
+
+
+def _int_mm_row_chunk(rows: int, out_features: int, in_features: int) -> int:
+    """Rows per int_mm call so the int32 + fp32 + output temporaries stay near 256 MiB."""
+
+    per_row = 10 * max(1, out_features) + max(1, in_features)
+    chunk = _INT_MM_CHUNK_BUDGET_BYTES // per_row
+    chunk = max(256, (chunk // 32) * 32)
+    return min(max(rows, 1), chunk)
+
+
+def _int_mm_linear_rows(
+    x: torch.Tensor,
+    int8_weight: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
     activation, activation_scale = _quantize_activation(x)
     accumulated = _int_mm_padded(activation, int8_weight)
     output = accumulated.float() * (activation_scale * scale.reshape(1, -1).float())
@@ -973,15 +1004,17 @@ def _offload_prefill_towers_if_needed(
     model: nn.Module,
     checkpoint: Path,
     target_device: torch.device,
+    *,
+    force: bool = False,
 ) -> tuple[str, ...]:
     if target_device.type != "cuda":
         return ()
     setting = os.environ.get("VCAP_QUANT_TOWER_OFFLOAD", "auto").strip().lower()
-    if setting in {"0", "false", "off"}:
+    if not force and setting in {"0", "false", "off"}:
         return ()
     _, total = torch.cuda.mem_get_info(target_device)
     pressure = checkpoint.stat().st_size / max(total, 1)
-    if setting == "auto" and pressure < 0.88:
+    if not force and setting == "auto" and pressure < 0.88:
         return ()
     names = []
     # Transformers derives the root model's input device from its first
@@ -1253,6 +1286,20 @@ def _assign_tensor(model: nn.Module, name: str, value: torch.Tensor) -> None:
 _EXPERT_TENSOR = re.compile(
     r"^((?:.*\.)?experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight(_scale)?$"
 )
+_DECODER_LAYER = re.compile(r"^model\.layers\.(\d+)(?:\.|$)")
+
+
+def _placement_device(
+    name: str,
+    default: torch.device,
+    layer_device: Callable[[int], torch.device | str] | None,
+) -> torch.device:
+    if layer_device is None:
+        return default
+    match = _DECODER_LAYER.match(name)
+    if match is None:
+        return default
+    return torch.device(layer_device(int(match.group(1))))
 
 
 def _materialize_quant_experts(module: _ConvRotExpertsBase, device: torch.device) -> None:
@@ -1308,16 +1355,30 @@ def _assign_bf16_expert(
     parameter.data[expert, start : start + intermediate].copy_(value)
 
 
-def _move_non_meta_buffers(model: nn.Module, device: torch.device) -> None:
-    for module in model.modules():
+def _move_non_meta_buffers(
+    model: nn.Module,
+    device: torch.device,
+    layer_device: Callable[[int], torch.device | str] | None = None,
+) -> None:
+    for module_name, module in model.named_modules():
+        module_device = _placement_device(module_name, device, layer_device)
         for name, value in list(module._buffers.items()):
-            if value is not None and value.device.type != "meta" and value.device != device:
-                module._buffers[name] = value.to(device)
+            if (
+                value is not None
+                and value.device.type != "meta"
+                and value.device != module_device
+            ):
+                module._buffers[name] = value.to(module_device)
 
 
-def _materialize_meta_buffers(model: nn.Module, device: torch.device) -> None:
+def _materialize_meta_buffers(
+    model: nn.Module,
+    device: torch.device,
+    layer_device: Callable[[int], torch.device | str] | None = None,
+) -> None:
     """Rebuild deterministic non-persistent buffers lost under ``torch.device('meta')``."""
-    for module in model.modules():
+    for module_name, module in model.named_modules():
+        module_device = _placement_device(module_name, device, layer_device)
         for name, value in list(module._buffers.items()):
             if value is None or value.device.type != "meta":
                 continue
@@ -1335,7 +1396,13 @@ def _materialize_meta_buffers(model: nn.Module, device: torch.device) -> None:
                 rebuilt = 1.0 / (
                     module.theta
                     ** (
-                        torch.arange(0, module.dim, 2, dtype=torch.float32, device=device)
+                        torch.arange(
+                            0,
+                            module.dim,
+                            2,
+                            dtype=torch.float32,
+                            device=module_device,
+                        )
                         / module.dim
                     )
                 )
@@ -1344,7 +1411,7 @@ def _materialize_meta_buffers(model: nn.Module, device: torch.device) -> None:
                 if inv_freq.device.type != "meta":
                     rebuilt = inv_freq.clone()
             if rebuilt is not None:
-                module._buffers[name] = rebuilt.to(device=device, dtype=value.dtype)
+                module._buffers[name] = rebuilt.to(device=module_device, dtype=value.dtype)
 
 
 def apply_quantized_checkpoint(
@@ -1354,6 +1421,8 @@ def apply_quantized_checkpoint(
     dtype: torch.dtype = torch.bfloat16,
     progress_cb: Callable[[int, int, str], None] | None = None,
     strip_prefix: str = "thinker.",
+    layer_device: Callable[[int], torch.device | str] | None = None,
+    tower_offload: bool | None = None,
 ) -> LoadReport:
     """Swap quantized modules and stream one safetensors file into a meta model."""
     started = time.perf_counter()
@@ -1407,7 +1476,8 @@ def apply_quantized_checkpoint(
             _replace_child(model, parent_name, replacement)
         modules = dict(model.named_modules())
         for parent_name in quant_expert_parents:
-            _materialize_quant_experts(modules[parent_name], target_device)
+            parent_device = _placement_device(parent_name, target_device, layer_device)
+            _materialize_quant_experts(modules[parent_name], parent_device)
 
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         names = list(handle.keys())
@@ -1423,6 +1493,7 @@ def apply_quantized_checkpoint(
             value = handle.get_tensor(name)
             loaded_bytes += value.numel() * value.element_size()
             target_name = _strip(name, strip_prefix)
+            tensor_device = _placement_device(target_name, target_device, layer_device)
             expert_match = _EXPERT_TENSOR.match(target_name)
             if expert_match:
                 parent_name, expert_text, projection, scale_suffix = expert_match.groups()
@@ -1431,20 +1502,20 @@ def apply_quantized_checkpoint(
                     raise KeyError(f"Expert module not found: {parent_name}")
                 if isinstance(expert_module, _ConvRotExpertsBase):
                     destination_dtype = torch.float32 if scale_suffix else torch.int8
-                    moved = value.to(target_device, dtype=destination_dtype)
+                    moved = value.to(tensor_device, dtype=destination_dtype)
                     _assign_quant_expert(
                         expert_module, int(expert_text), projection, bool(scale_suffix), moved
                     )
                 else:
                     if scale_suffix:
                         raise ValueError(f"BF16 checkpoint unexpectedly contains {name}")
-                    moved = value.to(target_device, dtype=dtype)
+                    moved = value.to(tensor_device, dtype=dtype)
                     _assign_bf16_expert(
                         expert_module,
                         int(expert_text),
                         projection,
                         moved,
-                        target_device,
+                        tensor_device,
                         dtype,
                     )
                 if progress_cb:
@@ -1460,7 +1531,7 @@ def apply_quantized_checkpoint(
             destination_dtype = destination.dtype
             if destination_dtype.is_floating_point:
                 destination_dtype = torch.float32 if target_name.endswith("weight_scale") else dtype
-            moved = value.to(target_device, dtype=destination_dtype)
+            moved = value.to(tensor_device, dtype=destination_dtype)
             _assign_tensor(model, target_name, moved)
             if target_name.endswith(".weight") and moved.is_floating_point() and moved.ndim == 2:
                 bf16_linear_names.add(target_name[: -len(".weight")])
@@ -1470,10 +1541,18 @@ def apply_quantized_checkpoint(
     if meta is not None:
         _fuse_quantized_qkv(model)
         _regular_hadamard(meta.group_size, target_device, dtype)
-    _materialize_meta_buffers(model, target_device)
-    _move_non_meta_buffers(model, target_device)
-    if meta is not None:
-        _offload_prefill_towers_if_needed(model, checkpoint, target_device)
+    _materialize_meta_buffers(model, target_device, layer_device)
+    _move_non_meta_buffers(model, target_device, layer_device)
+    if tower_offload is True or (meta is not None and tower_offload is None):
+        if tower_offload is True:
+            _offload_prefill_towers_if_needed(
+                model,
+                checkpoint,
+                target_device,
+                force=True,
+            )
+        else:
+            _offload_prefill_towers_if_needed(model, checkpoint, target_device)
     remaining_meta_parameters = [name for name, value in model.named_parameters() if value.device.type == "meta"]
     remaining_meta_buffers = [name for name, value in model.named_buffers() if value.device.type == "meta"]
     if remaining_meta_parameters or remaining_meta_buffers:

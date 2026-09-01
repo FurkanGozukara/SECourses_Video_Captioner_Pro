@@ -71,6 +71,15 @@ def _int(value: Any, default: int) -> int:
         return int(default)
 
 
+def _gpu_layers(value: Any) -> int | str:
+    if value is None:
+        return "auto"
+    normalized = str(value).strip().casefold()
+    if normalized in {"auto", "all"}:
+        return normalized
+    return max(0, _int(value, 0))
+
+
 def _float(value: Any, default: float) -> float:
     try:
         return float(value)
@@ -160,10 +169,19 @@ class InputItem:
 class OffloadSpec:
     """Serializable counterpart of :class:`vcap.models.offload.OffloadPlan`."""
 
-    gpu_layers: int | str = "all"
+    gpu_layers: int | str = "auto"
     offload_experts: bool = False
     max_memory: dict[str, str] | None = None
-    pin_cpu: bool = False
+    pin_cpu: bool = True
+    vram_reserve_gb: float = 2.0
+    swap_slots: int = 2
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "gpu_layers", _gpu_layers(self.gpu_layers))
+        object.__setattr__(self, "offload_experts", _bool(self.offload_experts, False))
+        object.__setattr__(self, "pin_cpu", _bool(self.pin_cpu, True))
+        object.__setattr__(self, "vram_reserve_gb", max(0.0, _float(self.vram_reserve_gb, 2.0)))
+        object.__setattr__(self, "swap_slots", max(1, min(4, _int(self.swap_slots, 2))))
 
 
 @dataclass(frozen=True)
@@ -387,11 +405,9 @@ class JobSpec:
             offload_data = dict(raw_offload)
         else:
             offload_data = {}
-        gpu_layers = _setting(source, "gpu_layers", "layers_on_gpu", default=offload_data.get("gpu_layers", "all"))
-        if str(gpu_layers).strip().casefold() != "all":
-            gpu_layers = max(0, _int(gpu_layers, 0))
-        else:
-            gpu_layers = "all"
+        gpu_layers = _gpu_layers(
+            _setting(source, "gpu_layers", "layers_on_gpu", default=offload_data.get("gpu_layers", "auto"))
+        )
         raw_max_memory = _setting(source, "offload_max_memory", "max_memory", default=offload_data.get("max_memory"))
         max_memory = (
             {str(key): str(value) for key, value in raw_max_memory.items()}
@@ -409,7 +425,35 @@ class JobSpec:
                     False,
                 ),
                 max_memory=max_memory,
-                pin_cpu=_bool(_setting(source, "pin_cpu", default=offload_data.get("pin_cpu")), False),
+                pin_cpu=_bool(
+                    _setting(source, "pin_cpu", default=offload_data.get("pin_cpu", True)),
+                    True,
+                ),
+                vram_reserve_gb=max(
+                    0.0,
+                    _float(
+                        _setting(
+                            source,
+                            "vram_reserve_gb",
+                            default=offload_data.get("vram_reserve_gb", 2.0),
+                        ),
+                        2.0,
+                    ),
+                ),
+                swap_slots=max(
+                    1,
+                    min(
+                        4,
+                        _int(
+                            _setting(
+                                source,
+                                "swap_slots",
+                                default=offload_data.get("swap_slots", 2),
+                            ),
+                            2,
+                        ),
+                    ),
+                ),
             ),
         )
 

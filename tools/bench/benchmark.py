@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 from datetime import datetime
+import inspect
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,19 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def _gpu_layers(value: str) -> int | str:
+    normalized = str(value).strip().casefold()
+    if normalized in {"auto", "all"}:
+        return normalized
+    try:
+        count = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected 'auto', 'all', or a non-negative integer") from exc
+    if count < 0:
+        raise argparse.ArgumentTypeError("GPU layer count must be non-negative")
+    return count
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -41,6 +55,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-preset", help="Optional application prompt-preset id")
     parser.add_argument("--profile-tier", type=int, default=32, help="Production VRAM tier (default: 32)")
     parser.add_argument("--attention", help="Override the production profile attention backend")
+    parser.add_argument(
+        "--gpu-layers",
+        type=_gpu_layers,
+        help="Resident decoder layers: auto, all, or a non-negative count (default: profile plan)",
+    )
+    parser.add_argument(
+        "--vram-reserve-gb",
+        type=float,
+        help="Dedicated VRAM to keep free (default: profile plan)",
+    )
+    parser.add_argument(
+        "--swap-slots",
+        type=int,
+        help="GPU block-swap staging slots (default: profile plan)",
+    )
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA GPU index (default: 0)")
     parser.add_argument("--seed", type=int, default=1234, help="Base sampling seed (default: 1234)")
     parser.add_argument(
@@ -160,6 +189,7 @@ def run(args: argparse.Namespace) -> int:
     from vcap.models import captioner_for_loaded
     from vcap.models.base import Callbacks, GenParams, MediaInput, PreprocessParams, PromptSpec
     from vcap.models.loader import load_model, unload_model
+    from vcap.models.offload import BudgetHint, OffloadPlan
     from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
     from vcap.models.vram_presets import preset_for
 
@@ -167,6 +197,19 @@ def run(args: argparse.Namespace) -> int:
     family = variant_to_family(registered_variant.key)
     spec = MODEL_SPECS[family]
     profile = preset_for(family, args.profile_tier)
+    profile_offload = profile.offload
+    offload = OffloadPlan(
+        gpu_layers=profile_offload.gpu_layers if args.gpu_layers is None else args.gpu_layers,
+        offload_experts=profile_offload.offload_experts,
+        max_memory=profile_offload.max_memory,
+        pin_cpu=profile_offload.pin_cpu,
+        vram_reserve_gb=(
+            profile_offload.vram_reserve_gb
+            if args.vram_reserve_gb is None
+            else args.vram_reserve_gb
+        ),
+        swap_slots=profile_offload.swap_slots if args.swap_slots is None else args.swap_slots,
+    )
     defaults = {item.name: item.default for item in spec.param_schema}
     max_new_tokens = int(args.max_new_tokens or defaults.get("max_new_tokens", 2048))
     generation = GenParams(
@@ -191,15 +234,23 @@ def run(args: argparse.Namespace) -> int:
     loaded = None
     measurements: list[dict[str, Any]] = []
     try:
-        loaded = load_model(
-            registered_variant.key,
-            device="cuda:0",
-            gpu_index=int(args.gpu),
-            attention=attention,
-            offload=profile.offload,
-            progress_cb=_progress,
-            hf_dir=model_dir,
-        )
+        load_kwargs: dict[str, Any] = {
+            "device": "cuda:0",
+            "gpu_index": int(args.gpu),
+            "attention": attention,
+            "offload": offload,
+            "progress_cb": _progress,
+            "hf_dir": model_dir,
+        }
+        if "budget_hint" in inspect.signature(load_model).parameters:
+            load_kwargs["budget_hint"] = BudgetHint(
+                max_frames=preprocessing.max_frames,
+                max_pixels=preprocessing.max_pixels,
+                fps=preprocessing.fps,
+                max_new_tokens=generation.max_new_tokens,
+                context_tokens=spec.limits.context_tokens,
+            )
+        loaded = load_model(registered_variant.key, **load_kwargs)
         captioner = captioner_for_loaded(loaded)
         prompt = PromptSpec(preset_id=args.prompt_preset) if args.prompt_preset else None
         for index in range(args.runs):
@@ -269,7 +320,7 @@ def run(args: argparse.Namespace) -> int:
                 "profile_tier_gb": int(args.profile_tier),
                 "attention_requested": attention,
                 "attention_resolved": loaded.load_report.attention,
-                "offload": asdict(profile.offload),
+                "offload": asdict(offload),
                 "generation": asdict(generation),
                 "preprocessing": asdict(preprocessing),
             },

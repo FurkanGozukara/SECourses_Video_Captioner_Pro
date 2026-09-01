@@ -82,7 +82,7 @@ _BASE_CSS = r"""
   --vc-log-border: rgba(56,189,248,0.20);
 }
 
-.gradio-container { max-width: 1840px !important; }
+.gradio-container { max-width: 1840px !important; margin-left: auto !important; margin-right: auto !important; }
 .vc-shell { padding-bottom: 28px; }
 .vc-header {
   padding: 15px 18px 13px;
@@ -196,7 +196,7 @@ _BASE_CSS = r"""
 .vcap-replace-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid rgba(56,189,248,.30); border-radius: 6px; background: rgba(8,145,178,.12); font-size: 12px; }
 .vcap-replace-arrow { color: #38bdf8; font-weight: 800; }
 
-.vc-btn, .vc-btn.vc-btn { border-radius: 7px !important; font-weight: 780 !important; letter-spacing: 0 !important; transition: transform .14s ease, filter .14s ease, box-shadow .14s ease !important; }
+.vc-btn, .vc-btn.vc-btn { border-radius: 7px !important; min-height: 36px !important; font-weight: 780 !important; letter-spacing: 0 !important; transition: transform .14s ease, filter .14s ease, box-shadow .14s ease !important; }
 .vc-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.04); }
 .vc-btn:focus-visible { outline: 2px solid #bae6fd !important; outline-offset: 2px !important; }
 .vc-btn:disabled { filter: grayscale(.46) opacity(.62) !important; transform: none !important; }
@@ -269,6 +269,17 @@ def build_theme() -> gr.themes.Soft:
         button_primary_background_fill_dark="#6366f1",
         button_primary_background_fill_hover="#4338ca",
         button_primary_background_fill_hover_dark="#818cf8",
+        # Every gr.Button size (sm/md/lg) renders with the large metrics so the whole UI
+        # shares one button font size and height (matches "Start Captioning").
+        button_small_text_size="*text_lg",
+        button_medium_text_size="*text_lg",
+        button_large_text_size="*text_lg",
+        button_small_text_weight="600",
+        button_medium_text_weight="600",
+        button_large_text_weight="600",
+        button_small_padding="*spacing_lg calc(2 * *spacing_lg)",
+        button_medium_padding="*spacing_lg calc(2 * *spacing_lg)",
+        button_large_padding="*spacing_lg calc(2 * *spacing_lg)",
         loader_color="#0ea5e9",
     )
 

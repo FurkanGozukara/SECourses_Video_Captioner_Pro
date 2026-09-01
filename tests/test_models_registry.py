@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vcap.models import attention
+from vcap.models.offload import OffloadPlan
 from vcap.models.registry import (
     MODEL_SPECS,
     all_variant_choices,
@@ -115,6 +116,77 @@ def test_vram_tiers_presets_and_allowed_variants_are_monotonic() -> None:
     assert preset_for("qwen3_omni_instruct", 48).variant_scheme == "int8_convrot"
     with pytest.raises(ValueError, match="not offered"):
         preset_for("qwen3_omni_instruct", 6)
+
+
+def test_vram_presets_use_automatic_block_swap_and_new_scheme_thresholds() -> None:
+    expected_offload = OffloadPlan("auto", False, None, True, 2.0, 2)
+    seven_b_schemes = {
+        6: "int4_convrot_w4a8",
+        8: "int4_convrot_w4a8",
+        10: "int4_convrot_w4a8",
+        12: "int8_convrot",
+        16: "int8_convrot",
+        24: "bf16",
+        32: "bf16",
+        48: "bf16",
+        80: "bf16",
+    }
+    qwen3_schemes = {
+        8: "int4_convrot_w4a8",
+        10: "int4_convrot_w4a8",
+        12: "int4_convrot_w4a8",
+        16: "int4_convrot_w4a8",
+        24: "int4_convrot_w4a8",
+        32: "int8_convrot",
+        48: "int8_convrot",
+        80: "bf16",
+    }
+    for family in ("timechat", "avocado"):
+        for tier, scheme in seven_b_schemes.items():
+            preset = preset_for(family, tier)
+            assert preset.variant_scheme == scheme
+            assert preset.offload == expected_offload
+            assert "automatic block swap" in preset.notes
+            if tier <= 6:
+                # The 7B models cannot keep 2 GB free on a 6 GB card; the note says so.
+                assert "2 GB reserve cannot be met" in preset.notes
+            else:
+                assert "keeps 2 GB VRAM free" in preset.notes
+    for family in (
+        "qwen3_omni_instruct",
+        "qwen3_omni_thinking",
+        "qwen3_omni_captioner",
+    ):
+        for tier, scheme in qwen3_schemes.items():
+            preset = preset_for(family, tier)
+            assert preset.variant_scheme == scheme
+            assert preset.offload == expected_offload
+            assert "automatic block swap" in preset.notes
+            assert "keeps 2 GB VRAM free" in preset.notes
+
+    assert set(allowed_variants("timechat", 6)) == {"timechat_int4"}
+    assert set(allowed_variants("timechat", 8)) == {"timechat_int8", "timechat_int4"}
+    assert set(allowed_variants("timechat", 12)) == {
+        "timechat_bf16",
+        "timechat_int8",
+        "timechat_int4",
+    }
+    assert set(allowed_variants("qwen3_omni_instruct", 8)) == {
+        "qwen3_omni_instruct_int4"
+    }
+    assert set(allowed_variants("qwen3_omni_instruct", 16)) == {
+        "qwen3_omni_instruct_int8",
+        "qwen3_omni_instruct_int4",
+    }
+    assert set(allowed_variants("qwen3_omni_instruct", 24)) == {
+        "qwen3_omni_instruct_bf16",
+        "qwen3_omni_instruct_int8",
+        "qwen3_omni_instruct_int4",
+        "qwen3_omni_instruct_gguf_q4",
+    }
+    assert "qwen3_omni_instruct_gguf_q8" in allowed_variants(
+        "qwen3_omni_instruct", 32
+    )
 
 
 def test_vram_preset_fields_have_descriptions_and_apply_without_mutation() -> None:

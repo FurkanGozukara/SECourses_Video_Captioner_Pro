@@ -348,9 +348,9 @@ def build(ctx: "UiContext") -> None:
             max_frames = gr.Number(value=129, minimum=1, precision=0, label="Max frames", info="Maximum decoded frames per source video.")
             source_fps = gr.Number(value=16.0, minimum=0.01, step=0.01, label="Source FPS", info="Expected source/training frame rate.")
         with gr.Row(elem_classes=["vc-compact-row"]):
-            wan_defaults = action_button("Wan 81f defaults", "cyan", size="sm")
-            ltx_defaults = action_button("LTX 121f 25fps", "violet", size="sm")
-            minimax_defaults = action_button("MiniMax H3 124f", "orange", size="sm")
+            wan_defaults = action_button("Wan 81f defaults", "cyan", size="md")
+            ltx_defaults = action_button("LTX 121f 25fps", "violet", size="md")
+            minimax_defaults = action_button("MiniMax H3 124f", "orange", size="md")
         with gr.Row(elem_classes=["vc-compact-row"]):
             toml_output = gr.Textbox(
                 value=str(ctx.outputs_dir / "dataset_config.toml"), label="Output path",

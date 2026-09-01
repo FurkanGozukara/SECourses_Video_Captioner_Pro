@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 _MODEL_PROMPT_KEYS = {
     "model_key",
     "vram_preset",
+    "vram_reserve_gb",
+    "swap_slots",
     "attention_backend",
     "prompt_preset_id",
     "system_prompt",

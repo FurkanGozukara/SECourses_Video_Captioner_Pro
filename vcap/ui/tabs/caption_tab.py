@@ -15,6 +15,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Iterable
 
 import gradio as gr
@@ -134,9 +135,10 @@ def variant_choices_for_tier(
             continue
     result: list[tuple[str, str]] = []
     for label, key in all_choices:
-        if key not in allowed and key != selected_variant:
+        exceeds_tier = variant_size_gb(key) > float(tier)
+        if (key not in allowed or exceeds_tier) and key != selected_variant:
             continue
-        if key == selected_variant and key not in allowed:
+        if key == selected_variant and (key not in allowed or exceeds_tier):
             label = f"{label} ⚠ exceeds tier"
         result.append((label, key))
     return result
@@ -704,34 +706,63 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
                 with gr.Accordion("Offload plan", open=False):
                     gpu_layers = gr.Dropdown(
-                        choices=["all", *[str(value) for value in range(0, 49, 4)]],
-                        value="all",
+                        choices=["auto", "all", *[str(value) for value in range(0, 49, 4)]],
+                        value="auto",
                         allow_custom_value=True,
                         label="Decoder layers on GPU",
-                        info="Use all, or enter a leading decoder-layer count for CPU offload.",
+                        info=(
+                            "auto fits the free VRAM minus the reserve; a number keeps that many layers "
+                            "resident and block-swaps the rest from pinned RAM"
+                        ),
                     )
                     controls["gpu_layers"] = ctx.reg(
-                        "gpu_layers", gpu_layers, "all", section="model",
-                        description="Leading decoder layers kept resident on GPU.",
+                        "gpu_layers", gpu_layers, "auto", section="model",
+                        description="Resident decoder layers: automatic fit, all, or an explicit count.",
+                        choices=["auto", "all", *[str(value) for value in range(0, 49, 4)]], kind="str",
                     )
+                    with gr.Row(elem_classes=["vc-compact-row"]):
+                        vram_reserve_gb = gr.Number(
+                            value=2.0,
+                            minimum=0,
+                            maximum=24,
+                            step=0.5,
+                            label="VRAM to keep free (GB)",
+                            info="Dedicated VRAM reserved for activations and runtime peaks.",
+                        )
+                        controls["vram_reserve_gb"] = ctx.reg(
+                            "vram_reserve_gb", vram_reserve_gb, 2.0, section="model",
+                            description="Dedicated VRAM kept free at the expected generation peak.",
+                            kind="float", minimum=0, maximum=24,
+                        )
+                        swap_slots = gr.Dropdown(
+                            choices=[2, 3],
+                            value=2,
+                            label="Swap slots",
+                            info="Advanced: GPU staging slots used to prefetch swapped decoder layers.",
+                        )
+                        controls["swap_slots"] = ctx.reg(
+                            "swap_slots", swap_slots, 2, section="model",
+                            description="GPU staging slots allocated for decoder block swap.",
+                            choices=[2, 3], kind="int",
+                        )
                     with gr.Row(elem_classes=["vc-compact-row"]):
                         offload_experts = gr.Checkbox(
                             value=False,
                             label="Offload MoE experts",
-                            info="Keep Qwen3 expert banks on CPU to reduce VRAM use.",
+                            info="Legacy Accelerate expert offload; disables block swap",
                         )
                         controls["offload_experts"] = ctx.reg(
                             "offload_experts", offload_experts, False, section="model",
-                            description="Offload Qwen3 mixture-of-experts banks to CPU.", kind="bool",
+                            description="Use legacy Accelerate expert offload instead of block swap.", kind="bool",
                         )
                         pin_cpu = gr.Checkbox(
-                            value=False,
-                            label="Pin CPU tensors",
-                            info="Use pinned host memory for faster transfers at the cost of RAM flexibility.",
+                            value=True,
+                            label="Pin swapped layers in RAM",
+                            info="Use pinned host memory for faster decoder-layer transfers.",
                         )
                         controls["pin_cpu"] = ctx.reg(
-                            "pin_cpu", pin_cpu, False, section="model",
-                            description="Pin CPU-offloaded tensors in host memory.", kind="bool",
+                            "pin_cpu", pin_cpu, True, section="model",
+                            description="Pin block-swapped decoder layers in host memory.", kind="bool",
                         )
                 with gr.Row(elem_classes=["vc-compact-row"]):
                     compile_enabled = gr.Checkbox(
@@ -1460,6 +1491,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         max_pixels,
         max_new_tokens,
         gpu_layers,
+        vram_reserve_gb,
+        swap_slots,
         offload_experts,
         pin_cpu,
         vram_note,
@@ -1521,12 +1554,14 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 preset.max_pixels,
                 preset.max_new_tokens,
                 str(offload.gpu_layers),
+                offload.vram_reserve_gb,
+                offload.swap_slots,
                 offload.offload_experts,
                 offload.pin_cpu,
                 note,
             )
         except Exception as exc:
-            return (*[gr.skip() for _ in range(9)], f"<span class='vc-err'>{html.escape(str(exc))}</span>")
+            return (*[gr.skip() for _ in range(11)], f"<span class='vc-err'>{html.escape(str(exc))}</span>")
 
     def apply_vram(
         selected_variant: str,
@@ -1564,7 +1599,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 f"<span class='vc-help'>Manual {html.escape(str(selected_tier))} GB plan retained.</span>"
                 + tier_warning(selected_variant, physical_tier)
             )
-            return gr.update(choices=choices, value=selected_variant), *[gr.skip() for _ in range(8)], note
+            return gr.update(choices=choices, value=selected_variant), *[gr.skip() for _ in range(10)], note
         physical_tier = auto_tier(gpu_total_for(selected_gpu))
         selected_fits = selected_variant in allowed_variants(
             variant_to_family(selected_variant),
@@ -2078,6 +2113,28 @@ class _UiSink:
         self.events.put(("item", event))
 
 
+def _merge_live_outputs(state: dict[str, Any], data: Mapping[str, Any] | None, status: str | None) -> bool:
+    """Fold run folder and finished-item artifacts from a progress/item event into the live output state."""
+
+    payload = dict(data or {})
+    changed = False
+    run_dir = payload.get("run_dir")
+    if run_dir and state.get("run_dir") != str(run_dir):
+        state["run_dir"] = str(run_dir)
+        changed = True
+    if str(status or "").casefold() == "done":
+        outputs = payload.get("outputs") or {}
+        caption_path = outputs.get("txt") if isinstance(outputs, Mapping) else None
+        if caption_path and state.get("caption_path") != str(caption_path):
+            state["caption_path"] = str(caption_path)
+            changed = True
+        clip_path = payload.get("clip_path")
+        if clip_path and state.get("clip_path") != str(clip_path):
+            state["clip_path"] = str(clip_path)
+            changed = True
+    return changed
+
+
 def _result_payload(result: JobResult) -> tuple[str, Any, str, str, list[Any], dict[str, Any]]:
     completed = [item for item in result.items if item.status == "done"]
     if not completed:
@@ -2364,6 +2421,8 @@ def wire(ctx: "UiContext") -> None:
         remaining_count = total_count
         item_started_at: dict[int, float] = {}
         terminal_items: set[int] = set()
+        live_outputs: dict[str, Any] = {}
+        live_dirty = False
         yield (
             render_progress_html(
                 0,
@@ -2397,6 +2456,7 @@ def wire(ctx: "UiContext") -> None:
                     last_fraction = float(event.fraction or 0.0)
                     last_message = event.message
                     data = event.data or {}
+                    live_dirty = _merge_live_outputs(live_outputs, data, None) or live_dirty
                     eta_seconds = data.get("eta_s", data.get("eta_seconds"))
                     last_eta = format_eta(eta_seconds) if eta_seconds is not None else "—"
                     speed = data.get("tok_per_s") or data.get("tokens_per_second")
@@ -2421,6 +2481,7 @@ def wire(ctx: "UiContext") -> None:
                 elif kind == "item":
                     event = payload
                     data = event.data or {}
+                    live_dirty = _merge_live_outputs(live_outputs, data, event.status) or live_dirty
                     raw_index = data.get("item_index", event.item_index)
                     index = int(raw_index or 0)
                     if 0 <= index < len(item_rows):
@@ -2456,13 +2517,18 @@ def wire(ctx: "UiContext") -> None:
                     f"**ETA:** {last_eta}",
                     f"**Speed:** {last_speed}",
                     item_rows,
-                    *[gr.skip() for _ in range(9)],
+                    *[gr.skip() for _ in range(6)],
+                    dict(live_outputs) if live_dirty else gr.skip(),
+                    gr.skip(),
+                    gr.skip(),
                 )
+                live_dirty = False
             thread.join()
             if "error" in terminal:
                 raise terminal["error"]
             result: JobResult = terminal["result"]
             final_caption, structured, srt_text, reasoning_text, gallery, state = _result_payload(result)
+            state = {**state, **{key: value for key, value in live_outputs.items() if not state.get(key)}}
             terminal_label, message, status_class, eta_text = _result_summary(result)
             if _should_auto_open_output(
                 result,
@@ -2611,11 +2677,28 @@ def wire(ctx: "UiContext") -> None:
         api_visibility="private",
     )
 
+    open_labels = {"run_dir": "run folder", "caption_path": "caption file", "clip_path": "clip"}
+
     def open_last(state: dict[str, Any], key: str, reveal: bool = False) -> str:
-        value = (state or {}).get(key)
+        current = dict(state or {})
+        value = current.get(key)
+        if not value and key == "clip_path" and current.get("run_dir"):
+            note = (
+                "No saved clip to reveal: clips are kept only when 'Save produced clips' is enabled. "
+                "Opening the run folder instead."
+            )
+            gr.Warning(note)
+            ok, message = open_in_file_manager(current["run_dir"])
+            css = "vc-warn" if ok else "vc-err"
+            return f"<span class='{css}'>{html.escape(note + ' ' + message)}</span>"
         if not value:
-            return f"<span class='vc-warn'>No {html.escape(key.replace('_', ' '))} is available yet.</span>"
+            label = open_labels.get(key, key.replace("_", " "))
+            hint = "The running job has not produced it yet." if current else "Run a caption job first."
+            note = f"No {label} is available yet. {hint}"
+            gr.Warning(note)
+            return f"<span class='vc-warn'>{html.escape(note)}</span>"
         ok, message = reveal_in_file_manager(value) if reveal else open_in_file_manager(value)
+        (gr.Info if ok else gr.Warning)(message)
         css = "vc-ok" if ok else "vc-err"
         return f"<span class='{css}'>{html.escape(message)}</span>"
 
@@ -2623,7 +2706,8 @@ def wire(ctx: "UiContext") -> None:
         lambda state: open_last(state, "run_dir"),
         inputs=handles.last_outputs_state,
         outputs=handles.progress.status,
-        queue=False,
+        concurrency_id="vc-open-buttons",
+        concurrency_limit=8,
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2631,7 +2715,8 @@ def wire(ctx: "UiContext") -> None:
         lambda state: open_last(state, "caption_path"),
         inputs=handles.last_outputs_state,
         outputs=handles.progress.status,
-        queue=False,
+        concurrency_id="vc-open-buttons",
+        concurrency_limit=8,
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2639,7 +2724,8 @@ def wire(ctx: "UiContext") -> None:
         lambda state: open_last(state, "clip_path", True),
         inputs=handles.last_outputs_state,
         outputs=handles.progress.status,
-        queue=False,
+        concurrency_id="vc-open-buttons",
+        concurrency_limit=8,
         show_progress="hidden",
         api_visibility="private",
     )

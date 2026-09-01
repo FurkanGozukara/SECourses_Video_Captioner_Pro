@@ -52,31 +52,31 @@ def _seven_b_preset(family: str, tier: int) -> VramPreset:
     max_tokens = 9_216 if family == "timechat" else 2_048
     if tier <= 6:
         return VramPreset("int4_convrot_w4a8", "auto", 1.0, 32, 128 * 28 * 28,
-                          min(max_tokens, 2_048), OffloadPlan(6, False, None, False),
-                          "Heavy CPU offload; lowest-memory mode and substantially slower.")
+                          min(max_tokens, 2_048), OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap (every decoder layer swapped, towers staged); a 6 GB card runs without paging but keeps under 1 GB spare, so the 2 GB reserve cannot be met here.")
     if tier <= 8:
         return VramPreset("int4_convrot_w4a8", "auto", 1.0, 48, 200_000,
-                          min(max_tokens, 4_096), OffloadPlan(16, False, None, True),
-                          "INT4 with partial decoder offload and conservative video input.")
+                          min(max_tokens, 4_096), OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free and uses conservative video input.")
     if tier <= 10:
         return VramPreset("int4_convrot_w4a8", "auto", 2.0, 80, max_pixels,
-                          max_tokens, OffloadPlan("all", False, None, False),
-                          "INT4 resident weights with the model's training resolution.")
+                          max_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free at the training resolution.")
     if tier <= 12:
         return VramPreset("int8_convrot", "auto", 2.0, 80, max_pixels,
-                          max_tokens, OffloadPlan(22, False, None, True),
-                          "INT8 with a small CPU-offloaded decoder tail.")
+                          max_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT8 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
     if tier <= 16:
         return VramPreset("int8_convrot", "auto", 2.0, 128, max_pixels,
-                          max_tokens, OffloadPlan("all", False, None, False),
-                          "INT8 fully resident with room for vision and KV-cache peaks.")
+                          max_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT8 with automatic block swap; keeps 2 GB VRAM free for vision and KV-cache peaks.")
     if tier <= 24:
         return VramPreset("bf16", "auto", 2.0, 128 if family == "avocado" else 120, max_pixels,
-                          max_tokens, OffloadPlan("all", False, None, False),
-                          "BF16 resident; preserves the reference checkpoint exactly.")
+                          max_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "BF16 with automatic block swap; keeps 2 GB VRAM free and preserves checkpoint precision.")
     return VramPreset("bf16", "auto", 2.0, 160 if family == "timechat" else 256, max_pixels,
-                      max_tokens, OffloadPlan("all", False, None, False),
-                      "BF16 resident with the full documented frame allowance.")
+                      max_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                      "BF16 with automatic block swap; keeps 2 GB VRAM free at the full frame allowance.")
 
 
 def _qwen3_preset(family: str, tier: int) -> VramPreset:
@@ -87,31 +87,31 @@ def _qwen3_preset(family: str, tier: int) -> VramPreset:
     default_tokens = 2_048 if captioner else 16_384 if thinking else 4_096
     if tier <= 8:
         return VramPreset("int4_convrot_w4a8", "auto", 1.0, 32, 128 * 32 * 32,
-                          min(default_tokens, 2_048), OffloadPlan(4, True, None, False),
-                          "Experimental heavy offload; experts stay on CPU and generation is slow.")
+                          min(default_tokens, 2_048), OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
     if tier <= 12:
         return VramPreset("int4_convrot_w4a8", "auto", 1.0, 48, 128 * 32 * 32,
-                          min(default_tokens, 4_096), OffloadPlan(12, True, None, True),
-                          "INT4 with expert offload and a conservative context budget.")
+                          min(default_tokens, 4_096), OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free and uses a conservative context budget.")
     if tier <= 16:
         return VramPreset("int4_convrot_w4a8", "auto", 1.0, 64, 192 * 32 * 32,
-                          min(default_tokens, 8_192), OffloadPlan(32, False, None, True),
-                          "INT4 with a light CPU-offloaded decoder tail.")
+                          min(default_tokens, 8_192), OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
     if tier <= 24:
         return VramPreset("int4_convrot_w4a8", "auto", 2.0, 96, 256 * 32 * 32,
-                          default_tokens, OffloadPlan("all", False, None, False),
-                          "INT4 fully resident with the recommended 256-token frame budget.")
+                          default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT4 with automatic block swap; keeps 2 GB VRAM free at the recommended frame budget.")
     if tier <= 32:
         return VramPreset("int8_convrot", "auto", 2.0, 96, 256 * 32 * 32,
-                          default_tokens, OffloadPlan(42, False, None, True),
-                          "INT8 with a small decoder tail offloaded to CPU.")
+                          default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT8 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
     if tier <= 48:
         return VramPreset("int8_convrot", "auto", 2.0, 128, 256 * 32 * 32,
-                          default_tokens, OffloadPlan("all", False, None, False),
-                          "INT8 fully resident.")
+                          default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                          "INT8 with automatic block swap; keeps 2 GB VRAM free for generation peaks.")
     return VramPreset("bf16", "auto", 2.0, 128, 256 * 32 * 32,
-                      default_tokens, OffloadPlan("all", False, None, False),
-                      "BF16 thinker fully resident.")
+                      default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
+                      "BF16 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
 
 
 def preset_for(family: str, tier: int | float) -> VramPreset:
@@ -126,8 +126,8 @@ def preset_for(family: str, tier: int | float) -> VramPreset:
 
 def _scheme_threshold(family: str, scheme: str) -> int:
     if family in {"timechat", "avocado"}:
-        return {"int4_convrot_w4a8": 6, "int8_convrot": 10, "bf16": 24}.get(scheme, 999)
-    return {"int4_convrot_w4a8": 8, "int8_convrot": 32, "bf16": 80, "gguf": 24}.get(scheme, 999)
+        return {"int4_convrot_w4a8": 6, "int8_convrot": 8, "bf16": 12}.get(scheme, 999)
+    return {"int4_convrot_w4a8": 8, "int8_convrot": 16, "bf16": 24, "gguf": 24}.get(scheme, 999)
 
 
 def allowed_variants(family: str, tier: int | float) -> list[str]:

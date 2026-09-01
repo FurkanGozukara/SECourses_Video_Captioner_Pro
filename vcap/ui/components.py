@@ -729,19 +729,39 @@ class LogPanelHandles:
     meter_timer: gr.Timer
 
 
+LOG_PANEL_CHAR_LIMIT = 120_000
+
+
+def newest_first(text: str) -> str:
+    """Reverse a chronological newline-delimited log block so the latest line is on top."""
+
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    return "\n".join(reversed(lines))
+
+
+def merge_log_newest_first(current: str, new_lines: list[str], limit: int = LOG_PANEL_CHAR_LIMIT) -> str:
+    """Prepend chronological ``new_lines`` above ``current`` (newest first) and trim the oldest tail."""
+
+    fresh = "\n".join(line for line in reversed([str(item) for item in new_lines]) if line.strip())
+    combined = "\n".join(part for part in (fresh, str(current or "").strip()) if part)
+    if len(combined) > limit:
+        combined = combined[:limit]
+    return combined
+
+
 def log_panel(ctx: "UiContext") -> LogPanelHandles:
     """Build revision-polled live logs and a Torch-free resource meter."""
 
     with gr.Group(elem_classes=["vc-card"]):
         with gr.Row(elem_classes=["vc-compact-row"]):
             gr.Markdown("### Live log", elem_classes=["vc-section-title"])
-            clear = action_button("⌫ Clear", "orange", size="sm", min_width=86)
+            clear = action_button("⌫ Clear", "orange", size="md", min_width=86)
         log = gr.Textbox(
-            value=ctx.app_log.tail(300),
-            label="Application log",
+            value=newest_first(ctx.app_log.tail(300)),
+            label="Application log (newest first)",
             lines=14,
             max_lines=14,
-            autoscroll=True,
+            autoscroll=False,
             interactive=False,
             buttons=["copy"],
             show_label=True,
@@ -757,10 +777,7 @@ def log_panel(ctx: "UiContext") -> LogPanelHandles:
         lines, new_revision = ctx.app_log.snapshot(int(cursor or 0))
         if new_revision == int(cursor or 0):
             return gr.skip(), gr.skip()
-        combined = "\n".join(part for part in (str(current or "").rstrip(), *lines) if part)
-        if len(combined) > 120_000:
-            combined = combined[-120_000:]
-        return combined, new_revision
+        return merge_log_newest_first(str(current or ""), lines), new_revision
 
     def poll_resources(selected_gpu: int | str | None) -> str:
         try:

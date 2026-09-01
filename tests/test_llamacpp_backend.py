@@ -296,16 +296,24 @@ def test_free_port_and_server_command_contains_no_quantized_kv_flags(tmp_path: P
     assert "--mmproj" in command
     assert "--jinja" in command
     assert command[command.index("-c") + 1] == "32768"
-    assert command[command.index("-ngl") + 1] == "999"
+    # -ngl must stay unset: llama.cpp aborts fitting when n_gpu_layers is user-set.
+    assert "-ngl" not in command
+    assert command[command.index("--fit") + 1] == "on"
+    # 2 GB reserve + 1,536 MiB multimodal-projector headroom
+    assert command[command.index("--fit-target") + 1] == "3584"
     assert command[command.index("--device") + 1] == "CUDA0"
     assert not {"-ctk", "-ctv", "--cache-type-k", "--cache-type-v"}.intersection(command)
 
 
-def test_24gb_server_plan_caps_context_and_partially_offloads(tmp_path: Path) -> None:
+def test_server_plan_keeps_tier_contexts_and_delegates_offload_to_fit(tmp_path: Path) -> None:
     assert server_plan_for_vram(24.0).context_size == 16_384
-    assert server_plan_for_vram(24.0).gpu_layers == 36
+    assert server_plan_for_vram(24.0).gpu_layers is None
     assert server_plan_for_vram(32.0).context_size == 32_768
-    assert server_plan_for_vram(32.0).gpu_layers == 999
+    assert server_plan_for_vram(32.0).gpu_layers is None
+    assert server_plan_for_vram(32.0, q8_weights=True).gpu_layers is None
+    assert server_plan_for_vram(32.0).fit is True
+    assert server_plan_for_vram(32.0).fit_target_mib == 3_584
+    assert server_plan_for_vram(32.0).n_cpu_moe is None
 
     backend = LlamaCppCaptioner(
         "qwen3_omni_instruct",
@@ -315,12 +323,63 @@ def test_24gb_server_plan_caps_context_and_partially_offloads(tmp_path: Path) ->
         device_index=2,
         gpu_index=2,
         vram_total_gb=24.0,
+        vram_reserve_gb=3.5,
     )
     command = backend._server_command(tmp_path / "llama-server.exe", 12345)
     assert command[command.index("-c") + 1] == "16384"
-    assert command[command.index("-ngl") + 1] == "36"
+    assert "-ngl" not in command
+    assert command[command.index("--fit") + 1] == "on"
+    assert command[command.index("--fit-target") + 1] == "5120"
     assert command[command.index("--device") + 1] == "CUDA2"
     assert command[command.index("--main-gpu") + 1] == "2"
+
+
+def test_server_fit_environment_overrides(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("VCAP_LLAMACPP_GPU_LAYERS", "17")
+    monkeypatch.setenv("VCAP_LLAMACPP_CONTEXT_SIZE", "12288")
+    monkeypatch.setenv("VCAP_LLAMACPP_FIT_TARGET_MIB", "3072")
+    monkeypatch.setenv("VCAP_LLAMACPP_FIT", "0")
+    monkeypatch.setenv("VCAP_LLAMACPP_N_CPU_MOE", "11")
+
+    backend = _backend(tmp_path)
+    command = backend._server_command(tmp_path / "llama-server.exe", 12345)
+
+    assert command[command.index("-ngl") + 1] == "17"
+    assert command[command.index("-c") + 1] == "12288"
+    assert command[command.index("--fit") + 1] == "off"
+    assert command[command.index("--fit-target") + 1] == "3072"
+    assert command[command.index("--n-cpu-moe") + 1] == "11"
+    assert backend.block_swap_summary()["fit"] is False
+
+
+def test_fit_report_parses_final_server_placement_and_is_json_safe(tmp_path: Path) -> None:
+    backend = _backend(tmp_path)
+    backend._server_command(tmp_path / "llama-server.exe", 12345)
+    with backend._log_lock:
+        backend._log_tail.extend(
+            [
+                "common_params_fit_impl: n_gpu_layers = 35",
+                "tensor blk.0.ffn_gate_exps.weight (512 MiB) buffer type overridden to CPU",
+                "tensor blk.1.ffn_up_exps.weight (512 MiB) buffer type overridden to CPU",
+                "load_tensors: offloaded 37/49 layers to GPU",
+                "llama_context: n_ctx = 16384",
+                "W common_fit_params: failed to fit params to free device memory: example, abort",
+            ]
+        )
+
+    report = backend.block_swap_summary()
+    assert report["fit_error"] == "failed to fit params to free device memory: example, abort"
+
+    assert report["backend"] == "llamacpp"
+    assert report["mode"] == "fit"
+    assert report["fit_target_mib"] == 3_584
+    assert report["requested_gpu_layers"] is None
+    assert report["n_gpu_layers"] == 37
+    assert report["n_gpu_layers_total"] == 49
+    assert report["n_cpu_moe"] == 2
+    assert report["n_ctx"] == 16_384
+    assert backend.context_size == 16_384
+    assert json.loads(json.dumps(report)) == report
 
 
 def test_generation_payload_maps_sampling_controls(tmp_path: Path) -> None:

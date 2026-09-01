@@ -96,6 +96,17 @@ def build_child_env(
                 env[key] = ",".join(tokens)
             else:
                 env.pop(key, None)
+        # Without expandable segments the caching allocator keeps large transient prefill
+        # blocks cached; with the worker's per-process VRAM cap in place, a garbage-collection
+        # threshold makes it release unused cached blocks before the cap is reached.
+        configured = ",".join(
+            env.get(key, "") for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+        ).casefold()
+        if "garbage_collection_threshold" not in configured:
+            existing = env.get("PYTORCH_ALLOC_CONF", "").strip()
+            env["PYTORCH_ALLOC_CONF"] = (
+                f"{existing},garbage_collection_threshold:0.6" if existing else "garbage_collection_threshold:0.6"
+            )
     return env
 
 

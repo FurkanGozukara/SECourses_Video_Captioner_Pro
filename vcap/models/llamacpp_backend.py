@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import socket
 import subprocess
 import threading
@@ -73,11 +74,21 @@ DEFAULT_STARTUP_TIMEOUT_S = 900.0
 
 @dataclass(frozen=True)
 class LlamaCppServerPlan:
-    """Tier-aware llama-server context and GPU-layer limits."""
+    """Tier-aware llama-server context and device-memory fitting settings."""
 
     vram_tier_gb: int
     context_size: int
-    gpu_layers: int
+    gpu_layers: int | None  # None leaves -ngl unset so llama.cpp's fitter can choose
+    fit: bool
+    fit_target_mib: int
+    n_cpu_moe: int | None
+
+
+# llama.cpp's fitter sizes weights, KV cache, and text compute buffers, but not the
+# multimodal projector's image/audio encoding buffers. Measured on a 32 GB GPU, a
+# 2,048 MiB target left only ~0.7 GiB free at generation peak; this headroom is added
+# on top of the configured reserve so the reserve is honoured in practice.
+MTMD_FIT_HEADROOM_MIB = 1_536
 
 
 def server_plan_for_vram(
@@ -85,20 +96,110 @@ def server_plan_for_vram(
     *,
     requested_context: int = DEFAULT_CONTEXT_SIZE,
     q8_weights: bool = False,
+    fit_target_mib: int = 2_048 + MTMD_FIT_HEADROOM_MIB,
 ) -> LlamaCppServerPlan:
-    """Return a conservative Qwen3-Omni server plan for one physical GPU."""
+    """Return a Qwen3-Omni server plan that lets llama.cpp fit device memory."""
 
+    del q8_weights  # Kept for API compatibility; --fit now handles every GGUF size.
     observed = float(total_vram_gb or 32.0)
     tier = vram_tier_for_gb(observed)
     requested = max(4_096, int(requested_context))
+    target = max(0, int(fit_target_mib))
     if tier <= 16:
-        return LlamaCppServerPlan(tier, min(requested, 8_192), 20)
-    if tier <= 24:
-        # Q4_K_M + mmproj leaves too little headroom for a fully offloaded 32K
-        # context on a 24 GB card. This plan stays below that measured peak.
-        return LlamaCppServerPlan(tier, min(requested, 16_384), 36)
-    gpu_layers = 36 if q8_weights and tier < 48 else 999
-    return LlamaCppServerPlan(tier, min(requested, 32_768), gpu_layers)
+        context_size = min(requested, 8_192)
+    elif tier <= 24:
+        context_size = min(requested, 16_384)
+    else:
+        context_size = min(requested, 32_768)
+    # -ngl stays unset: llama.cpp aborts fitting when n_gpu_layers is user-set.
+    return LlamaCppServerPlan(tier, context_size, None, True, target, None)
+
+
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_GPU_LAYERS_RE = re.compile(r"\bn_gpu_layers\b\s*(?:=|:)\s*(-?\d+)", re.IGNORECASE)
+_GPU_OFFLOAD_RE = re.compile(
+    r"\boffloaded\s+(\d+)\s*/\s*(\d+)\s+layers?\s+to\s+GPU\b",
+    re.IGNORECASE,
+)
+_CPU_MOE_RE = re.compile(r"\bn_cpu_moe\b\s*(?:=|:)\s*(\d+)", re.IGNORECASE)
+_CONTEXT_RE = re.compile(r"\bn_ctx\b\s*(?:=|:)\s*(\d+)", re.IGNORECASE)
+_BLOCK_INDEX_RE = re.compile(r"\bblk\\?\.(\d+)\\?\.", re.IGNORECASE)
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+def _server_plan_from_env(plan: LlamaCppServerPlan) -> LlamaCppServerPlan:
+    fit_raw = os.environ.get("VCAP_LLAMACPP_FIT")
+    fit = (
+        plan.fit
+        if fit_raw is None or not fit_raw.strip()
+        else fit_raw.strip().casefold() not in _FALSE_ENV_VALUES
+    )
+    n_cpu_raw = os.environ.get("VCAP_LLAMACPP_N_CPU_MOE")
+    n_cpu_moe = plan.n_cpu_moe
+    if n_cpu_raw is not None and n_cpu_raw.strip():
+        n_cpu_moe = _env_non_negative_int("VCAP_LLAMACPP_N_CPU_MOE", 0)
+    gpu_layers = plan.gpu_layers
+    layers_raw = os.environ.get("VCAP_LLAMACPP_GPU_LAYERS")
+    if layers_raw is not None and layers_raw.strip():
+        gpu_layers = _env_non_negative_int("VCAP_LLAMACPP_GPU_LAYERS", 0)
+    elif gpu_layers is None and not fit:
+        gpu_layers = 999  # no fitter and no explicit request: offload everything, as before
+    return LlamaCppServerPlan(
+        plan.vram_tier_gb,
+        max(4_096, _env_non_negative_int("VCAP_LLAMACPP_CONTEXT_SIZE", plan.context_size)),
+        gpu_layers,
+        fit,
+        _env_non_negative_int("VCAP_LLAMACPP_FIT_TARGET_MIB", plan.fit_target_mib),
+        n_cpu_moe,
+    )
+
+
+def _parse_fit_log(lines: Iterable[str]) -> dict[str, Any]:
+    """Extract final fitted placement values from llama.cpp startup output."""
+
+    parsed: dict[str, Any] = {}
+    cpu_moe_layers: set[int] = set()
+    for raw in lines:
+        line = str(raw)
+        if "failed to fit params" in line:
+            parsed["fit_error"] = line.split("common_fit_params:", 1)[-1].strip()
+        match = _GPU_LAYERS_RE.search(line)
+        if match:
+            parsed["n_gpu_layers"] = max(0, int(match.group(1)))
+        match = _GPU_OFFLOAD_RE.search(line)
+        if match:
+            parsed["n_gpu_layers"] = int(match.group(1))
+            parsed["n_gpu_layers_total"] = int(match.group(2))
+        match = _CPU_MOE_RE.search(line)
+        if match:
+            parsed["n_cpu_moe"] = int(match.group(1))
+        match = _CONTEXT_RE.search(line)
+        if match:
+            parsed["n_ctx"] = int(match.group(1))
+        lowered = line.casefold()
+        if (
+            "cpu" in lowered
+            and "overrid" in lowered
+            and ("exps" in lowered or "expert" in lowered)
+        ):
+            match = _BLOCK_INDEX_RE.search(line)
+            if match:
+                cpu_moe_layers.add(int(match.group(1)))
+    if cpu_moe_layers and "n_cpu_moe" not in parsed:
+        parsed["n_cpu_moe"] = len(cpu_moe_layers)
+    return parsed
 
 
 def _cancelled(token: object | None) -> bool:
@@ -549,6 +650,7 @@ class LlamaCppCaptioner(BaseCaptioner):
         device_index: int = 0,
         gpu_index: int = 0,
         vram_total_gb: float | None = None,
+        vram_reserve_gb: float = 2.0,
     ) -> None:
         super().__init__(family, loaded)
         if not family.startswith("qwen3_omni_"):
@@ -575,11 +677,16 @@ class LlamaCppCaptioner(BaseCaptioner):
         self.device_index = max(0, int(device_index))
         self.gpu_index = max(0, int(gpu_index))
         self.vram_total_gb = float(vram_total_gb or 32.0)
+        self.vram_reserve_gb = float(vram_reserve_gb)
+        if not math.isfinite(self.vram_reserve_gb) or self.vram_reserve_gb < 0:
+            raise ValueError("vram_reserve_gb must be a non-negative finite number")
         self.server_plan = server_plan_for_vram(
             self.vram_total_gb,
             requested_context=self.requested_context_size,
             q8_weights=self.variant.key.endswith("_gguf_q8"),
+            fit_target_mib=int(round(self.vram_reserve_gb * 1_024)) + MTMD_FIT_HEADROOM_MIB,
         )
+        self._active_server_plan = self.server_plan
         self.context_size = self.server_plan.context_size
         selected_video_mode = (video_mode or os.environ.get("VCAP_LLAMACPP_VIDEO_MODE", "frames_audio")).strip().casefold()
         if selected_video_mode not in {"frames_audio", "native"}:
@@ -589,7 +696,10 @@ class LlamaCppCaptioner(BaseCaptioner):
         self._port: int | None = None
         self._base_url: str | None = None
         self._log_thread: threading.Thread | None = None
-        self._log_tail: deque[str] = deque(maxlen=120)
+        self._log_tail: deque[str] = deque(maxlen=1_000)
+        self._log_lock = threading.Lock()
+        self._fit_lock = threading.Lock()
+        self.fit_report: dict[str, Any] = self._fit_report_for_plan(self.server_plan)
         self._startup_progress: ProgressCallback | None = None
         self._lifecycle_lock = threading.RLock()
         self._caption_lock = threading.Lock()
@@ -616,41 +726,81 @@ class LlamaCppCaptioner(BaseCaptioner):
 
     @property
     def server_log_tail(self) -> str:
-        return "\n".join(self._log_tail)
+        with self._log_lock:
+            return "\n".join(self._log_tail)
+
+    @staticmethod
+    def _fit_report_for_plan(plan: LlamaCppServerPlan) -> dict[str, Any]:
+        return {
+            "backend": "llamacpp",
+            "mode": "fit" if plan.fit else "manual",
+            "fit": bool(plan.fit),
+            "fit_target_mib": int(plan.fit_target_mib),
+            "requested_gpu_layers": None if plan.gpu_layers is None else int(plan.gpu_layers),
+            "requested_n_cpu_moe": plan.n_cpu_moe,
+            "requested_context_size": int(plan.context_size),
+            "n_gpu_layers": None,
+            "n_cpu_moe": plan.n_cpu_moe,
+            "n_ctx": int(plan.context_size),
+        }
+
+    def _update_fit_report_from_log_tail(self) -> None:
+        with self._log_lock:
+            lines = list(self._log_tail)
+        parsed = _parse_fit_log(lines)
+        with self._fit_lock:
+            self.fit_report.update(parsed)
+            fitted_context = self.fit_report.get("n_ctx")
+        if isinstance(fitted_context, int) and fitted_context > 0:
+            self.context_size = fitted_context
+
+    def block_swap_summary(self) -> dict[str, Any]:
+        """Return the llama.cpp fit result in the common JSON-safe report slot."""
+
+        self._update_fit_report_from_log_tail()
+        with self._fit_lock:
+            return json.loads(json.dumps(self.fit_report))
 
     def _server_command(self, server: Path, port: int) -> list[str]:
         if not self.variant.gguf_files or len(self.variant.gguf_files) < 2:
             raise RuntimeError(f"{self.variant.key} does not define a model and mmproj")
         model = self.model_dir / self.variant.gguf_files[0]
         mmproj = self.model_dir / self.variant.gguf_files[1]
-        context_size = int(
-            os.environ.get("VCAP_LLAMACPP_CONTEXT_SIZE", self.server_plan.context_size)
-        )
-        gpu_layers = int(
-            os.environ.get("VCAP_LLAMACPP_GPU_LAYERS", self.server_plan.gpu_layers)
-        )
-        return [
+        plan = _server_plan_from_env(self.server_plan)
+        self._active_server_plan = plan
+        self.context_size = plan.context_size
+        with self._fit_lock:
+            self.fit_report = self._fit_report_for_plan(plan)
+        command = [
             str(server),
             "--model",
             str(model),
             "--mmproj",
             str(mmproj),
             "-c",
-            str(max(4_096, context_size)),
+            str(plan.context_size),
             "--jinja",
-            "-ngl",
-            str(max(0, gpu_layers)),
-            "--device",
-            f"CUDA{self.device_index}",
-            "--split-mode",
-            "none",
-            "--main-gpu",
-            str(self.device_index),
-            "--port",
-            str(port),
-            "--host",
-            "127.0.0.1",
         ]
+        if plan.gpu_layers is not None:
+            command.extend(["-ngl", str(plan.gpu_layers)])
+        command.extend(["--fit", "on" if plan.fit else "off", "--fit-target", str(plan.fit_target_mib)])
+        if plan.n_cpu_moe is not None:
+            command.extend(["--n-cpu-moe", str(plan.n_cpu_moe)])
+        command.extend(
+            [
+                "--device",
+                f"CUDA{self.device_index}",
+                "--split-mode",
+                "none",
+                "--main-gpu",
+                str(self.device_index),
+                "--port",
+                str(port),
+                "--host",
+                "127.0.0.1",
+            ]
+        )
+        return command
 
     def _read_server_logs(self, process: subprocess.Popen[str]) -> None:
         stream = process.stdout
@@ -661,7 +811,8 @@ class LlamaCppCaptioner(BaseCaptioner):
                 line = raw.rstrip("\r\n")
                 if not line:
                     continue
-                self._log_tail.append(line)
+                with self._log_lock:
+                    self._log_tail.append(line)
                 _emit(self._startup_progress, f"llama-server: {line}")
         finally:
             try:
@@ -699,7 +850,8 @@ class LlamaCppCaptioner(BaseCaptioner):
             baseline = float(
                 resource_snapshot(self.gpu_index).get("vram_used_gb", 0.0) or 0.0
             )
-            self._log_tail.clear()
+            with self._log_lock:
+                self._log_tail.clear()
             self._startup_progress = progress_cb
             try:
                 process = subprocess.Popen(
@@ -759,6 +911,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                         if health_ready:
                             self.load_seconds = time.perf_counter() - started
                             self.load_peak_vram_gb = peak
+                            self._update_fit_report_from_log_tail()
                             _emit(
                                 progress_cb,
                                 f"llama-server ready in {self.load_seconds:.1f}s; "

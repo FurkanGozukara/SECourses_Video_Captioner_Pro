@@ -16,7 +16,8 @@ from vcap.ui.tabs.editor_tab import (
     pagination_math,
     scan_folder,
 )
-from vcap.ui.tabs.recover_tab import build_recovery_diff_table
+from vcap.ui.tabs.health_tab import render_model_health
+from vcap.ui.tabs.recover_tab import build_recovery_diff_table, present_recovery_settings
 
 
 def test_cancelled_job_summary_reports_cancel_count() -> None:
@@ -148,6 +149,49 @@ def test_recover_diff_table_from_metadata_json(tmp_path: Path) -> None:
     assert by_key["fps"]["different"] is False
     assert by_key["recursive"]["saved_value"] is True
     assert by_key["recursive"]["different"] is True
+
+
+def test_recover_model_only_includes_block_swap_budget_keys() -> None:
+    registry = SettingsRegistry()
+    registry.register(
+        "vram_reserve_gb", object(), 2.0, section="runtime", kind="float", description="Reserve"
+    )
+    registry.register(
+        "swap_slots", object(), 2, section="runtime", kind="int", choices=[2, 3], description="Slots"
+    )
+
+    values, warnings = present_recovery_settings(
+        {"settings": {"vram_reserve_gb": "4.5", "swap_slots": "3"}},
+        registry,
+        model_prompt_only=True,
+        available_gpu_indices=[],
+    )
+
+    assert values == {"vram_reserve_gb": 4.5, "swap_slots": 3}
+    assert warnings == []
+
+
+def test_health_formats_worker_block_swap_summary() -> None:
+    report = render_model_health(
+        {
+            "loaded_variant": "qwen3_omni_instruct_int8",
+            "block_swap": {
+                "mode": "block_swap",
+                "layer_count": 48,
+                "resident_layers": 39,
+                "swapped_layers": 9,
+                "slots": 2,
+                "pinned_gib": 5.24,
+                "expected_peak_gib": 29.5,
+                "reserve_gib": 2.0,
+            },
+        }
+    )
+
+    assert "qwen3_omni_instruct_int8" in report
+    assert "39/48 resident" in report
+    assert "9 swapped" in report
+    assert "5.24 GiB pinned" in report
 
 
 def test_build_app_with_all_tabs_smoke() -> None:

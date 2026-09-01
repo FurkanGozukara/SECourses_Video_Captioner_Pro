@@ -12,6 +12,22 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.3.0",
+        "2026-09-01",
+        """
+### Decoder block swap instead of Windows shared-memory paging
+
+- Replace the Accelerate hook offload with kohya/Musubi-style decoder block swap: the first N decoder layers stay resident, the rest live in pinned system RAM (`cudaHostRegister`, with pinned-chunk and pageable fallbacks) and stream through a ring of preallocated GPU slots on a dedicated CUDA copy stream that prefetches the next layer while the current one computes. Swapped captions are byte-identical to fully resident ones.
+- Plan residency from measurements instead of tier constants: the loader reads per-layer byte sizes from the safetensors header, measures free VRAM, estimates the job's activation peak from the media it will process (frames, pixels, context, family), keeps a configurable reserve (default 2 GB) free, and logs the whole budget. `Decoder layers on GPU` accepts `auto`, `all`, or a resident count; `VRAM to keep free (GB)` and `Swap slots` are new controls.
+- Cap the PyTorch allocator at the dedicated VRAM that was free at load so an overrun raises a recoverable out-of-memory error instead of silently paging (`VCAP_VRAM_HARD_CAP=0` disables it), slice the language-model head to the last token during generation (removes 1.6-2.5 GB of prefill logits), and record observed activation peaks per variant to tighten later plans.
+- Show WDDM shared GPU memory in the Health meter and run metadata, and warn only when shared usage exceeds the pinned block-swap buffers, which Windows also reports as shared memory.
+- Every VRAM tier now uses automatic block swap with a 2 GB reserve; INT8 and BF16 variants are offered on smaller tiers because they no longer need to fit entirely. GGUF variants start `llama-server` with `--fit on` and a target of the reserve plus 1,536 MiB of projector headroom, leaving `-ngl` to the fitter (an explicit `-ngl` makes llama.cpp abort fitting); Q8_0 Instruct went from 9.6 to 64.6 tok/s on a 32 GB GPU.
+- Size residency from the media a job really contains (frames from clip durations, kinds from probing) rather than the preset's worst case, budget 768 MiB of allocator slack so the reserve holds against real free VRAM, trim the worker's working set after large loads, and retry ffprobe/ffmpeg spawns with backoff.
+- Cap ConvRot prefill temporaries by chunking the `int_mm` projection rows (identical results, INT4/INT8 activation peaks roughly halved), stage the prefill-only audio/vision towers on CPU when that buys resident decoder layers, and feed observed reserved-memory peaks back into later plans as a per-variant ratio.
+- Verified on an RTX 5090: swapped captions are byte-identical to resident ones for TimeChat and Qwen3-Omni (including all 48 layers swapped), every family runs on the automatic plan without touching shared GPU memory, and 63.4 GB Qwen3 BF16 checkpoints run within a 32 GB budget with 2.3 GB left free. See docs/BLOCK_SWAP.md.
+""".strip(),
+    ),
+    (
         "v1.2.0",
         "2026-09-01",
         """

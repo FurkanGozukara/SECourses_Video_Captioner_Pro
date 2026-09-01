@@ -57,7 +57,9 @@ registry. Each variant downloads directly from its source Hugging Face repo.
 
 Q4_K_M is offered from the 24 GB VRAM tier. Q8_0 becomes selectable at the
 32 GB tier, but its 33.81 GB of files cannot be fully GPU-resident on a nominal
-32 GB card; llama.cpp may fit/offload some tensors and performance will vary.
+32 GB card. The server's memory fitter keeps the configured reserve free and
+moves the remaining weights to host memory, so performance varies with the
+fitted placement.
 
 GGUF remains an explicit speed-first choice rather than the automatic Qwen3
 preset. The optimized ConvRot path now reaches 20.40-21.84 tok/s on the tested
@@ -67,43 +69,49 @@ that fidelity for the GGUF frame-plus-audio fallback would be surprising.
 
 ## VRAM-tier server plan
 
-The backend caps context and GPU-resident layers before starting the persistent
-process. These are product defaults, not user estimates:
+The backend keeps the tier-specific context limits but delegates weight
+placement to llama.cpp b10621. Every tier leaves `-ngl` unset and requests `--fit on` with a
+target margin of the configured VRAM reserve plus 1,536 MiB of multimodal-projector headroom
+(the fitter does not size the mtmd image/audio buffers; measured on a 32 GB GPU a bare 2,048 MiB
+target left only ~0.7 GiB free at generation peak). With the default 2 GB reserve that is a
+3,584 MiB target margin. This replaces the old fixed 36-layer Q8 plan: Q4 and
+Q8 now use the same fitting policy, while larger cards naturally retain more
+weights in VRAM.
 
-| Detected tier | Context | `-ngl` | Intended use |
-|---:|---:|---:|---|
-| 16 GB or less | 8,192 | 20 | Defensive fallback; Qwen3-Omni GGUF is not offered by the normal tier picker here. |
-| 24 GB | 16,384 | 36 | Q4_K_M plus Q8_0 mmproj with CPU-resident tail layers and runtime headroom. |
-| 32 GB+ | 32,768 | 999 for Q4 | Fully offloaded Q4 path measured on the RTX 5090. |
-| 32 GB | 32,768 | 36 for Q8 | Partial offload because the Q8 files alone exceed nominal card capacity. |
-| 48 GB+ | 32,768 | 999 | Fully offloaded Q4 or Q8. |
+| Detected tier | Context | GPU request | Fitter target |
+|---:|---:|---:|---:|
+| 16 GB or less | 8,192 | unset (fitter decides) | 3,584 MiB free |
+| 24 GB | 16,384 | unset (fitter decides) | 3,584 MiB free |
+| 32 GB or more | 32,768 | unset (fitter decides) | 3,584 MiB free |
 
-For example, the 24 GB Q4 command is:
-
-```text
-llama-server --model <model.gguf> --mmproj <mmproj.gguf> -c 16384 --jinja -ngl 36 --device CUDA0 --split-mode none --main-gpu 0 --port <free> --host 127.0.0.1
-```
-
-The 32 GB+ Q4 command uses `-c 32768 -ngl 999`. `CUDA0` is the
-process-local device in an isolated worker; it maps to the physical GPU chosen
-in settings. In in-process mode the command uses that GPU's CUDA index directly.
-Advanced diagnostics can override the two automatic limits with
-`VCAP_LLAMACPP_CONTEXT_SIZE` and `VCAP_LLAMACPP_GPU_LAYERS`.
-
-The 24 GB plan was sized with the pinned runtime's estimator against the actual
-local Instruct Q4_K_M artifact:
+For example, the 24 GB command is:
 
 ```text
-llama-fit-params -m Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf -c 16384 -ngl 36 --device CUDA0 -fit off -fitp on
-CUDA0 12769 1120 301
-Host   4921  416  24
+llama-server --model <model.gguf> --mmproj <mmproj.gguf> -c 16384 --jinja --fit on --fit-target 3584 --device CUDA0 --split-mode none --main-gpu 0 --port <free> --host 127.0.0.1
 ```
 
-The three CUDA columns are model, context, and compute MiB: 14,190 MiB total.
-Adding the measured 1,264 MiB Q8_0 projector artifact gives 15,454 MiB of
-static/projector storage, leaving about 8.9 GiB on a 24,576 MiB card for
-multimodal activations and allocator headroom. This is why the product uses 36
-layers rather than relying on full offload at this tier.
+`--fit-target` is a per-device margin in MiB; a single value is broadcast to
+all selected devices. The application derives it from the load plan's
+`vram_reserve_gb` setting (2.0 GB by default). `--fit-ctx` is not passed: the
+application sets `-c` from the table, while that option only sets the minimum
+context size that the fitter may choose for an unset context.
+
+`CUDA0` is the process-local device in an isolated worker and maps to the
+physical GPU chosen in settings. In in-process mode the command uses that GPU's
+CUDA index directly. Diagnostic environment overrides are:
+
+| Variable | Effect |
+|---|---|
+| `VCAP_LLAMACPP_CONTEXT_SIZE` | Overrides the tier context (minimum 4,096). |
+| `VCAP_LLAMACPP_GPU_LAYERS` | Sends an explicit `-ngl`. llama.cpp then refuses to fit (`n_gpu_layers already set by user ... abort`) and will page a too-large model through WDDM, so pair it with `VCAP_LLAMACPP_N_CPU_MOE` or `VCAP_LLAMACPP_FIT=0` deliberately. |
+| `VCAP_LLAMACPP_FIT_TARGET_MIB` | Overrides the target free margin in MiB. |
+| `VCAP_LLAMACPP_FIT=0` | Sends `--fit off`. |
+| `VCAP_LLAMACPP_N_CPU_MOE=N` | Sends `--n-cpu-moe N`, keeping the MoE weights of the first N layers on CPU. |
+
+At startup the backend reads the final `n_gpu_layers`, `n_cpu_moe` or tensor
+override lines, and `n_ctx` from the server log. The JSON-safe result is
+available through `block_swap_summary()` and is stored in the common load
+report's `block_swap` field.
 
 ## Server and API
 
@@ -168,9 +176,9 @@ Both requests completed through `/v1/chat/completions` with default mmproj GPU
 offload and F16 KV. The Instruct run processed 4,450 prompt tokens in 8.93 s;
 the Captioner run processed 283 prompt tokens in 0.26 s. The high peak was
 transient: Instruct was at 23.51 GiB immediately after generation. The 24 GB
-allocation plan above was verified with `llama-fit-params` on GPU 0 and the
-exact local files; decode throughput was not separately benchmarked on 24 GB
-hardware.
+decode throughput was not separately benchmarked on 24 GB hardware. These
+measurements predate the explicit 2,048 MiB fit target and remain a throughput
+baseline rather than a promise about the newly fitted placement.
 
 The GGUF contains only the Qwen thinker plus multimodal projector. Speech
 generation (`talker` / `code2wav`) is not present, which is immaterial for text

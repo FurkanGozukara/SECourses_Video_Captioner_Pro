@@ -22,6 +22,13 @@ def test_build_app_registry_and_presets_smoke(tmp_path: Path, monkeypatch) -> No
         assert defaults["desktop_notification_on_finish"] is False
         assert defaults["play_sound_on_finish"] is False
         assert defaults["open_output_folder_on_single_finish"] is False
+        assert defaults["gpu_layers"] == "auto"
+        assert defaults["vram_reserve_gb"] == 2.0
+        assert defaults["swap_slots"] == 2
+        assert defaults["pin_cpu"] is True
+        entries = {entry.key: entry for entry in registry.entries()}
+        assert entries["vram_reserve_gb"].section == "model"
+        assert entries["swap_slots"].choices == (2, 3)
         assert demo.vcap_context.preset_store.list_presets()
         first = demo.vcap_context.preset_store.list_presets()[0]
         assert first.name == "Default - Qwen3-Omni Instruct video"

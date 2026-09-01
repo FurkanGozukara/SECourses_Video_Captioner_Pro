@@ -982,9 +982,9 @@ def build(ctx: "UiContext") -> None:
             )
             counters = gr.Markdown(_counter_markdown(initial_state))
             with gr.Row(elem_classes=["vc-compact-row"]):
-                previous_page = action_button("Prev page", "indigo", size="sm", scale=1)
+                previous_page = action_button("Prev page", "indigo", size="md", scale=1)
                 page_label = gr.Markdown("**Page 1 / 1** · showing 0 of 0", scale=3)
-                next_page = action_button("Next page", "sky", size="sm", scale=1)
+                next_page = action_button("Next page", "sky", size="md", scale=1)
                 page_size = gr.Dropdown(
                     choices=[25, 50, 100], value=25, label="Per page",
                     info="Rows shown on each editor page.", scale=1, min_width=105,

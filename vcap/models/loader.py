@@ -13,16 +13,29 @@ from typing import Any, Callable
 import weakref
 
 from vcap import TEMP_DIR
-from vcap.core.gpu import resource_snapshot
+from vcap.core.gpu import resource_snapshot, vram_cap_env_disabled
 from vcap.core.logs import get_log
 
 from .attention import is_flash_attention_failure, resolve as resolve_attention
-from .offload import OffloadPlan, build_device_map
+from .block_swap import BlockSwapManager
+from .offload import (
+    BudgetHint,
+    OffloadPlan,
+    _FAMILY_LAYOUTS,
+    build_device_map,
+    checkpoint_layout,
+    estimate_activation_bytes,
+    observed_activation_bytes,
+    observed_activation_ratio,
+    plan_block_swap,
+)
 from .registry import MODEL_SPECS, ModelSpec, VariantSpec, get_variant, resolve_model_dir, variant_is_ready, variant_to_family
 from .torch_compile import DEFAULT_COMPILE_MODE
 
 
 ProgressCallback = Callable[..., None]
+_MIB = 2**20
+_GIB = 2**30
 
 
 @dataclass(frozen=True)
@@ -38,6 +51,10 @@ class LoadReport:
     bf16_layers: int = 0
     compile_mode: str = "eager"
     warnings: tuple[str, ...] = ()
+    block_swap: dict[str, Any] | None = None
+    resident_bytes: int = 0
+    activation_estimate_bytes: int = 0
+    vram_cap_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,128 @@ def _emit(callback: ProgressCallback | None, message: str, fraction: float | Non
             return
         except TypeError:
             continue
+
+
+def _install_last_token_logits_hook(model: Any, enabled: bool = True) -> Any | None:
+    """Slice the language-model head input to the final sequence position."""
+
+    model._vcap_last_token_logits = bool(enabled)
+    lm_head = getattr(model, "lm_head", None)
+    register = getattr(lm_head, "register_forward_pre_hook", None)
+    if not callable(register):
+        return None
+    existing = getattr(model, "_vcap_last_token_logits_hook", None)
+    remove = getattr(existing, "remove", None)
+    if callable(remove):
+        remove()
+    root_ref = weakref.ref(model)
+
+    def slice_last_token(_module: Any, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+        root = root_ref()
+        if root is None or not getattr(root, "_vcap_last_token_logits", True) or not args:
+            return None
+        hidden_states = args[0]
+        if getattr(hidden_states, "ndim", 0) == 3 and hidden_states.shape[1] > 1:
+            return (hidden_states[:, -1:, :],)
+        return None
+
+    handle = register(slice_last_token)
+    model._vcap_last_token_logits_hook = handle
+    return handle
+
+
+def _trim_host_working_set() -> None:
+    """Return cached checkpoint pages to Windows after a large streamed load.
+
+    Streaming a checkpoint through safetensors leaves tens of GB of file pages in the
+    worker's working set next to the page-locked block-swap packs. They are only cache,
+    but until Windows trims them a following child process (ffprobe/ffmpeg) can fail to
+    start under memory pressure. Locked pages are unaffected; touched private pages are
+    soft-faulted back from the standby list.
+    """
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        psapi.EmptyWorkingSet(kernel32.GetCurrentProcess())
+    except Exception:
+        pass
+
+
+def _remove_model_runtime(model: Any) -> None:
+    manager = getattr(model, "_vcap_block_swap_manager", None)
+    remove_manager = getattr(manager, "remove", None)
+    if callable(remove_manager):
+        try:
+            remove_manager()
+        except Exception as exc:
+            get_log().warn(f"Could not remove block-swap manager cleanly: {exc}", scope="models")
+    hook = getattr(model, "_vcap_last_token_logits_hook", None)
+    remove_hook = getattr(hook, "remove", None)
+    if callable(remove_hook):
+        try:
+            remove_hook()
+        except Exception:
+            pass
+    for name in ("_vcap_last_token_logits_hook", "_vcap_last_token_logits"):
+        try:
+            delattr(model, name)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _block_swap_layers(model: Any, family: str, expected_count: int) -> Any:
+    language_model = getattr(model, "model", None)
+    layers = getattr(language_model, "layers", None)
+    if layers is None:
+        raise RuntimeError("Block swap requires decoder layers at model.model.layers")
+    if len(layers) != int(expected_count):
+        raise RuntimeError(
+            f"Block-swap layout expected {expected_count} decoder layers, found {len(layers)}"
+        )
+    expected_class = _FAMILY_LAYOUTS[family][1][-1]
+    mismatch = next(
+        (
+            (index, layer.__class__.__name__)
+            for index, layer in enumerate(layers)
+            if layer.__class__.__name__ != expected_class
+        ),
+        None,
+    )
+    if mismatch is not None:
+        index, actual = mismatch
+        raise RuntimeError(
+            f"Block-swap decoder layer {index} is {actual}, expected {expected_class}"
+        )
+    return layers
+
+
+def _apply_vram_hard_cap(
+    torch: Any,
+    torch_device: Any,
+    *,
+    total_vram_bytes: int,
+    other_vram_bytes: int,
+) -> int:
+    if (
+        vram_cap_env_disabled()
+        or getattr(torch_device, "type", None) != "cuda"
+        or not torch.cuda.is_available()
+        or total_vram_bytes <= 0
+    ):
+        return 0
+    cap = max(0, int(total_vram_bytes) - int(other_vram_bytes) - 256 * _MIB)
+    fraction = min(1.0, max(0.05, cap / int(total_vram_bytes)))
+    try:
+        torch.cuda.set_per_process_memory_fraction(fraction, torch_device)
+    except (AttributeError, RuntimeError) as exc:
+        get_log().warn(f"Could not apply the CUDA allocator VRAM cap: {exc}", scope="models")
+        return 0
+    return int(int(total_vram_bytes) * fraction)
 
 
 def _checkpoint_bytes(folder: Path) -> int:
@@ -228,6 +367,7 @@ def _load_llamacpp_model(
         attention="llamacpp",
         device_map={"": str(device)},
         compile_mode="llama.cpp",
+        block_swap=_llamacpp_fit_summary(backend),
     )
     loaded = LoadedModel(
         backend,
@@ -250,6 +390,18 @@ def _load_llamacpp_model(
         1.0,
     )
     return loaded
+
+
+def _llamacpp_fit_summary(backend: Any) -> dict[str, Any] | None:
+    summary = getattr(backend, "block_swap_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        result = summary()
+    except Exception as exc:
+        get_log().warn(f"Could not read the llama.cpp fit report: {exc}", scope="llama.cpp")
+        return None
+    return dict(result) if isinstance(result, dict) else None
 
 
 def _model_types(architecture: str) -> tuple[Any, Any]:
@@ -359,6 +511,8 @@ def _stream_single_checkpoint(
     target_device: str,
     dtype: Any,
     progress_cb: ProgressCallback | None,
+    layer_device: Callable[[int], Any] | None = None,
+    tower_offload: bool | None = None,
 ) -> tuple[Any, Any]:
     try:
         from accelerate import init_empty_weights
@@ -393,11 +547,13 @@ def _stream_single_checkpoint(
             dtype=dtype,
             progress_cb=on_tensor,
             strip_prefix="thinker.",
+            layer_device=layer_device,
+            tower_offload=tower_offload,
         )
     except (AttributeError, TypeError) as exc:
         raise RuntimeError(
-            "The installed ConvRot loader does not match the required T4 API "
-            "apply_quantized_checkpoint(model, path, device, dtype, progress_cb, strip_prefix)."
+            "The installed ConvRot loader does not match the required checkpoint API "
+            "with per-layer placement support."
         ) from exc
     return model, report
 
@@ -408,7 +564,8 @@ def _plain_sharded_load(
     *,
     dtype: Any,
     attention: str,
-    placement: Any,
+    placement: Any | None = None,
+    device_map: dict[str, Any] | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {
         "dtype": dtype,
@@ -417,7 +574,12 @@ def _plain_sharded_load(
         "trust_remote_code": False,
         "low_cpu_mem_usage": True,
     }
-    kwargs.update(placement.from_pretrained_kwargs())
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    elif placement is not None:
+        kwargs.update(placement.from_pretrained_kwargs())
+    else:
+        raise ValueError("A placement plan or explicit device map is required")
     return model_class.from_pretrained(folder, **kwargs)
 
 
@@ -494,6 +656,8 @@ def load_model(
     hf_dir: str | os.PathLike[str] | None = None,
     compile_model: bool = False,
     compile_mode: str = DEFAULT_COMPILE_MODE,
+    budget_hint: BudgetHint | None = None,
+    last_token_logits: bool = True,
 ) -> LoadedModel:
     """Load one local thinker checkpoint through its registered backend."""
 
@@ -532,29 +696,106 @@ def load_model(
             f"Attention backend {requested_attention} is unavailable; loading with SDPA instead.",
         )
     model_class, processor_class = _model_types(spec.architecture)
-    snapshot = resource_snapshot(physical_gpu_index)
-    placement = build_device_map(
-        family,
-        plan,
-        float(snapshot.get("vram_free_gb", 0.0) or 0.0),
-        device_index=device_index,
-        physical_gpu_index=physical_gpu_index,
-    )
+    placement = None
+    if plan.uses_legacy_offload:
+        snapshot = resource_snapshot(physical_gpu_index)
+        placement = build_device_map(
+            family,
+            plan,
+            float(snapshot.get("vram_free_gb", 0.0) or 0.0),
+            device_index=device_index,
+            physical_gpu_index=physical_gpu_index,
+        )
     torch_device = torch.device(device)
-    if torch.cuda.is_available() and device.startswith("cuda"):
+    cuda_load = bool(torch.cuda.is_available() and torch_device.type == "cuda")
+    free_vram_bytes = 0
+    total_vram_bytes = 0
+    other_vram_bytes = 0
+    if cuda_load:
         torch.cuda.reset_peak_memory_stats(torch_device)
+        if not plan.uses_legacy_offload:
+            free_vram_bytes, total_vram_bytes = (
+                int(value) for value in torch.cuda.mem_get_info(torch_device)
+            )
+            reserved_at_start = int(torch.cuda.memory_reserved(torch_device))
+            other_vram_bytes = max(
+                0,
+                total_vram_bytes - free_vram_bytes - reserved_at_start,
+            )
     _emit(progress_cb, f"Loading {spec.label} / {variant.label} from {folder}", 0.0)
 
     checkpoint = folder / "model.safetensors"
     single_file = checkpoint.is_file()
-    use_cpu_staging = single_file and (
-        plan.gpu_layers != "all" or plan.offload_experts or plan.max_memory is not None
-    )
+    use_cpu_staging = single_file and plan.uses_legacy_offload
+    planned_attention = resolved_attention
+    planned_config = None
+    activation_estimate = 0
+    ram_available_bytes: int | None = None
+    budget = None
+    if not plan.uses_legacy_offload:
+        planned_config = _thinker_config(
+            folder,
+            spec.architecture,
+            planned_attention,
+            dtype,
+        )
+        activation_estimate = int(
+            estimate_activation_bytes(
+                family,
+                planned_config,
+                budget_hint,
+                observed_ratio=observed_activation_ratio(variant.key),
+            )
+        )
+        if single_file:
+            import psutil
 
-    def load_weights(selected_attention: str) -> tuple[Any, dict[str, Any] | str | None, int, int]:
-        config = _thinker_config(folder, spec.architecture, selected_attention, dtype)
+            layout = checkpoint_layout(checkpoint)
+            ram_available_bytes = int(psutil.virtual_memory().available)
+            budget = plan_block_swap(
+                plan,
+                layout,
+                free_vram_bytes=free_vram_bytes,
+                total_vram_bytes=total_vram_bytes,
+                activation_bytes=activation_estimate,
+                ram_available_bytes=ram_available_bytes,
+            )
+            if budget.notes:
+                _emit(progress_cb, budget.notes[0])
+                for note in budget.notes[1:]:
+                    get_log().warn(note, scope="models")
+        else:
+            message = (
+                "Block swap requires a single-file model.safetensors checkpoint; "
+                "loading this sharded checkpoint fully on the selected device."
+            )
+            _emit(progress_cb, message)
+
+    attempt_model: Any | None = None
+
+    def load_weights(
+        selected_attention: str,
+    ) -> tuple[Any, dict[str, Any] | str | None, int, int, Any | None]:
+        nonlocal attempt_model
+        config = (
+            planned_config
+            if planned_config is not None and selected_attention == planned_attention
+            else _thinker_config(folder, spec.architecture, selected_attention, dtype)
+        )
+        manager = None
         if single_file:
             target = "cpu" if use_cpu_staging else str(device)
+            per_layer = None
+            tower_offload = None
+            if not plan.uses_legacy_offload:
+                assert budget is not None
+                per_layer = lambda index: (
+                    "cpu" if index >= budget.resident_layers else str(device)
+                )
+                if budget.stage_towers:
+                    tower_offload = True
+                else:
+                    tower_offload = None if budget.swapped_layers == 0 else False
             loaded_model, stream_report = _stream_single_checkpoint(
                 folder,
                 model_class,
@@ -562,9 +803,13 @@ def load_model(
                 target_device=target,
                 dtype=dtype,
                 progress_cb=progress_cb,
+                layer_device=per_layer,
+                tower_offload=tower_offload,
             )
+            attempt_model = loaded_model
             selected_map: dict[str, Any] | str | None = {"": target}
             if use_cpu_staging:
+                assert placement is not None
                 selected_map = _dispatch_after_cpu_load(
                     loaded_model,
                     family,
@@ -573,29 +818,68 @@ def load_model(
                     dtype,
                     device_index=device_index,
                 )
+            elif budget is not None and budget.swapped_layers > 0:
+                layers = _block_swap_layers(loaded_model, family, budget.layer_count)
+                pin_budget = (
+                    max(0, ram_available_bytes - 6 * _GIB)
+                    if ram_available_bytes is not None
+                    else None
+                )
+                manager = BlockSwapManager.install(
+                    loaded_model,
+                    layers,
+                    resident=budget.resident_layers,
+                    slots=budget.slots,
+                    device=torch_device,
+                    pin=plan.pin_cpu,
+                    pin_budget_bytes=pin_budget,
+                    log=lambda message: _emit(progress_cb, message),
+                )
+                selected_map = {"": str(device)}
             return (
                 loaded_model,
                 selected_map,
                 int(getattr(stream_report, "quantized_layers", 0)),
                 int(getattr(stream_report, "bf16_layers", 0)),
+                manager,
             )
         if variant.scheme != "bf16":
             raise RuntimeError("Quantized variants must be self-contained single-file checkpoints")
-        loaded_model = _plain_sharded_load(
-            folder,
-            model_class,
-            dtype=dtype,
-            attention=selected_attention,
-            placement=placement,
-        )
-        return loaded_model, getattr(loaded_model, "hf_device_map", placement.device_map), 0, 0
+        if plan.uses_legacy_offload:
+            assert placement is not None
+            loaded_model = _plain_sharded_load(
+                folder,
+                model_class,
+                dtype=dtype,
+                attention=selected_attention,
+                placement=placement,
+            )
+            selected_map = getattr(loaded_model, "hf_device_map", placement.device_map)
+        else:
+            selected_map = {"": str(device)}
+            loaded_model = _plain_sharded_load(
+                folder,
+                model_class,
+                dtype=dtype,
+                attention=selected_attention,
+                device_map=selected_map,
+            )
+        attempt_model = loaded_model
+        return loaded_model, selected_map, 0, 0, None
 
     try:
-        model, device_map, quantized_layers, bf16_layers = load_weights(resolved_attention)
+        model, device_map, quantized_layers, bf16_layers, swap_manager = load_weights(
+            resolved_attention
+        )
     except Exception as exc:
         if resolved_attention != "flash_attention_2" or not is_flash_attention_failure(exc):
             raise
         warning = f"FlashAttention 2 load failed ({exc}); retrying with SDPA."
+        failed_model = attempt_model
+        attempt_model = None
+        if failed_model is not None:
+            _remove_model_runtime(failed_model)
+        failed_model = None
         exc.__traceback__ = None
         get_log().warn(warning, scope="models")
         _emit(progress_cb, warning)
@@ -603,12 +887,34 @@ def load_model(
         if torch.cuda.is_available() and device.startswith("cuda"):
             torch.cuda.empty_cache()
         resolved_attention = "sdpa"
-        model, device_map, quantized_layers, bf16_layers = load_weights(resolved_attention)
+        model, device_map, quantized_layers, bf16_layers, swap_manager = load_weights(
+            resolved_attention
+        )
 
     model.eval()
     if plan.pin_cpu and isinstance(device_map, dict) and any(str(value) == "cpu" for value in device_map.values()):
         pinned = _pin_cpu_tensors(model)
         _emit(progress_cb, f"Pinned {pinned / 1024**3:.2f} GiB of CPU-resident weights")
+    vram_cap_bytes = 0
+    resident_bytes = int(torch.cuda.memory_allocated(torch_device)) if cuda_load else 0
+    block_swap_summary = None
+    gc.collect()
+    _trim_host_working_set()
+    if not plan.uses_legacy_offload:
+        vram_cap_bytes = _apply_vram_hard_cap(
+            torch,
+            torch_device,
+            total_vram_bytes=total_vram_bytes,
+            other_vram_bytes=other_vram_bytes,
+        )
+        _install_last_token_logits_hook(model, last_token_logits)
+        if budget is not None:
+            block_swap_summary = budget.summary()
+            if swap_manager is not None:
+                block_swap_summary = {
+                    **block_swap_summary,
+                    **swap_manager.summary(),
+                }
     processor = _processor(processor_class, folder, spec)
     _load_generation_config(model, folder, processor, spec)
 
@@ -625,7 +931,7 @@ def load_model(
 
     peak = (
         torch.cuda.max_memory_allocated(torch_device) / 1024**3
-        if torch.cuda.is_available() and device.startswith("cuda")
+        if cuda_load
         else 0.0
     )
     report = LoadReport(
@@ -638,6 +944,12 @@ def load_model(
         bf16_layers=bf16_layers,
         compile_mode=compile_name,
         warnings=tuple(warnings),
+        block_swap=block_swap_summary,
+        resident_bytes=resident_bytes,
+        activation_estimate_bytes=(
+            activation_estimate if not plan.uses_legacy_offload else 0
+        ),
+        vram_cap_bytes=vram_cap_bytes,
     )
     loaded = LoadedModel(
         model,
@@ -675,6 +987,8 @@ def unload_model(loaded: LoadedModel | None) -> UnloadReport:
     if loaded is not None:
         _SWITCH_REGISTRY.discard(loaded)
         model = loaded.model
+        if not llama_backend:
+            _remove_model_runtime(model)
         stop = getattr(model, "stop", None)
         if callable(stop):
             stop()
@@ -689,8 +1003,18 @@ def unload_model(loaded: LoadedModel | None) -> UnloadReport:
         try:
             import torch
 
+            host_empty_cache = getattr(getattr(torch, "_C", None), "_host_emptyCache", None)
+            if callable(host_empty_cache):
+                try:
+                    host_empty_cache()
+                except (AttributeError, RuntimeError):
+                    pass
             if torch.cuda.is_available() and device_name.startswith("cuda"):
                 selected_device = torch.device(device_name)
+                try:
+                    torch.cuda.set_per_process_memory_fraction(1.0, selected_device)
+                except (AttributeError, RuntimeError):
+                    pass
                 torch.cuda.synchronize(selected_device)
                 torch.cuda.empty_cache()
                 try:
@@ -738,10 +1062,17 @@ class ModelCache:
             str(kwargs.get("hf_dir")),
             bool(kwargs.get("compile_model", False)),
             str(kwargs.get("compile_mode", DEFAULT_COMPILE_MODE)),
+            repr(kwargs.get("last_token_logits", True)),
         )
         with self._lock:
             if self._loaded is not None and self._key == key and self._loaded.model is not None:
-                return self._loaded
+                if self._plan_covers(self._loaded, kwargs.get("budget_hint")):
+                    return self._loaded
+                get_log().log(
+                    "Reloading the resident model: the new job needs more activation VRAM "
+                    "than the current block-swap plan reserved.",
+                    scope="models",
+                )
             if self._loaded is not None:
                 unload_model(self._loaded)
                 self._loaded = None
@@ -749,6 +1080,27 @@ class ModelCache:
             self._loaded = load_model(variant_key, **kwargs)
             self._key = key
             return self._loaded
+
+    @staticmethod
+    def _plan_covers(loaded: LoadedModel, hint: Any) -> bool:
+        """Return whether the resident plan's activation reserve covers ``hint``."""
+
+        report = getattr(loaded, "load_report", None)
+        planned = int(getattr(report, "activation_estimate_bytes", 0) or 0)
+        if planned <= 0:
+            return True  # legacy, GGUF, or CPU loads carry no block-swap plan
+        try:
+            needed = int(
+                estimate_activation_bytes(
+                    loaded.spec.family,
+                    getattr(loaded.model, "config", None),
+                    hint,
+                    observed_ratio=observed_activation_ratio(loaded.variant.key),
+                )
+            )
+        except Exception:
+            return True
+        return needed <= planned
 
     def unload(self) -> UnloadReport | None:
         """Unload the cached model and clear the cache key."""

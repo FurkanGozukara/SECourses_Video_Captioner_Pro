@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import threading
 import time
@@ -124,3 +126,31 @@ def test_cooperative_chat_stop_retains_worker(monkeypatch: pytest.MonkeyPatch) -
         assert client._worker is worker and worker.is_alive()
     finally:
         client.shutdown()
+
+
+def test_worker_ping_includes_loaded_block_swap_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+    from vcap.pipeline.worker import _ProtocolWriter, _Server
+
+    monkeypatch.setattr(pipeline_runner, "loaded_variant_key", lambda: "qwen3_test_int8")
+    monkeypatch.setattr(
+        pipeline_runner,
+        "loaded_block_swap_summary",
+        lambda: {
+            "mode": "block_swap",
+            "layer_count": 48,
+            "resident_layers": 39,
+            "swapped_layers": 9,
+            "slots": 2,
+        },
+    )
+    stream = io.StringIO()
+    _Server(_ProtocolWriter(stream)).ping()
+
+    event = json.loads(stream.getvalue())
+    assert event["ev"] == "pong"
+    assert event["loaded_variant"] == "qwen3_test_int8"
+    assert event["block_swap"]["resident_layers"] == 39
+    assert event["block_swap"]["slots"] == 2

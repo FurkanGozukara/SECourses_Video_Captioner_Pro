@@ -296,12 +296,16 @@ class _Server:
 
     def ping(self) -> None:
         try:
-            from .runner import loaded_variant_key
+            from .runner import loaded_block_swap_summary, loaded_variant_key
 
             loaded = loaded_variant_key()
+            block_swap = loaded_block_swap_summary()
         except Exception:
             loaded = None
-        self.protocol.emit({"ev": "pong", "loaded_variant": loaded})
+            block_swap = None
+        self.protocol.emit(
+            {"ev": "pong", "loaded_variant": loaded, "block_swap": block_swap}
+        )
 
     def close(self) -> None:
         self._closing.set()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from vcap.ui.theme import HOTKEYS_HEAD, THEME_CHANGE_JS, build_css
+from vcap.ui.theme import HOTKEYS_HEAD, THEME_CHANGE_JS, build_css, build_theme
 
 
 def test_head_script_has_dark_default_and_three_mode_theme_logic() -> None:
@@ -40,6 +40,15 @@ def test_light_mode_css_covers_native_controls_log_tabs_and_focus() -> None:
     assert "body:not(.dark) input[type=checkbox]:not(:checked)" in css
     assert "body:not(.dark) input[type=radio]:not(:checked)" in css
     assert "body:not(.dark) .gradio-container .vc-log textarea" in css
+    assert ".gradio-container { max-width: 1840px !important; margin-left: auto !important; margin-right: auto !important; }" in css
     assert "body:not(.dark) #vc-main-tabs > .tab-wrapper > .tab-container" in css
     assert "body:not(.dark) .vcap-replace-arrow" in css
     assert "body:not(.dark) .vc-btn:focus-visible" in css
+
+
+def test_every_button_size_shares_the_large_metrics() -> None:
+    theme = build_theme()
+    assert theme.button_small_text_size == theme.button_medium_text_size == theme.button_large_text_size == "*text_lg"
+    assert theme.button_small_padding == theme.button_medium_padding == theme.button_large_padding
+    assert theme.button_small_text_weight == theme.button_medium_text_weight == theme.button_large_text_weight == "600"
+    assert "min-height: 36px !important" in build_css()

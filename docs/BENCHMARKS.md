@@ -108,3 +108,28 @@ These end-to-end application runs used physical GPU 0, an NVIDIA GeForce RTX 509
 | `qwen3_omni_captioner_gguf_q4` | 15 s MP3 | 447 tokens at 300 tok/s |
 | `qwen3_omni_captioner_gguf_q8` | 15 s MP3 | 481 tokens at 41.5 tok/s |
 | `qwen3_omni_thinking_bf16` | Not run | Skipped because it uses the same proven 63.4 GB loader/offload path as Instruct BF16, while its reasoning path was covered by INT4, INT8, and both GGUF variants |
+
+## v1.3.0 block swap verification (2026-09-01)
+
+Decoder block swap replaced the Accelerate hook offload and every VRAM tier now plans
+residency from measured layer sizes with a 2 GB reserve. The full measured matrix, including
+byte-identical swapped-versus-resident captions for TimeChat and Qwen3-Omni, automatic plans
+for every family, simulated 8 GB and 12 GB tiers, and the GGUF fitter results, is in
+[BLOCK_SWAP.md](BLOCK_SWAP.md#measured-results-rtx-5090-32-gb-windows-11-2026-09-01). Headline
+numbers on the RTX 5090:
+
+| Case | Before (v1.2.0) | After (v1.3.0) |
+|---|---|---|
+| Qwen3-Omni Thinking INT8, video | 33.07 GiB peak on a 31.84 GiB card (paged), 3.9 tok/s | 24.5-25.7 GiB peak, 3.4-4.5 GiB free, no paging, 1.5 tok/s |
+| Qwen3-Omni Instruct BF16 63.4 GB, media | 51.6 GiB peak (paged), 0.42 tok/s | 26.9 GiB peak, 2.3 GiB free, no paging, 0.35 tok/s |
+| TimeChat BF16, video | 31.52 GiB peak (paged) | 18.26 GiB peak (last-token logits), 33.9 tok/s |
+| Qwen3-Omni Instruct GGUF Q8_0, video | `-ngl 36`: 9.6 tok/s | `--fit`: 64.6 tok/s |
+
+The block-swap decode rates are transfer-bound at the measured 13.4 GiB/s host-to-device rate
+of this system; INT4 (fully resident, 12-13 tok/s) and GGUF remain the fast choices on 32 GB.
+
+Every VRAM-tier preset (6-32 GB) of every family was additionally verified through the real
+runner with emulated card sizes; the per-tier table is in
+[BLOCK_SWAP.md](BLOCK_SWAP.md#tier-preset-verification-every-family-6-32-gb). All offered tiers
+keep at least 2 GB of dedicated VRAM free except the 6 GB tier of the 7B models, which fits
+without paging but with under 1 GB spare.

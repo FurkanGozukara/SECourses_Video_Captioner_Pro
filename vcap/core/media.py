@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import subprocess
+import time
 import threading
 from dataclasses import dataclass
 from functools import lru_cache
@@ -72,6 +73,40 @@ def _common_windows_binary(name: str) -> Iterable[Path]:
     ]
     for root in roots:
         yield root / executable
+
+
+_SPAWN_RETRY_DELAYS_S = (1.5, 3.0, 6.0)
+
+
+def _run_media_tool(
+    command: list[str],
+    *,
+    timeout: float,
+    text_mode: bool,
+) -> "subprocess.CompletedProcess":
+    """Run ffprobe/ffmpeg, retrying a silent non-zero exit that indicates a failed spawn.
+
+    A child that exits non-zero without writing anything to stderr did not get far enough
+    to complain about the media; on Windows this happens transiently under host memory
+    pressure right after a large model load. Genuine media errors always carry stderr.
+    """
+
+    kwargs: dict[str, Any] = {"capture_output": True, "timeout": timeout, "check": False}
+    if text_mode:
+        kwargs.update(text=True, encoding="utf-8", errors="replace")
+    attempt = 0
+    while True:
+        completed = subprocess.run(command, **kwargs)
+        stderr = completed.stderr
+        silent = not (stderr.strip() if isinstance(stderr, str) else (stderr or b"").strip())
+        if completed.returncode == 0 or not silent or attempt >= len(_SPAWN_RETRY_DELAYS_S):
+            return completed
+        time.sleep(_SPAWN_RETRY_DELAYS_S[attempt])
+        attempt += 1
+
+
+def _exit_code_text(returncode: int) -> str:
+    return f"exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
 
 
 @lru_cache(maxsize=1)
@@ -218,26 +253,21 @@ def probe_media(path: str | os.PathLike[str]) -> MediaInfo:
     if not ffprobe:
         return _unknown_info(target, "ffprobe was not found")
     try:
-        completed = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-                str(target),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            check=False,
-        )
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(target),
+        ]
+        completed = _run_media_tool(command, timeout=30, text_mode=True)
         if completed.returncode != 0:
-            tail = (completed.stderr or "ffprobe failed").strip()[-2000:]
+            tail = (completed.stderr or "").strip()[-2000:] or (
+                f"ffprobe failed to start ({_exit_code_text(completed.returncode)})"
+            )
             return _unknown_info(target, tail)
         payload = json.loads(completed.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -493,7 +523,7 @@ def read_audio(path: str | os.PathLike[str], sample_rate: int = 16000) -> np.nda
     if not ffmpeg:
         raise MediaError("ffmpeg was not found")
     target = normalize_path(path, must_exist=True)
-    completed = subprocess.run(
+    completed = _run_media_tool(
         [
             ffmpeg,
             "-hide_banner",
@@ -510,11 +540,13 @@ def read_audio(path: str | os.PathLike[str], sample_rate: int = 16000) -> np.nda
             "f32le",
             "pipe:1",
         ],
-        capture_output=True,
-        check=False,
+        timeout=600,
+        text_mode=False,
     )
     if completed.returncode != 0:
-        error = completed.stderr.decode("utf-8", errors="replace")[-3000:]
+        error = completed.stderr.decode("utf-8", errors="replace")[-3000:].strip() or (
+            f"ffmpeg failed to start ({_exit_code_text(completed.returncode)})"
+        )
         raise MediaError(f"Could not decode audio: {error}")
     return np.frombuffer(completed.stdout, dtype="<f4").astype(np.float32, copy=True)
 

@@ -16,8 +16,8 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Use Dataset & Export for trainer frame-fit suggestions, crop/pad bucket previews, timestamped fitness plans, an overlap-aware video sub-split tool, and Kohya/Musubi TOML generation.
 - Chat through the shared resident worker with streamed Qwen3-Omni multimodal multi-turn history or single-turn TimeChat/AVoCaDO video Q&A, then save the conversation as JSON and Markdown.
 - Use protected shipped presets, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
-- Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention and offload plans, recover from supported OOM cases, inspect live VRAM/RAM and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
-- Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server`, while 63.4 GB Qwen3 BF16 checkpoints can use automatic CPU offload on smaller GPUs.
+- Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention plans with automatic decoder block swap that keeps 2 GB of dedicated VRAM free instead of paging into Windows shared GPU memory, recover from supported OOM cases, inspect live VRAM/RAM/shared-memory and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
+- Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server` that fits itself to device memory, while 63.4 GB Qwen3 BF16 checkpoints run through pinned-RAM block swap on smaller GPUs.
 
 ## Requirements
 
@@ -105,7 +105,7 @@ SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py
 
 The downloader menu includes Qwen3-Omni Instruct, Thinking, and Captioner in both GGUF Q4_K_M and Q8_0 forms. On Linux the model files can be downloaded from this menu, but the pinned `llama-server` runtime must be built with CMake and a C++ compiler and selected with `VCAP_LLAMACPP_SERVER`; see [docs/GGUF_BACKEND.md](docs/GGUF_BACKEND.md).
 
-The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, attention, and CPU-offload plan.
+The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, and attention plan. Decoder placement is `auto` on every tier: at load time the app measures free VRAM, estimates the job's activation peak from the media it will process, keeps 2 GB free, and block-swaps the remaining decoder layers from pinned RAM through a prefetching ring of GPU slots (see [docs/BLOCK_SWAP.md](docs/BLOCK_SWAP.md)). `Decoder layers on GPU`, `VRAM to keep free (GB)`, and `Swap slots` in the Offload plan section override this per job.
 
 ## Presets and Persistence
 
@@ -147,7 +147,7 @@ Sizes are decimal GB from the produced/downloaded folders. GGUF totals include t
 | Qwen3-Omni 30B-A3B Thinking | Video, video+audio, audio, image, text; separate reasoning output | `qwen3_omni_thinking_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_thinking_int8` — INT8 ConvRot — 33.031 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_thinking_int4` — INT4 ConvRot W4A8 — 17.780 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_thinking_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_thinking_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 | Qwen3-Omni 30B-A3B Captioner | One audio file, prompt-free; up to 30 seconds | `qwen3_omni_captioner_bf16` — BF16 — 63.4 GB — 80 GB<br>`qwen3_omni_captioner_int8` — INT8 ConvRot — 33.041 GB — 32 GB (48 GB fully resident)<br>`qwen3_omni_captioner_int4` — INT4 ConvRot W4A8 — 17.790 GB — 8 GB experimental (24 GB fully resident)<br>`qwen3_omni_captioner_gguf_q4` — GGUF Q4_K_M — 19.882 GB — 24 GB<br>`qwen3_omni_captioner_gguf_q8` — GGUF Q8_0 — 33.810 GB — 32 GB partial offload (48 GB fully resident) |
 
-Qwen3 BF16 checkpoints are 63.4 GB and do not fit wholly in 32 GB VRAM. Automatic CPU offload was verified with Instruct and Captioner on an RTX 5090, at substantially lower throughput than resident variants.
+Qwen3 BF16 checkpoints are 63.4 GB and do not fit wholly in 32 GB VRAM. They load through automatic block swap: the decoder layers that do not fit stay in pinned system RAM (about 1.2 GB per swapped layer, so plan for 40 GB or more of free RAM on a 32 GB GPU) and stream through the GPU each token, which keeps dedicated VRAM within budget at substantially lower throughput than resident variants. The tier column above lists the smallest tier that still keeps the whole model resident; smaller cards use block swap automatically.
 
 ## Model Credits and Licenses
 

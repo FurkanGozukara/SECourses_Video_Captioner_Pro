@@ -113,6 +113,58 @@ def _settings(**overrides: Any) -> dict[str, Any]:
     return values
 
 
+@pytest.mark.parametrize(
+    ("settings", "expected_layers"),
+    [
+        ({"gpu_layers": "AUTO"}, "auto"),
+        ({"gpu_layers": "all"}, "all"),
+        ({"gpu_layers": "12"}, 12),
+        ({"layers_on_gpu": 8}, 8),
+    ],
+)
+def test_job_offload_parsing_accepts_auto_all_and_counts(
+    settings: dict[str, Any], expected_layers: int | str, tmp_path: Path
+) -> None:
+    spec = JobSpec.from_settings(
+        _settings(
+            **settings,
+            vram_reserve_gb="3.5",
+            swap_slots="3",
+            pin_cpu="true",
+        ),
+        [],
+        OutputSpec(outputs_root=tmp_path),
+    )
+
+    assert spec.model.offload.gpu_layers == expected_layers
+    assert spec.model.offload.vram_reserve_gb == 3.5
+    assert spec.model.offload.swap_slots == 3
+    assert spec.model.offload.pin_cpu is True
+    assert JobSpec.from_json(spec.to_json()).model.offload == spec.model.offload
+
+
+def test_job_offload_defaults_match_automatic_block_swap(tmp_path: Path) -> None:
+    spec = JobSpec.from_settings(
+        _settings(), [], OutputSpec(outputs_root=tmp_path)
+    )
+    offload = spec.model.offload
+    assert offload.gpu_layers == "auto"
+    assert offload.pin_cpu is True
+    assert offload.vram_reserve_gb == 2.0
+    assert offload.swap_slots == 2
+    payload = spec.to_dict()
+    payload["model"]["offload"].update(
+        gpu_layers="16", vram_reserve_gb="4.0", swap_slots="3", pin_cpu="false"
+    )
+    parsed = JobSpec.from_dict(payload).model.offload
+    assert (parsed.gpu_layers, parsed.vram_reserve_gb, parsed.swap_slots, parsed.pin_cpu) == (
+        16,
+        4.0,
+        3,
+        False,
+    )
+
+
 def _write_wav(path: Path, seconds: float = 0.2) -> None:
     sample_rate = 8_000
     frames = bytearray()
@@ -379,6 +431,7 @@ def test_worker_protocol_end_to_end_with_fake_env(
     worker.send({"cmd": "ping"})
     pong = next(event for event in stream if event.get("ev") == "pong")
     assert pong["loaded_variant"] == "qwen3_omni_instruct_int8"
+    assert pong["block_swap"] is None
     worker.send({"cmd": "unload"})
     worker.send({"cmd": "exit"})
     list(stream)
@@ -787,6 +840,133 @@ def test_loader_progress_is_written_once_to_run_log(
     run_log = Path(result.run_dir, "run_log.txt").read_text(encoding="utf-8")
     assert run_log.count(marker) == 1
     assert any(event.data.get("phase") == "model_load" for event in sink.progress)
+
+
+def test_runner_passes_block_swap_budget_and_records_shared_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vcap.pipeline.runner as pipeline_runner
+    from vcap.models import loader
+    from vcap.models.registry import MODEL_SPECS
+
+    captured: dict[str, Any] = {}
+
+    def load_model(
+        variant_key: str,
+        *,
+        budget_hint: Any = None,
+        **kwargs: Any,
+    ) -> FakeCaptioner:
+        captured.update(variant_key=variant_key, budget_hint=budget_hint, **kwargs)
+        captioner = FakeCaptioner(variant_key, [])
+        captioner.load_report = SimpleNamespace(
+            peak_vram_gb=7.0,
+            block_swap={
+                "mode": "block_swap",
+                "layer_count": 48,
+                "resident_layers": 40,
+                "swapped_layers": 8,
+                "slots": 3,
+            },
+            activation_estimate_bytes=int(1.25 * 2**30),
+            vram_cap_bytes=int(27.5 * 2**30),
+        )
+        return captioner
+
+    samples = iter(({"shared_gb": 0.1}, {"shared_gb": 2.5}))
+    monkeypatch.setattr(loader, "load_model", load_model)
+    monkeypatch.setattr(
+        pipeline_runner.gpu,
+        "shared_gpu_memory_usage",
+        lambda: next(samples),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline_runner.gpu,
+        "resource_snapshot",
+        lambda _index: {"gpu_index": 0, "vram_used_gb": 7.0},
+    )
+    sink = RecordingSink()
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(
+                gpu_layers="auto",
+                vram_reserve_gb=3.5,
+                swap_slots=3,
+                pin_cpu=True,
+                max_frames=30,
+                max_pixels=262_144,
+                fps=1.5,
+                max_new_tokens=321,
+            ),
+            [
+                InputItem("first", text_prompt_only=True),
+                InputItem("second", text_prompt_only=True),
+            ],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        sink,
+        CancelToken(),
+    )
+
+    offload = captured["offload"]
+    assert offload.gpu_layers == "auto"
+    assert offload.vram_reserve_gb == 3.5
+    assert offload.swap_slots == 3
+    assert offload.pin_cpu is True
+    hint = captured["budget_hint"]
+    # Text-only inputs need no vision or audio budget: the media-derived hint
+    # reports zero frames and the kinds the job really contains.
+    assert (hint.max_frames, hint.max_pixels, hint.fps, hint.max_new_tokens) == (
+        0,
+        262_144,
+        1.5,
+        321,
+    )
+    assert hint.media_kinds == ("text",)
+    assert hint.context_tokens == MODEL_SPECS["qwen3_omni_instruct"].limits.context_tokens
+    # 0.1 GiB is ordinary CUDA-context overhead (no warning); 2.5 GiB with no pinned
+    # block-swap buffers means 1.9 GiB of device allocations were paged.
+    assert any(
+        level == "warning"
+        and "WDDM shared GPU memory beyond the pinned block-swap buffers: 1.90 GiB" in message
+        for message, level, _scope in sink.logs
+    )
+    metadata = json.loads(Path(result.metadata_path).read_text(encoding="utf-8"))
+    gpu_info = metadata["gpu_info"]
+    assert gpu_info["block_swap"]["resident_layers"] == 40
+    assert gpu_info["vram_reserve_gb"] == 3.5
+    assert gpu_info["activation_estimate_gb"] == 1.25
+    assert gpu_info["vram_cap_gb"] == 27.5
+    assert gpu_info["shared_gpu_memory_peak_gb"] == 2.5
+    assert gpu_info["shared_gpu_memory_excess_peak_gb"] == pytest.approx(1.9)
+
+
+def test_runner_omits_budget_hint_for_legacy_loader_signature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vcap.models import loader
+
+    captured: dict[str, Any] = {}
+
+    def load_model(variant_key: str, **kwargs: Any) -> FakeCaptioner:
+        captured.update(kwargs)
+        return FakeCaptioner(variant_key, [])
+
+    monkeypatch.setattr(loader, "load_model", load_model)
+    result = run_job(
+        JobSpec.from_settings(
+            _settings(),
+            [InputItem("legacy", text_prompt_only=True)],
+            OutputSpec(outputs_root=tmp_path / "runs"),
+        ),
+        RecordingSink(),
+        CancelToken(),
+    )
+    assert result.counts["done"] == 1
+    assert "budget_hint" not in captured
 
 
 def test_context_carry_over_appends_only_previous_segment(

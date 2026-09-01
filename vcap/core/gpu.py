@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import html
 import os
 import shutil
@@ -14,6 +15,28 @@ from typing import Any
 
 VRAM_TIERS = (6, 8, 10, 12, 16, 24, 32, 48, 80)
 TIER_LABELS = {tier: f"{tier} GB" for tier in VRAM_TIERS}
+
+_PDH_FMT_LARGE = 0x00000400
+_PDH_MORE_DATA = 0x800007D2
+
+
+class _PdhFormattedValueData(ctypes.Union):
+    _fields_ = [
+        ("longValue", ctypes.c_long),
+        ("doubleValue", ctypes.c_double),
+        ("largeValue", ctypes.c_longlong),
+        ("ansiStringValue", ctypes.c_char_p),
+        ("wideStringValue", ctypes.c_wchar_p),
+    ]
+
+
+class _PdhFormattedCounterValue(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [("CStatus", ctypes.c_uint32), ("value", _PdhFormattedValueData)]
+
+
+class _PdhFormattedCounterValueItemW(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhFormattedCounterValue)]
 
 
 @dataclass(frozen=True)
@@ -191,6 +214,145 @@ def _nvml_memory_for_index(gpu_index: int) -> tuple[float, float, float] | None:
                 pass
 
 
+def _pdh_status_code(status: Any) -> int:
+    """Normalize signed or ctypes PDH_STATUS values for constant comparisons."""
+
+    return int(getattr(status, "value", status)) & 0xFFFFFFFF
+
+
+def _configure_pdh_signatures(pdh: Any) -> None:
+    """Set 64-bit-safe signatures on real ctypes functions while leaving mocks alone."""
+
+    function_type = getattr(ctypes, "_CFuncPtr", None)
+    if function_type is None:
+        return
+    signatures = {
+        "PdhOpenQueryW": (
+            [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_long,
+        ),
+        "PdhAddEnglishCounterW": (
+            [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_long,
+        ),
+        "PdhCollectQueryData": ([ctypes.c_void_p], ctypes.c_long),
+        "PdhGetFormattedCounterArrayW": (
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ],
+            ctypes.c_long,
+        ),
+        "PdhCloseQuery": ([ctypes.c_void_p], ctypes.c_long),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        function = getattr(pdh, name, None)
+        if isinstance(function, function_type):
+            function.argtypes = argtypes
+            function.restype = restype
+
+
+def _pdh_counter_array_total(pdh: Any, counter: ctypes.c_void_p) -> int | None:
+    buffer_size = ctypes.c_uint32(0)
+    item_count = ctypes.c_uint32(0)
+    status = pdh.PdhGetFormattedCounterArrayW(
+        counter,
+        _PDH_FMT_LARGE,
+        ctypes.byref(buffer_size),
+        ctypes.byref(item_count),
+        None,
+    )
+    status_code = _pdh_status_code(status)
+    if status_code == 0 and item_count.value == 0:
+        return 0
+    if status_code != _PDH_MORE_DATA or buffer_size.value <= 0:
+        return None
+
+    buffer = ctypes.create_string_buffer(buffer_size.value)
+    status = pdh.PdhGetFormattedCounterArrayW(
+        counter,
+        _PDH_FMT_LARGE,
+        ctypes.byref(buffer_size),
+        ctypes.byref(item_count),
+        buffer,
+    )
+    if _pdh_status_code(status) != 0:
+        return None
+    items = ctypes.cast(buffer, ctypes.POINTER(_PdhFormattedCounterValueItemW))
+    total = 0
+    for index in range(item_count.value):
+        if items[index].FmtValue.CStatus in {0, 1}:
+            total += max(0, int(items[index].FmtValue.largeValue))
+    return total
+
+
+def _pdh_memory_totals(instance_object: str) -> dict[str, float]:
+    """Sum WDDM shared/dedicated usage counters for one PDH object instance filter."""
+
+    if os.name != "nt":
+        return {}
+
+    query = ctypes.c_void_p()
+    pdh: Any | None = None
+    try:
+        pdh = ctypes.windll.pdh
+        _configure_pdh_signatures(pdh)
+        if _pdh_status_code(pdh.PdhOpenQueryW(None, 0, ctypes.byref(query))) != 0:
+            return {}
+
+        counters: dict[str, ctypes.c_void_p] = {}
+        for key, counter_name in (
+            ("shared_gb", "Shared Usage"),
+            ("dedicated_gb", "Dedicated Usage"),
+        ):
+            counter = ctypes.c_void_p()
+            path = f"\\{instance_object}\\{counter_name}"
+            status = pdh.PdhAddEnglishCounterW(query, path, 0, ctypes.byref(counter))
+            if _pdh_status_code(status) != 0:
+                return {}
+            counters[key] = counter
+
+        if _pdh_status_code(pdh.PdhCollectQueryData(query)) != 0:
+            return {}
+        totals = {key: _pdh_counter_array_total(pdh, counter) for key, counter in counters.items()}
+        if any(value is None for value in totals.values()):
+            return {}
+        gib = float(2**30)
+        return {key: float(value) / gib for key, value in totals.items() if value is not None}
+    except Exception:
+        return {}
+    finally:
+        if pdh is not None and query.value:
+            try:
+                pdh.PdhCloseQuery(query)
+            except Exception:
+                pass
+
+
+def shared_gpu_memory_usage(pid: int | None = None) -> dict[str, float]:
+    """Return one process's WDDM shared and dedicated GPU memory in GiB via PDH.
+
+    Pinned (page-locked) host memory is counted as shared usage by WDDM, so a
+    block-swapped model legitimately shows its pinned layers here; only the
+    portion beyond the pinned bytes indicates paging of device allocations.
+    """
+
+    try:
+        process_id = os.getpid() if pid is None else int(pid)
+    except (TypeError, ValueError):
+        return {}
+    return _pdh_memory_totals(f"GPU Process Memory(pid_{process_id}_*)")
+
+
+def shared_gpu_memory_total() -> dict[str, float]:
+    """Return system-wide WDDM shared and dedicated GPU memory in GiB (all adapters)."""
+
+    return _pdh_memory_totals("GPU Adapter Memory(*)")
+
+
 def resource_snapshot(gpu_index: int = 0) -> dict[str, float | int]:
     """Capture current VRAM and system RAM use in GiB."""
 
@@ -210,7 +372,7 @@ def resource_snapshot(gpu_index: int = 0) -> dict[str, float | int]:
         ram_used, ram_total, ram_free = memory.used / gib, memory.total / gib, memory.available / gib
     except Exception:
         ram_used = ram_total = ram_free = 0.0
-    return {
+    snapshot: dict[str, float | int] = {
         "gpu_index": int(gpu_index),
         "vram_used_gb": float(vram[0]),
         "vram_total_gb": float(vram[1]),
@@ -220,6 +382,10 @@ def resource_snapshot(gpu_index: int = 0) -> dict[str, float | int]:
         "ram_free_gb": float(ram_free),
         "timestamp": time.time(),
     }
+    shared = shared_gpu_memory_total()
+    if "shared_gb" in shared:
+        snapshot["shared_used_gb"] = float(shared["shared_gb"])
+    return snapshot
 
 
 def _meter_row(label: str, used: float, total: float, detail: str = "") -> str:
@@ -247,12 +413,16 @@ def render_resource_meter_html(
     ram_used = float(snapshot.get("ram_used_gb", 0.0) or 0.0)
     ram_total = float(snapshot.get("ram_total_gb", 0.0) or 0.0)
     peak = f"; peak {float(peak_vram_gb):.1f} GB" if peak_vram_gb is not None else ""
-    return (
+    rows = (
         '<div class="vc-meter">'
         + _meter_row("VRAM", vram_used, vram_total, peak)
         + _meter_row("RAM", ram_used, ram_total)
-        + "</div>"
     )
+    if "shared_used_gb" in snapshot:
+        shared_used = float(snapshot.get("shared_used_gb", 0.0) or 0.0)
+        shared_total = float(snapshot.get("shared_total_gb", ram_total / 2.0) or 0.0)
+        rows += _meter_row("Shared GPU memory (WDDM, all processes)", shared_used, shared_total)
+    return rows + "</div>"
 
 
 def is_oom_error(exc_or_text: object) -> bool:
@@ -289,6 +459,12 @@ def cuda_visible_devices_env(index: int | str) -> dict[str, str]:
     return {"CUDA_VISIBLE_DEVICES": str(index).strip()}
 
 
+def vram_cap_env_disabled() -> bool:
+    """Return whether VCAP_VRAM_HARD_CAP explicitly disables the allocator cap."""
+
+    return os.environ.get("VCAP_VRAM_HARD_CAP", "").strip().casefold() in {"0", "false", "off"}
+
+
 __all__ = [
     "GpuInfo",
     "TIER_LABELS",
@@ -297,5 +473,8 @@ __all__ = [
     "list_gpus",
     "render_resource_meter_html",
     "resource_snapshot",
+    "shared_gpu_memory_total",
+    "shared_gpu_memory_usage",
+    "vram_cap_env_disabled",
     "vram_tier_for_gb",
 ]

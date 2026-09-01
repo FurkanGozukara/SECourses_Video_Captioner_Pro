@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -72,6 +73,7 @@ class _Emitter:
         self._current_event_index: int | None = None
         self._console_key = ("pipeline", id(self))
         self._console_throttle = UiThrottle(0.5)
+        self.run_dir: str | None = None
 
     def log(self, text: object, level: str = "info", scope: str = "pipeline") -> None:
         message = str(text)
@@ -120,6 +122,7 @@ class _Emitter:
             "item_index": event_index,
             "item_elapsed_s": snapshot["item_elapsed_s"],
             "status_line": self.tracker.status_line(),
+            "run_dir": self.run_dir,
             **dict(data or {}),
         }
 
@@ -258,12 +261,20 @@ class _Emitter:
         status: str,
         message: str,
         seconds: float,
+        *,
+        outputs: Mapping[str, Any] | None = None,
+        clip_path: str | None = None,
     ) -> None:
         tracker_status = status if status in {"done", "skipped", "failed"} else "failed"
         self.tracker.finish_item(tracker_status, seconds)
         payload = self._payload(
             event_index,
-            data={"elapsed": max(0.0, float(seconds)), "item_elapsed_s": max(0.0, float(seconds))},
+            data={
+                "elapsed": max(0.0, float(seconds)),
+                "item_elapsed_s": max(0.0, float(seconds)),
+                "outputs": {str(key): str(value) for key, value in dict(outputs or {}).items()},
+                "clip_path": clip_path,
+            },
         )
         _call_sink(
             self.sink.on_item,
@@ -283,6 +294,16 @@ class _Emitter:
             force=True,
             finalize=self.tracker.remaining == 0,
         )
+
+
+def _last_saved_clip(result: ItemResult) -> str | None:
+    """Return the newest segment clip that still exists on disk, if clips were kept."""
+
+    for record in reversed(list(result.segments or [])):
+        raw = record.get("media_path") if isinstance(record, dict) else None
+        if raw and Path(str(raw)).is_file():
+            return str(raw)
+    return None
 
 
 @dataclass
@@ -635,6 +656,9 @@ def _write_metadata(
     elapsed: float,
     peak_vram_gb: float,
     *,
+    load_report: Any | None = None,
+    shared_gpu_memory_peak_gb: float = 0.0,
+    shared_gpu_memory_excess_peak_gb: float = 0.0,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
     try:
@@ -652,6 +676,19 @@ def _write_metadata(
         model_info = {"variant_key": spec.model.variant_key}
     gpu_info = gpu.resource_snapshot(spec.runtime.gpu_index)
     gpu_info["peak_vram_gb"] = float(peak_vram_gb)
+    block_swap = getattr(load_report, "block_swap", None)
+    gpu_info.update(
+        block_swap=dict(block_swap) if isinstance(block_swap, Mapping) else None,
+        vram_reserve_gb=float(spec.model.offload.vram_reserve_gb),
+        activation_estimate_gb=float(
+            getattr(load_report, "activation_estimate_bytes", 0) or 0
+        )
+        / float(2**30),
+        vram_cap_gb=float(getattr(load_report, "vram_cap_bytes", 0) or 0)
+        / float(2**30),
+        shared_gpu_memory_peak_gb=max(0.0, float(shared_gpu_memory_peak_gb)),
+        shared_gpu_memory_excess_peak_gb=max(0.0, float(shared_gpu_memory_excess_peak_gb)),
+    )
     name = str(spec.internal.get("metadata_name") or "metadata.json")
     target = run_dir / sanitize_filename(name)
     builder = MetadataBuilder()
@@ -731,14 +768,69 @@ class _FakeCaptioner:
         )
 
 
+def _media_budget_hint(spec: JobSpec, resolved: Sequence["_ResolvedInput"]) -> Any | None:
+    """Derive the frame count and media kinds the job will really use from probed inputs.
+
+    The VRAM plan is computed once per load, before any item runs. Using the actual
+    clip durations instead of the preset's worst-case ``max_frames`` keeps more
+    decoder layers resident for short clips while staying exact for long ones.
+    """
+
+    from vcap.models.offload import BudgetHint
+
+    kinds: set[str] = set()
+    frames_needed = 0
+    saw_visual = False
+    fps = max(0.25, float(spec.preprocess.fps or 0.25))
+    max_frames = max(2, int(spec.preprocess.max_frames or 2))
+    strategy = str(getattr(spec.preprocess, "sampling_strategy", "fps") or "fps").casefold()
+    for entry in resolved:
+        if entry.status not in {"pending", "done"}:
+            continue
+        info = entry.info
+        kind = str(entry.kind or (info.kind if info is not None else "unknown")).casefold()
+        if kind in {"video", "video_no_audio", "video_audio"}:
+            kinds.add("video")
+            saw_visual = True
+            duration = float(getattr(info, "duration", None) or 0.0) if info is not None else 0.0
+            if strategy != "fps" or duration <= 0.0:
+                frames_needed = max_frames
+            else:
+                frames_needed = max(frames_needed, min(max_frames, int(math.ceil(duration * fps)) + 2))
+        elif kind == "image":
+            kinds.add("image")
+            saw_visual = True
+            frames_needed = max(frames_needed, 2)
+        elif kind == "audio":
+            kinds.add("audio")
+        elif kind == "text":
+            kinds.add("text")
+    if not kinds:
+        return None
+    return BudgetHint(
+        max_frames=frames_needed if saw_visual else 0,
+        media_kinds=tuple(sorted(kinds)),
+    )
+
+
 class _ModelSession:
-    def __init__(self, spec: JobSpec, emitter: _Emitter, cancel: CancelToken) -> None:
+    def __init__(
+        self,
+        spec: JobSpec,
+        emitter: _Emitter,
+        cancel: CancelToken,
+        media_hint: Any | None = None,
+    ) -> None:
         self.spec = spec
         self.emitter = emitter
         self.cancel = cancel
+        self.media_hint = media_hint
         self.captioner: Any | None = None
         self.loaded: Any | None = None
+        self.load_report: Any | None = None
         self.peak_vram_gb = 0.0
+        self.shared_gpu_memory_peak_gb = 0.0
+        self.shared_gpu_memory_excess_peak_gb = 0.0
         self._compile_prepared = False
         self._patched_loader = False
 
@@ -784,7 +876,7 @@ class _ModelSession:
 
         from vcap.models import captioner_for_loaded
         from vcap.models import downloads, loader
-        from vcap.models.offload import OffloadPlan
+        from vcap.models.offload import BudgetHint, OffloadPlan
 
         load_function = loader.load_model
         loader_is_patched = not (
@@ -841,6 +933,23 @@ class _ModelSession:
             offload_experts=self.spec.model.offload.offload_experts,
             max_memory=max_memory,
             pin_cpu=self.spec.model.offload.pin_cpu,
+            vram_reserve_gb=self.spec.model.offload.vram_reserve_gb,
+            swap_slots=self.spec.model.offload.swap_slots,
+        )
+        model_spec = MODEL_SPECS[variant_to_family(self.spec.model.variant_key)]
+        hint_frames = self.spec.preprocess.max_frames
+        hint_kinds: tuple[str, ...] = ()
+        if self.media_hint is not None:
+            if getattr(self.media_hint, "max_frames", None) is not None:
+                hint_frames = min(int(hint_frames), int(self.media_hint.max_frames))
+            hint_kinds = tuple(getattr(self.media_hint, "media_kinds", ()) or ())
+        budget_hint = BudgetHint(
+            max_frames=hint_frames,
+            max_pixels=self.spec.preprocess.max_pixels,
+            fps=self.spec.preprocess.fps,
+            max_new_tokens=self.spec.generation.max_new_tokens,
+            context_tokens=model_spec.limits.context_tokens,
+            media_kinds=hint_kinds,
         )
         physical_gpu_index = int(self.spec.runtime.gpu_index)
         isolated_worker = os.environ.get("VCAP_WORKER", "").strip() == "1"
@@ -861,12 +970,19 @@ class _ModelSession:
             "compile_model": self.spec.runtime.compile,
             "compile_mode": compile_mode,
         }
+        try:
+            accepts_budget_hint = "budget_hint" in inspect.signature(loader.load_model).parameters
+        except (TypeError, ValueError):
+            accepts_budget_hint = False
+        if accepts_budget_hint:
+            load_kwargs["budget_hint"] = budget_hint
         self.loaded = (
             load_function(self.spec.model.variant_key, **load_kwargs)
             if loader_is_patched
             else loader.MODEL_CACHE.load(self.spec.model.variant_key, **load_kwargs)
         )
         report = getattr(self.loaded, "load_report", None)
+        self.load_report = report
         self.peak_vram_gb = max(self.peak_vram_gb, float(getattr(report, "peak_vram_gb", 0.0) or 0.0))
         self.captioner = (
             self.loaded
@@ -874,6 +990,40 @@ class _ModelSession:
             else captioner_for_loaded(self.loaded)
         )
         return self.captioner
+
+    def sample_shared_gpu_memory(self) -> None:
+        """Record process-level WDDM spill after an item without requiring Task C."""
+
+        sampler = getattr(gpu, "shared_gpu_memory_usage", None)
+        if not callable(sampler):
+            return
+        try:
+            usage = sampler()
+            shared_gb = float(usage.get("shared_gb", 0.0) or 0.0) if isinstance(usage, Mapping) else 0.0
+        except Exception:
+            return
+        self.shared_gpu_memory_peak_gb = max(self.shared_gpu_memory_peak_gb, shared_gb)
+        # WDDM counts pinned (page-locked) host memory as "shared usage", so the
+        # block-swap buffers legitimately appear here. Only usage beyond the pinned
+        # bytes plus the driver's own baseline indicates that device allocations
+        # were paged into system memory.
+        block_swap = getattr(self.load_report, "block_swap", None)
+        pinned_gb = 0.0
+        if isinstance(block_swap, Mapping):
+            try:
+                pinned_gb = float(block_swap.get("pinned_gib", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pinned_gb = 0.0
+        excess_gb = max(0.0, shared_gb - pinned_gb - 0.6)
+        self.shared_gpu_memory_excess_peak_gb = max(self.shared_gpu_memory_excess_peak_gb, excess_gb)
+        if excess_gb > 0.5:
+            self.emitter.log(
+                f"WDDM shared GPU memory beyond the pinned block-swap buffers: {excess_gb:.2f} GiB "
+                f"(shared {shared_gb:.2f} GiB, pinned {pinned_gb:.2f} GiB) — VRAM is being paged into "
+                "system memory; increase the VRAM reserve or lower the resident layer count",
+                "warning",
+                "gpu",
+            )
 
     def unload(self) -> None:
         global _FAKE_CAPTIONER, _FAKE_VARIANT
@@ -912,6 +1062,19 @@ def loaded_variant_key() -> str | None:
 
         loaded = MODEL_CACHE.loaded
         return str(loaded.variant.key) if loaded is not None else None
+    except Exception:
+        return None
+
+
+def loaded_block_swap_summary() -> dict[str, Any] | None:
+    """Return the cached model's JSON-safe block-swap load summary, if any."""
+
+    try:
+        from vcap.models.loader import MODEL_CACHE
+
+        loaded = MODEL_CACHE.loaded
+        summary = getattr(getattr(loaded, "load_report", None), "block_swap", None)
+        return dict(summary) if isinstance(summary, Mapping) else None
     except Exception:
         return None
 
@@ -1756,6 +1919,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         _assign_single_outputs(run_dir, resolved)
     tracker = ProgressTracker(len(resolved), [entry.stem for entry in resolved])
     emitter = _Emitter(sinks, tracker)
+    emitter.run_dir = str(run_dir)
     results: dict[int, ItemResult] = {}
     peak_vram = 0.0
     metadata_path = run_dir / str(spec.internal.get("metadata_name") or "metadata.json")
@@ -1778,6 +1942,9 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             _probe_and_classify(spec, resolved, model)
             _apply_batch_skip(spec, resolved)
             _apply_batch_limit(spec, resolved)
+            # The VRAM plan is made once at the first load; size it from the media
+            # this job really contains rather than the preset's worst-case frames.
+            session.media_hint = _media_budget_hint(spec, resolved)
 
         actionable: list[_ResolvedInput] = []
         for entry in resolved:
@@ -1832,6 +1999,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     result.status,
                     result.message,
                     result.elapsed,
+                    outputs=result.outputs,
+                    clip_path=_last_saved_clip(result),
                 )
             except CancelledError as exc:
                 cancelled_job = True
@@ -1877,6 +2046,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     message,
                     elapsed,
                 )
+            finally:
+                session.sample_shared_gpu_memory()
 
         if not spec.runtime.keep_model_loaded:
             session.unload()
@@ -1890,6 +2061,9 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                 run_dir,
                 elapsed,
                 max(peak_vram, session.peak_vram_gb),
+                load_report=session.load_report,
+                shared_gpu_memory_peak_gb=session.shared_gpu_memory_peak_gb,
+                shared_gpu_memory_excess_peak_gb=session.shared_gpu_memory_excess_peak_gb,
             )
         except Exception as exc:
             emitter.log(f"Could not write metadata: {exc}", "error", "metadata")
@@ -2229,4 +2403,9 @@ def run_job(
     return _run_job_local(spec, sinks, token)
 
 
-__all__ = ["loaded_variant_key", "run_job", "unload_cached_model"]
+__all__ = [
+    "loaded_block_swap_summary",
+    "loaded_variant_key",
+    "run_job",
+    "unload_cached_model",
+]
