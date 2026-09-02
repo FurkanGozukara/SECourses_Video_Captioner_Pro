@@ -50,7 +50,7 @@ def test_job_clamps_frames_to_the_family_cap(tmp_path: Path) -> None:
     assert frames("avocado_int4", 768) == 256
     assert frames("qwen3_omni_instruct_int4", 768) == 768
     assert frames("qwen3_omni_instruct_int4", 240) == 240
-    assert frames("timechat_int8", 0) == 160
+    assert frames("timechat_int8", 0) == 4
 
 
 def test_llamacpp_reserves_the_requested_window_within_the_tier() -> None:

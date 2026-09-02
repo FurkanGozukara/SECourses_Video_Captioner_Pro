@@ -12,7 +12,9 @@ from .paths import normalize_path
 
 
 APP_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "app_settings.json"
-_PATH_KEYS = ("outputs_dir", "temp_dir", "models_dir")
+_DEFAULT_LOGS_DIR = APP_SETTINGS_PATH.parent / "logs"
+_PATH_KEYS = ("outputs_dir", "temp_dir", "models_dir", "logs_dir")
+_OPTIONAL_PATH_KEYS = ("ffmpeg_path",)
 _BOOL_KEYS = (
     "save_processed_files",
     "scan_subfolders",
@@ -41,12 +43,25 @@ def load_app_settings(
 
     result: dict[str, Any] = {}
     for key in _PATH_KEYS:
-        raw = payload.get(key)
+        raw = payload.get(key, _DEFAULT_LOGS_DIR if key == "logs_dir" else None)
         if isinstance(raw, (str, os.PathLike)) and str(raw).strip():
             try:
                 result[key] = str(normalize_path(raw))
             except (OSError, TypeError, ValueError):
                 continue
+    for key in _OPTIONAL_PATH_KEYS:
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, (str, os.PathLike)):
+            continue
+        if not str(raw).strip():
+            result[key] = ""
+            continue
+        try:
+            result[key] = str(normalize_path(raw))
+        except (OSError, TypeError, ValueError):
+            continue
     for key in _BOOL_KEYS:
         value = payload.get(key)
         if isinstance(value, bool):
@@ -63,10 +78,13 @@ def save_app_settings(
     target = _settings_path(path)
     payload: dict[str, Any] = {}
     for key in _PATH_KEYS:
-        raw = settings.get(key)
+        raw = settings.get(key, _DEFAULT_LOGS_DIR if key == "logs_dir" else None)
         if raw is None or not str(raw).strip():
             raise ValueError(f"{key} cannot be empty")
         payload[key] = str(normalize_path(raw))
+    for key in _OPTIONAL_PATH_KEYS:
+        raw = settings.get(key, "")
+        payload[key] = str(normalize_path(raw)) if str(raw or "").strip() else ""
     for key in _BOOL_KEYS:
         payload[key] = bool(settings.get(key, False))
 

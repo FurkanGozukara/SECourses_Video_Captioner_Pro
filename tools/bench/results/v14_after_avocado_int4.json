@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:08:18.953620+03:00",
+  "summary": {
+    "variant": "avocado_int4",
+    "checkpoint_gb": 6.451611744,
+    "load_s": 22.598051200038753,
+    "peak_vram_gib": 8.285619258880615,
+    "prefill_tok_s_mean": 3283.628041908669,
+    "decode_tok_s_mean": 25.31990986225304,
+    "generated_tokens_mean": 256,
+    "wall_clock_s_mean": 18.96981020004023,
+    "finish_reason": "length",
+    "caption_preview": "A static, high-angle shot captures a dark city street at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights in the background. Cars with headlights and t",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "avocado_int4",
+    "family": "avocado",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "unfused_gate_up_control": false,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 256,
+      "sampling_strategy": "fps",
+      "max_pixels": 401408,
+      "min_pixels": 100352,
+      "use_audio_in_video": true,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 22.598051200038753,
+    "peak_vram_gb": 6.049222469329834,
+    "checkpoint_bytes": 6451611744,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 569,
+    "bf16_layers": 49,
+    "compile_mode": "eager",
+    "warnings": [],
+    "block_swap": {
+      "mode": "resident",
+      "layer_count": 28,
+      "resident_layers": 28,
+      "swapped_layers": 0,
+      "slots": 0,
+      "layer_mib": 111.3,
+      "non_layer_gib": 2.96,
+      "resident_weight_gib": 6.01,
+      "activation_estimate_gib": 7.96,
+      "allocator_slack_gib": 4.48,
+      "stage_towers": false,
+      "tower_gib": 0.93,
+      "reserve_gib": 2.0,
+      "free_vram_gib": 30.26,
+      "total_vram_gib": 31.84,
+      "expected_peak_gib": 18.45,
+      "pinned_gib": 0.0,
+      "notes": [
+        "Resident: 28/28 decoder layers resident; GPU weights 6.0 GiB; activation estimate 8.0 GiB; allocator slack 4.5 GiB; reserve 2.0 GiB; expected peak 18.5 of 30.3 GiB free"
+      ]
+    },
+    "resident_bytes": 6495303168,
+    "activation_estimate_bytes": 8548471727,
+    "vram_cap_bytes": 32227983360
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 10196,
+      "generated_tokens": 256,
+      "finish_reason": "length",
+      "prefill_s": 3.1051019999431446,
+      "decode_s": 10.071125900023617,
+      "prefill_tok_s": 3283.628041908669,
+      "decode_tok_s": 25.31990986225304,
+      "generation_s": 13.176227899966761,
+      "wall_clock_s": 18.96981020004023,
+      "peak_vram_gib": 8.285619258880615,
+      "caption_chars": 1288,
+      "caption_preview": "A static, high-angle shot captures a dark city street at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights in the background. Cars with headlights and t",
+      "caption": "A static, high-angle shot captures a dark city street at night. The scene is mostly in silhouette, with the faint glow of streetlights and building lights in the background. Cars with headlights and taillights move along the wet road, their lights reflecting on the damp surface. In the distance, a tall, thin tower with red lights at its top is visible against the dark sky. The audio is filled with the powerful and dramatic sounds of a thunderstorm. It begins with the low, rumbling sound of distant thunder, creating a sense of anticipation. The sky suddenly illuminates with a bright flash of lightning, briefly lighting up the entire scene before fading back to darkness. This is quickly followed by a loud, sharp crack of thunder, which echoes and reverberates, sounding close and intense. The rain begins to fall, and the wet road reflects the lights from the buildings and traffic, creating a shimmering surface. The traffic continues to flow, with the headlights and taillights of the cars creating streaks of light as they move through the intersection. The thunder continues to boom and rumble in the background, a deep and resonant sound that fills the soundscape, conveying the power and intensity of the storm. The camera remains stationary throughout, maintaining its high",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

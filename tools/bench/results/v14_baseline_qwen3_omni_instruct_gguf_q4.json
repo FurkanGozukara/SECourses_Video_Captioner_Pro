@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T04:37:40.661744+03:00",
+  "summary": {
+    "variant": "qwen3_omni_instruct_gguf_q4",
+    "checkpoint_gb": 19.88207408,
+    "load_s": 15.170447499956936,
+    "peak_vram_gib": 24.353168487548828,
+    "prefill_tok_s_mean": 2575.635415044836,
+    "decode_tok_s_mean": 247.72926979611884,
+    "generated_tokens_mean": 171,
+    "wall_clock_s_mean": 6.282319899997674,
+    "finish_reason": "eos",
+    "caption_preview": "The video opens on a dark, nighttime scene of a street intersection, illuminated by the headlights of approaching vehicles and the ambient glow of streetlights and distant building lights. The camera ",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "qwen3_omni_instruct_gguf_q4",
+    "family": "qwen3_omni_instruct",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "llamacpp",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 96,
+      "sampling_strategy": "fps",
+      "max_pixels": 262144,
+      "min_pixels": 4096,
+      "use_audio_in_video": true,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 15.170447499956936,
+    "peak_vram_gb": 23.57463836669922,
+    "checkpoint_bytes": 19882074080,
+    "attention": "llamacpp",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 0,
+    "bf16_layers": 0,
+    "compile_mode": "llama.cpp",
+    "warnings": [],
+    "block_swap": {
+      "backend": "llamacpp",
+      "mode": "fit",
+      "fit": true,
+      "fit_target_mib": 3584,
+      "requested_gpu_layers": null,
+      "requested_n_cpu_moe": null,
+      "requested_context_size": 32768,
+      "n_gpu_layers": null,
+      "n_cpu_moe": null,
+      "n_ctx": 32768
+    },
+    "resident_bytes": 0,
+    "activation_estimate_bytes": 0,
+    "vram_cap_bytes": 0
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 4450,
+      "generated_tokens": 171,
+      "finish_reason": "eos",
+      "prefill_s": 1.727729,
+      "decode_s": 0.686233,
+      "prefill_tok_s": 2575.635415044836,
+      "decode_tok_s": 247.72926979611884,
+      "generation_s": 2.53271349996794,
+      "wall_clock_s": 6.282319899997674,
+      "peak_vram_gib": 24.353168487548828,
+      "caption_chars": 927,
+      "caption_preview": "The video opens on a dark, nighttime scene of a street intersection, illuminated by the headlights of approaching vehicles and the ambient glow of streetlights and distant building lights. The camera ",
+      "caption": "The video opens on a dark, nighttime scene of a street intersection, illuminated by the headlights of approaching vehicles and the ambient glow of streetlights and distant building lights. The camera is positioned at a high vantage point, looking down onto the intersection where cars are seen moving through the frame. The scene is initially dry, with the wet pavement reflecting the various lights. As the video progresses, the weather changes dramatically. The sound of steady rain begins, and the intensity of the downpour increases, creating a heavy, continuous patter on the ground. The rain becomes so heavy that it significantly reduces visibility, and the wet road surface is now clearly visible, with the lights from the cars and surrounding buildings creating bright, elongated reflections. The rain continues to fall heavily throughout the remainder of the clip, with the sound of the downpour dominating the audio.",
+      "reasoning_chars": 0,
+      "warnings": [
+        "Video used 16 chronological still frames plus separate audio; frame/audio tokens are not interleaved by timestamp."
+      ]
+    }
+  ]
+}

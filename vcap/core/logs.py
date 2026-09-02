@@ -215,6 +215,14 @@ class AppLog:
                 return ""
             return "\n".join(line for _, line in list(self._lines)[-count:])
 
+    def tail_snapshot(self, n: int) -> tuple[list[str], int]:
+        """Return a bounded recent window and its revision atomically."""
+
+        count = max(0, int(n))
+        with self._lock:
+            recent = list(self._lines)[-count:] if count else []
+            return [line for _, line in recent], self._revision
+
     def snapshot(self, since_revision: int = 0) -> tuple[list[str], int]:
         """Return lines newer than a revision and the current revision."""
 
@@ -222,6 +230,30 @@ class AppLog:
         with self._lock:
             lines = [line for revision, line in self._lines if revision > threshold]
             return lines, self._revision
+
+    def snapshot_for_poll(
+        self,
+        since_revision: int = 0,
+        recovery_limit: int = 300,
+    ) -> tuple[list[str], int, bool]:
+        """Return a cursor-safe snapshot for a periodically polled consumer.
+
+        A browser can retain a revision from an older logger lifetime or apply
+        timer responses out of order.  Such a cursor is ahead of this logger
+        and cannot ever match a future line until the revision catches up.
+        Return a bounded recent window in that case so the consumer can replace
+        its view and reset its cursor in one response.
+        """
+
+        threshold = max(0, int(since_revision))
+        limit = max(0, int(recovery_limit))
+        with self._lock:
+            current = self._revision
+            if threshold > current:
+                recent = list(self._lines)[-limit:] if limit else []
+                return [line for _, line in recent], current, True
+            lines = [line for revision, line in self._lines if revision > threshold]
+            return lines, current, False
 
 
 _APP_LOG = AppLog()

@@ -278,22 +278,32 @@ def _recent_choices(outputs_dir: Path) -> list[tuple[str, str]]:
     return choices
 
 
+def refresh_recent_run_choices(
+    outputs_dir: str | Path,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Return fresh recent-run choices and select the newest metadata path."""
+
+    root = normalize_path(outputs_dir)
+    choices = _recent_choices(root)
+    return choices, choices[0][1] if choices else None
+
+
 def build(ctx: "UiContext") -> None:
     """Render metadata selection, diff inspection, and registry-wide recovery."""
 
     recovered_state = gr.State({})
-    choices = _recent_choices(ctx.outputs_dir)
+    choices, newest = refresh_recent_run_choices(ctx.outputs_dir)
     with gr.Row(equal_height=False):
         with gr.Column(scale=4, min_width=360):
             metadata_file = gr.File(
                 label="Metadata file", file_types=[".json"], type="filepath",
             )
             metadata_path = gr.Textbox(
-                value=choices[0][1] if choices else "", label="Metadata path",
+                value=newest or "", label="Metadata path",
                 info="Enter metadata.json or a single/batch run folder containing it.",
             )
             recent = gr.Dropdown(
-                choices=choices, value=choices[0][1] if choices else None,
+                choices=choices, value=newest,
                 label="Recent run", info="Recent metadata discovered below the outputs directory.",
             )
             with gr.Row(elem_classes=["vc-compact-row"]):
@@ -320,22 +330,24 @@ def build(ctx: "UiContext") -> None:
             )
 
     registry = ctx.registry
-    registry_components = registry.components()
 
     recent.change(
         lambda value: value or "", inputs=recent, outputs=metadata_path,
         queue=False, show_progress="hidden", api_visibility="private",
     )
 
-    def refresh_handler() -> Any:
-        updated = _recent_choices(ctx.outputs_dir)
-        value = updated[0][1] if updated else None
-        return gr.update(choices=updated, value=value)
+    def refresh_handler() -> tuple[Any, str]:
+        updated, value = refresh_recent_run_choices(ctx.outputs_dir)
+        return gr.update(choices=updated, value=value), value or ""
 
     refresh.click(
-        refresh_handler, outputs=recent,
+        refresh_handler, outputs=[recent, metadata_path],
         queue=False, show_progress="hidden", api_visibility="private",
     )
+    ctx.states["recover_recent_binding"] = {
+        "refresh_fn": refresh_handler,
+        "refresh_outputs": [recent, metadata_path],
+    }
 
     def resolve_path(upload: Any, typed: str, selected: str) -> str:
         if upload:
@@ -372,26 +384,23 @@ def build(ctx: "UiContext") -> None:
             ctx.app_log.error(f"Metadata recovery load failed: {exc}", scope="recover")
             return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", {}, gr.skip()
 
-    load.click(
-        load_handler,
-        inputs=[metadata_file, metadata_path, recent, *registry_components],
-        outputs=[diff_table, recovery_status, recovered_state, metadata_path],
-        show_progress="minimal", api_visibility="private",
-    )
+    def load_path_handler(typed: str, *current_values: Any) -> tuple[Any, str, dict[str, Any], Any]:
+        return load_handler(None, typed, "", *current_values)
 
     def apply_handler(
         recovered: dict[str, Any],
         model_prompt_only: bool,
         include_paths: bool,
     ) -> tuple[Any, ...]:
+        entry_count = len(registry.entries())
         if not isinstance(recovered, dict):
-            return (*[gr.skip() for _ in registry_components], "<span class='vc-warn'>Load metadata first.</span>")
+            return (*[gr.skip() for _ in range(entry_count)], "<span class='vc-warn'>Load metadata first.</span>")
         document = recovered.get("document")
         if not isinstance(document, Mapping):
             stored = recovered.get("settings")
             document = {"settings": stored} if isinstance(stored, Mapping) else None
         if not isinstance(document, Mapping):
-            return (*[gr.skip() for _ in registry_components], "<span class='vc-warn'>Load metadata first.</span>")
+            return (*[gr.skip() for _ in range(entry_count)], "<span class='vc-warn'>Load metadata first.</span>")
         settings, warnings, skipped = _recovery_settings_details(
             document,
             registry,
@@ -420,17 +429,91 @@ def build(ctx: "UiContext") -> None:
         ctx.app_log.log(message, scope="recover")
         return *values, message
 
-    apply_all.click(
-        lambda recovered, include_paths: apply_handler(recovered, False, include_paths),
-        inputs=[recovered_state, restore_paths],
-        outputs=[*registry_components, recovery_status],
-        queue=False, show_progress="hidden", api_visibility="private",
+    ctx.states["recover_wire_binding"] = {
+        "load": load,
+        "load_handler": load_handler,
+        "load_inputs": [metadata_file, metadata_path, recent],
+        "load_outputs": [diff_table, recovery_status, recovered_state, metadata_path],
+        "load_path_handler": load_path_handler,
+        "metadata_path": metadata_path,
+        "apply_all": apply_all,
+        "apply_model_prompt": apply_model_prompt,
+        "apply_handler": apply_handler,
+        "apply_inputs": [recovered_state, restore_paths],
+        "apply_status": recovery_status,
+        "wired": False,
+    }
+
+
+def wire(ctx: "UiContext") -> None:
+    """Wire registry-wide recovery events after every tab has registered."""
+
+    binding = ctx.states.get("recover_wire_binding")
+    if not isinstance(binding, dict):
+        raise RuntimeError("recover_tab.build() must run before wire()")
+    if binding.get("wired"):
+        return
+
+    registry_components = ctx.settings_registry.components()
+    load_event = binding["load"].click(
+        binding["load_handler"],
+        inputs=[*binding["load_inputs"], *registry_components],
+        outputs=binding["load_outputs"],
+        show_progress="minimal",
+        api_visibility="private",
     )
-    apply_model_prompt.click(
-        lambda recovered, include_paths: apply_handler(recovered, True, include_paths),
-        inputs=[recovered_state, restore_paths],
-        outputs=[*registry_components, recovery_status],
-        queue=False, show_progress="hidden", api_visibility="private",
+    apply_all_event = binding["apply_all"].click(
+        lambda recovered, include_paths: binding["apply_handler"](
+            recovered,
+            False,
+            include_paths,
+        ),
+        inputs=binding["apply_inputs"],
+        outputs=[*registry_components, binding["apply_status"]],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    apply_model_event = binding["apply_model_prompt"].click(
+        lambda recovered, include_paths: binding["apply_handler"](
+            recovered,
+            True,
+            include_paths,
+        ),
+        inputs=binding["apply_inputs"],
+        outputs=[*registry_components, binding["apply_status"]],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    ctx.states["recover_load_binding"] = {
+        "path": binding["metadata_path"],
+        "load_fn": binding["load_path_handler"],
+        "inputs": [binding["metadata_path"], *registry_components],
+        "outputs": binding["load_outputs"],
+    }
+    recent_binding = ctx.states.get("recover_recent_binding")
+    recover_component = ctx.states.get("recover_tab_component")
+    tab_event = None
+    if isinstance(recent_binding, dict) and recover_component is not None:
+        tab_event = recover_component.select(
+            recent_binding["refresh_fn"],
+            outputs=recent_binding["refresh_outputs"],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+
+    binding.update(
+        {
+            "wired": True,
+            "registry_components": registry_components,
+            "load_event": load_event,
+            "apply_all_event": apply_all_event,
+            "apply_model_event": apply_model_event,
+            "tab_event": tab_event,
+        }
     )
 
 
@@ -441,5 +524,7 @@ __all__ = [
     "extract_metadata_settings",
     "present_recovery_settings",
     "recent_metadata_paths",
+    "refresh_recent_run_choices",
     "resolve_metadata_path",
+    "wire",
 ]

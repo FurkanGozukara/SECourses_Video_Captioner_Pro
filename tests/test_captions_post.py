@@ -29,6 +29,19 @@ def test_replace_parser_single_pass_and_unicode_words() -> None:
     assert "&lt;person&gt;" in chips and "vcap-replace-chip" in chips
 
 
+def test_case_insensitive_literal_replacements_preserve_common_word_casing() -> None:
+    pairs = [("cars", "vehicles")]
+    assert apply_replacements("cars", pairs) == "vehicles"
+    assert apply_replacements("Cars", pairs) == "Vehicles"
+    assert apply_replacements("CARS", pairs) == "VEHICLES"
+    assert apply_replacements("Cars", [("cars", "newVehicles")]) == "newVehicles"
+
+    # Regex replacements retain their existing verbatim behavior.
+    assert apply_replacements("Cars CARS", [(r"cars", "vehicles")], regex=True) == (
+        "vehicles vehicles"
+    )
+
+
 def test_finalize_order_subtitles_stats_and_diff() -> None:
     result = finalize_caption(
         "```text\nA woman\n```",

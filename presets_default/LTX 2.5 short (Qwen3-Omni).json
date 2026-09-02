@@ -6,7 +6,7 @@
     "description": "Five-second physical-action clips and concise captions for LTX 2.5 training."
   },
   "settings": {
-    "model_key": "qwen3_omni_instruct_int8",
+    "model_key": "qwen3_omni_instruct_int4",
     "prompt_preset_id": "ltx25_short_physical",
     "system_prompt": null,
     "user_prompt": "Caption this clip of no more than five seconds in one concise {{LANGUAGE}} paragraph for LTX 2.5 training. Describe the subject, initial pose, exact physical action, contact with objects or surfaces, resulting motion, and camera movement in temporal order. Use literal present-tense verbs and observable spatial relations; do not add backstory, emotion without visible evidence, metaphor, mood prose, or events outside the clip. Keep the answer short and omit headings and lists. {{AVOID}} {{EXTRA_INSTRUCTIONS}}",
@@ -40,7 +40,10 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": true,
     "save_reasoning": true,
     "overwrite_existing": false,

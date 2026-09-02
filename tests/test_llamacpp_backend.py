@@ -155,10 +155,10 @@ def test_video_building_uses_bounded_frames_and_separate_audio(monkeypatch, tmp_
         ),
     )
     types = [part["type"] for part in prepared.messages[-1]["content"]]
-    assert types.count("image_url") == 8
+    assert types.count("image_url") == 16
     assert types.count("input_audio") == 1
     assert types[-1] == "text"
-    assert prepared.warnings and "not interleaved" in prepared.warnings[0]
+    assert any("not interleaved" in warning for warning in prepared.warnings)
     assert frame_options["sampling"] == "keyframe"
     assert frame_options["target_fps"] == 2.0
 
@@ -204,7 +204,7 @@ def test_sse_parser_and_mocked_streaming_response(monkeypatch, tmp_path: Path) -
         text = ""
 
         def iter_lines(self, chunk_size=1):
-            del chunk_size
+            assert chunk_size is None
             yield b'data: {"choices":[{"delta":{"content":"Lightning "}}]}'
             yield b'data: {"choices":[{"delta":{"content":"strikes."}}]}'
             yield (
@@ -295,6 +295,11 @@ def test_free_port_and_server_command_contains_no_quantized_kv_flags(tmp_path: P
     assert command[:3] == [str(tmp_path / "llama-server.exe"), "--model", str(tmp_path / backend.variant.gguf_files[0])]
     assert "--mmproj" in command
     assert "--jinja" in command
+    assert "--no-webui" in command
+    assert command[command.index("-np") + 1] == "1"
+    assert command[command.index("-b") + 1] == "2048"
+    assert command[command.index("-ub") + 1] == "512"
+    assert command[command.index("-fa") + 1] == "auto"
     assert command[command.index("-c") + 1] == "32768"
     # -ngl must stay unset: llama.cpp aborts fitting when n_gpu_layers is user-set.
     assert "-ngl" not in command

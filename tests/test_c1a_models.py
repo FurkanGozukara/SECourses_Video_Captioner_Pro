@@ -126,10 +126,11 @@ def test_transformers_generation_passes_eos_and_reports_finish_reason() -> None:
     captioner = Qwen3OmniInstructCaptioner(_loaded("qwen3_omni_instruct", processor, model))
     result = captioner.caption(
         MediaInput(kind="text", text="Describe a storm."),
-        gen=GenParams(max_new_tokens=32),
+        gen=GenParams(max_new_tokens=32, no_repeat_ngram_size=4),
         cb=Callbacks(progress=lambda message, _payload=None: messages.append(str(message))),
     )
     call = model.calls[-1]
+    assert call["no_repeat_ngram_size"] == 4
     assert call["eos_token_id"] == [101, 202]
     assert call["pad_token_id"] == 303
     assert result.usage["finish_reason"] == "eos"
@@ -194,6 +195,7 @@ def test_thinking_template_defaults_and_reasoning_split() -> None:
     )
     template_kwargs = processor.template_calls[-1][1]
     generation_kwargs = model.calls[-1]
+    assert "no_repeat_ngram_size" not in generation_kwargs
     assert template_kwargs["enable_thinking"] is True
     assert generation_kwargs["temperature"] == 0.6
     assert generation_kwargs["top_p"] == 0.95

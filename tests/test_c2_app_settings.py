@@ -14,11 +14,13 @@ def test_app_settings_unicode_round_trip_and_corrupt_fallback(tmp_path: Path) ->
         "outputs_dir": tmp_path / "çıktılar 日本語",
         "temp_dir": tmp_path / "geçici dosyalar",
         "models_dir": tmp_path / "mödels",
+        "logs_dir": tmp_path / "log files",
         "save_processed_files": True,
         "scan_subfolders": True,
         "desktop_notification_on_finish": True,
         "play_sound_on_finish": True,
         "open_output_folder_on_single_finish": True,
+        "ffmpeg_path": "",
     }
 
     assert save_app_settings(values, settings_path) == normalize_path(settings_path)
@@ -27,11 +29,13 @@ def test_app_settings_unicode_round_trip_and_corrupt_fallback(tmp_path: Path) ->
         "outputs_dir": str(normalize_path(values["outputs_dir"])),
         "temp_dir": str(normalize_path(values["temp_dir"])),
         "models_dir": str(normalize_path(values["models_dir"])),
+        "logs_dir": str(normalize_path(values["logs_dir"])),
         "save_processed_files": True,
         "scan_subfolders": True,
         "desktop_notification_on_finish": True,
         "play_sound_on_finish": True,
         "open_output_folder_on_single_finish": True,
+        "ffmpeg_path": "",
     }
     assert not list(settings_path.parent.glob("*.tmp"))
 

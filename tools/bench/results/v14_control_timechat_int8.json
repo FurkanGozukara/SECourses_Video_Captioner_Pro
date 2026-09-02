@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:18:46.607748+03:00",
+  "summary": {
+    "variant": "timechat_int8",
+    "checkpoint_gb": 10.258512536,
+    "load_s": 21.374149999930523,
+    "peak_vram_gib": 11.318220138549805,
+    "prefill_tok_s_mean": 2796.970083445175,
+    "decode_tok_s_mean": 26.03917922291554,
+    "generated_tokens_mean": 256,
+    "wall_clock_s_mean": 17.775660699931905,
+    "finish_reason": "length",
+    "caption_preview": "[ { \"timestamp\": \"00:00-00:04\", \"segment_detail_caption\": \"A dark, nighttime view of a city street intersection. The scene is mostly obscured by deep shadows, with only a few distant streetlights and ",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "timechat_int8",
+    "family": "timechat",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "unfused_gate_up_control": true,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 160,
+      "sampling_strategy": "fps",
+      "max_pixels": 297920,
+      "min_pixels": 100352,
+      "use_audio_in_video": true,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 21.374149999930523,
+    "peak_vram_gb": 9.572184562683105,
+    "checkpoint_bytes": 10258512536,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 569,
+    "bf16_layers": 49,
+    "compile_mode": "eager",
+    "warnings": [],
+    "block_swap": {
+      "mode": "resident",
+      "layer_count": 28,
+      "resident_layers": 28,
+      "swapped_layers": 0,
+      "slots": 0,
+      "layer_mib": 222.5,
+      "non_layer_gib": 3.47,
+      "resident_weight_gib": 9.55,
+      "activation_estimate_gib": 4.93,
+      "allocator_slack_gib": 2.96,
+      "stage_towers": false,
+      "tower_gib": 1.44,
+      "reserve_gib": 2.0,
+      "free_vram_gib": 30.26,
+      "total_vram_gib": 31.84,
+      "expected_peak_gib": 17.44,
+      "pinned_gib": 0.0,
+      "notes": [
+        "Resident: 28/28 decoder layers resident; GPU weights 9.6 GiB; activation estimate 4.9 GiB; allocator slack 3.0 GiB; reserve 2.0 GiB; expected peak 17.4 of 30.3 GiB free"
+      ]
+    },
+    "resident_bytes": 10278054912,
+    "activation_estimate_bytes": 5288326575,
+    "vram_cap_bytes": 32227983360
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 7561,
+      "generated_tokens": 256,
+      "finish_reason": "length",
+      "prefill_s": 2.703282400034368,
+      "decode_s": 9.792935400037095,
+      "prefill_tok_s": 2796.970083445175,
+      "decode_tok_s": 26.03917922291554,
+      "generation_s": 12.496217800071463,
+      "wall_clock_s": 17.775660699931905,
+      "peak_vram_gib": 11.318220138549805,
+      "caption_chars": 1071,
+      "caption_preview": "[ { \"timestamp\": \"00:00-00:04\", \"segment_detail_caption\": \"A dark, nighttime view of a city street intersection. The scene is mostly obscured by deep shadows, with only a few distant streetlights and ",
+      "caption": "[\n  {\n    \"timestamp\": \"00:00-00:04\",\n    \"segment_detail_caption\": \"A dark, nighttime view of a city street intersection. The scene is mostly obscured by deep shadows, with only a few distant streetlights and building lights providing minimal illumination. A few cars are visible, their headlights and taillights creating faint streaks of light as they move through the intersection.\",\n    \"camera_state\": \"The camera is static, positioned at a high angle, looking down on the street from a window.\",\n    \"video_background\": \"The setting is a dark, urban or suburban street at night. The environment is mostly in silhouette, with the silhouettes of buildings, trees, and a traffic light faintly visible.\",\n    \"storyline\": \"The video begins by establishing a dark, moody, and urban setting, setting a calm but slightly mysterious tone.\",\n    \"shooting_style\": \"This is a static establishing shot.\",\n    \"speech_content\": \"\",\n    \"acoustics_content\": \"1) Tone of speech: N/A. 2) Background sounds or music: The faint sound of rain and distant thunder can be heard.\"\n  }\n]",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

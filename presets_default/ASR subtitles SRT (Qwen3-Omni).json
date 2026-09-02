@@ -6,7 +6,7 @@
     "description": "Greedy bracket-timestamp transcription converted to TXT, JSON, and SRT output."
   },
   "settings": {
-    "model_key": "qwen3_omni_instruct_int8",
+    "model_key": "qwen3_omni_instruct_int4",
     "prompt_preset_id": "asr_timestamped_srt",
     "system_prompt": null,
     "user_prompt": "Transcribe the {{SOURCE_LANGUAGE}} speech verbatim and divide it into short subtitle cues. Output exactly one cue per line in the form [MM:SS-MM:SS] text, using the audible start and end time and continuing to HH:MM:SS when the recording exceeds one hour. Keep each cue readable, preserve speech order and wording, add only necessary punctuation, use [inaudible] for unclear speech, and output no heading, explanation, or code fence.",
@@ -40,7 +40,11 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json", "srt"],
+    "output_formats": [
+      "txt",
+      "json",
+      "srt"
+    ],
     "save_clips": false,
     "save_reasoning": true,
     "overwrite_existing": false,

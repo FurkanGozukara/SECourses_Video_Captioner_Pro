@@ -52,6 +52,10 @@ EXPECTED_PRESET_IDS = {
     "image_short_caption",
     "timechat_6d_raw",
     "timechat_flatten_wan",
+    "timechat_flatten_motion_camera",
+    "timechat_flatten_av",
+    "timechat_speech_only",
+    "timechat_chapters",
     "timechat_to_srt",
     "avocado_av_aligned",
     "avocado_visual_only",
@@ -177,6 +181,10 @@ def test_model_and_modality_filtering_and_defaults():
     assert {preset.id for preset in list_presets("timechat")} == {
         "timechat_6d_raw",
         "timechat_flatten_wan",
+        "timechat_flatten_motion_camera",
+        "timechat_flatten_av",
+        "timechat_speech_only",
+        "timechat_chapters",
         "timechat_to_srt",
     }
     assert [preset.id for preset in list_presets("qwen3_omni_captioner", "audio")] == [
@@ -303,8 +311,12 @@ def test_remaining_structured_post_processors():
 
     expected_processors = {
         "timechat_parse",
-        "timechat_flatten_wan",
-        "timechat_flatten_full",
+            "timechat_flatten_wan",
+            "timechat_flatten_motion_camera",
+            "timechat_flatten_av",
+            "timechat_speech_only",
+            "timechat_chapters",
+            "timechat_flatten_full",
         "timechat_srt",
         "strip_reasoning",
         "srt_from_bracketed",

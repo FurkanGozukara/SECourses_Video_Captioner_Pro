@@ -242,7 +242,7 @@ def _segments_for_items(
             continue
         start, end = pair
         segments.append((max(0.0, start), max(max(0.0, start), end), text_builder(item)))
-    return segments
+    return sorted(segments, key=lambda segment: (segment[0], segment[1]))
 
 
 def timechat_parse(raw: str, _options: dict | None = None) -> PostResult:
@@ -273,6 +273,99 @@ def timechat_flatten_wan(raw: str, _options: dict | None = None) -> PostResult:
     if not items:
         text = raw.strip()
     return PostResult(text=text, structured=items, segments=_segments_for_items(items, _wan_item_text))
+
+
+def _motion_camera_text(item: dict[str, Any]) -> str:
+    return " ".join(
+        part
+        for part in (
+            _as_sentence(item.get("segment_detail_caption")),
+            _as_sentence(item.get("camera_state")),
+        )
+        if part
+    ).strip()
+
+
+def timechat_flatten_motion_camera(raw: str, _options: dict | None = None) -> PostResult:
+    """Keep only chronological motion/event detail and camera state."""
+
+    parsed = timechat_parse(raw)
+    items = parsed.structured if isinstance(parsed.structured, list) else []
+    segments = _segments_for_items(items, _motion_camera_text)
+    text = "\n".join(segment[2] for segment in segments if segment[2]).strip()
+    return PostResult(text=text if items else raw.strip(), structured=items, segments=segments)
+
+
+def _audiovisual_text(item: dict[str, Any]) -> str:
+    return " ".join(
+        part
+        for part in (
+            _as_sentence(item.get("segment_detail_caption")),
+            _as_sentence(item.get("camera_state")),
+            _as_sentence(item.get("speech_content")),
+            _as_sentence(item.get("acoustics_content")),
+        )
+        if part
+    ).strip()
+
+
+def timechat_flatten_av(raw: str, _options: dict | None = None) -> PostResult:
+    """Keep chronological visual motion, camera, speech, and acoustics."""
+
+    parsed = timechat_parse(raw)
+    items = parsed.structured if isinstance(parsed.structured, list) else []
+    segments = _segments_for_items(items, _audiovisual_text)
+    text = "\n".join(segment[2] for segment in segments if segment[2]).strip()
+    return PostResult(text=text if items else raw.strip(), structured=items, segments=segments)
+
+
+def _speech_text(item: dict[str, Any]) -> str:
+    return _clean_piece(item.get("speech_content"))
+
+
+def timechat_speech_only(raw: str, _options: dict | None = None) -> PostResult:
+    """Extract non-empty timestamped speech as a plain transcript and subtitle cues."""
+
+    parsed = timechat_parse(raw)
+    items = parsed.structured if isinstance(parsed.structured, list) else []
+    segments = [
+        segment
+        for segment in _segments_for_items(items, _speech_text)
+        if segment[2]
+    ]
+    text = "\n".join(segment[2] for segment in segments)
+    return PostResult(text=text if items else raw.strip(), structured=items, segments=segments)
+
+
+def _chapter_time(seconds: float, include_hours: bool = False) -> str:
+    total = max(0, int(round(float(seconds))))
+    if include_hours:
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    minutes, secs = divmod(total, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def timechat_chapters(raw: str, _options: dict | None = None) -> PostResult:
+    """Render one timestamped storyline chapter per native TimeChat segment."""
+
+    parsed = timechat_parse(raw)
+    items = parsed.structured if isinstance(parsed.structured, list) else []
+    chapters: list[tuple[float, float, str]] = []
+    for item in items:
+        pair = _timestamp_pair(item.get("timestamp"))
+        storyline = _clean_piece(item.get("storyline"))
+        if pair is None or not storyline:
+            continue
+        chapters.append((pair[0], pair[1], storyline))
+    chapters.sort(key=lambda chapter: (chapter[0], chapter[1]))
+    include_hours = any(end >= 3600.0 for _, end, _ in chapters)
+    lines = [
+        f"{_chapter_time(start, include_hours)}-{_chapter_time(end, include_hours)} {storyline}"
+        for start, end, storyline in chapters
+    ]
+    return PostResult(text="\n".join(lines) if items else raw.strip(), structured=items, segments=[])
 
 
 _FULL_FIELDS: tuple[tuple[str, str], ...] = (
@@ -495,6 +588,10 @@ def trim_avocado_trailing_qa(raw: str, *, hit_token_cap: bool) -> tuple[str, boo
 POST_PROCESSORS: dict[str, Callable[[str, dict], PostResult]] = {
     "timechat_parse": timechat_parse,
     "timechat_flatten_wan": timechat_flatten_wan,
+    "timechat_flatten_motion_camera": timechat_flatten_motion_camera,
+    "timechat_flatten_av": timechat_flatten_av,
+    "timechat_speech_only": timechat_speech_only,
+    "timechat_chapters": timechat_chapters,
     "timechat_flatten_full": timechat_flatten_full,
     "timechat_srt": timechat_srt,
     "strip_reasoning": strip_reasoning,
@@ -519,7 +616,11 @@ __all__ = [
     "tags_normalize",
     "trim_avocado_trailing_qa",
     "timechat_flatten_full",
+    "timechat_flatten_motion_camera",
+    "timechat_flatten_av",
     "timechat_flatten_wan",
+    "timechat_speech_only",
+    "timechat_chapters",
     "timechat_parse",
     "timechat_srt",
     "to_srt",

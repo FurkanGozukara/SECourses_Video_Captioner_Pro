@@ -48,6 +48,22 @@ def _sink_call(method: Any, *args: Any, **kwargs: Any) -> None:
         pass
 
 
+def _relay_app_log(
+    message: str,
+    *,
+    level: str = "info",
+    scope: str | None = None,
+) -> None:
+    """Mirror a worker log into the parent process independently of a UI sink."""
+
+    try:
+        from vcap.core.logs import get_log
+
+        get_log().log(message, level=level, scope=scope)
+    except Exception:
+        pass
+
+
 def _compile_child_plan(enabled: bool, gpu_index: int) -> tuple[dict[str, str], list[str], str]:
     """Probe compile support in a disposable child so the UI parent never imports Torch."""
 
@@ -265,11 +281,14 @@ class PipelineClient:
         kind = str(event.get("ev", ""))
         if kind in {"log", "stdout"}:
             level = str(event.get("level") or ("warning" if event.get("source") == "stderr" else "info"))
+            message = str(event.get("text", ""))
+            scope = event.get("scope")
+            _relay_app_log(message, level=level, scope=scope)
             _sink_call(
                 sink.on_log,
-                str(event.get("text", "")),
+                message,
                 level=level,
-                scope=event.get("scope"),
+                scope=scope,
             )
         elif kind == "progress":
             fields = {
@@ -321,8 +340,19 @@ class PipelineClient:
         self._stop_worker(graceful=True)
         env_updates, warnings, mode = _compile_child_plan(compile_enabled, gpu_index)
         if compile_enabled:
-            _sink_call(sink.on_log, f"torch.compile probe selected {mode}", level="info", scope="compile")
+            _relay_app_log(
+                f"torch.compile probe selected {mode}",
+                level="info",
+                scope="compile",
+            )
+            _sink_call(
+                sink.on_log,
+                f"torch.compile probe selected {mode}",
+                level="info",
+                scope="compile",
+            )
             for warning in warnings:
+                _relay_app_log(warning, level="warning", scope="compile")
                 _sink_call(sink.on_log, warning, level="warning", scope="compile")
         worker = WorkerProcess().start(
             [sys.executable, "-u", "-m", "vcap.pipeline.worker", "--gpu", str(gpu_index)],
@@ -536,6 +566,16 @@ class PipelineClient:
 
         def publish(event: Mapping[str, Any]) -> None:
             item = dict(event)
+            if item.get("ev") in {"log", "stdout"}:
+                level = str(
+                    item.get("level")
+                    or ("warning" if item.get("source") == "stderr" else "info")
+                )
+                _relay_app_log(
+                    str(item.get("text") or ""),
+                    level=level,
+                    scope=item.get("scope"),
+                )
             if on_event is not None:
                 try:
                     on_event(item)
@@ -757,6 +797,9 @@ class PipelineClient:
                                     event.get("message") or "Worker error"
                                 )
                             }
+                        if kind in {"log", "stdout"}:
+                            self._forward(event, _NullSink())
+                            continue
                     deferred.append(event)
             except Exception as exc:
                 return {"error": str(exc)}
@@ -765,12 +808,32 @@ class PipelineClient:
                 self._events.put(event)
             self._run_lock.release()
 
-    def select_variant(self, variant_key: str) -> dict[str, Any]:
-        """Record a model selection and release any different resident model."""
+    def record_variant_selection(self, variant_key: str) -> bool:
+        """Record the latest UI selection without waiting for model release."""
 
         selected = str(variant_key)
         with self._state_lock:
             self._selected_variant = selected
+            if self._busy:
+                self._release_pending = True
+                return True
+        return False
+
+    def select_variant(self, variant_key: str) -> dict[str, Any]:
+        """Record a model selection and release any different resident model."""
+
+        selected = str(variant_key)
+        if self.record_variant_selection(selected):
+            return {"busy": True, "deferred": True}
+        return self.release_recorded_variant(selected)
+
+    def release_recorded_variant(self, variant_key: str) -> dict[str, Any]:
+        """Release for a selection only while it is still the latest choice."""
+
+        selected = str(variant_key)
+        with self._state_lock:
+            if self._selected_variant != selected:
+                return {"superseded": True}
             if self._busy:
                 self._release_pending = True
                 return {"busy": True, "deferred": True}
@@ -840,6 +903,9 @@ class PipelineClient:
                     continue
                 if isinstance(event, Mapping) and event.get("ev") == "pong":
                     return dict(event)
+                if isinstance(event, Mapping) and event.get("ev") in {"log", "stdout"}:
+                    self._forward(event, _NullSink())
+                    continue
                 deferred.append(event)
             return {"error": "Worker health ping timed out"}
         except Exception as exc:

@@ -158,21 +158,22 @@ def show_progress_line(
     text: str,
     key: Hashable | None = None,
     stream: TextIO | None = None,
+    min_interval: float = 0.1,
 ) -> None:
-    """Create or update one keyed progress row."""
+    """Create or update one keyed progress row at a bounded refresh rate."""
 
     output = stream or sys.stdout
     resolved = _DEFAULT_KEY if key is None else key
     with _LOCK:
         state = _state_for(output)
+        value = _safe_text(text)
+        now = time.monotonic()
+        last_emit = state.plain_last_emit.get(resolved)
+        terminal = "100%" in value or "100.0%" in value
         if not _isatty(output):
-            value = _safe_text(text)
             state.lines[resolved] = value
-            now = time.monotonic()
-            last_emit = state.plain_last_emit.get(resolved, 0.0)
             last_text = state.plain_last_text.get(resolved)
-            terminal = "100%" in value or "100.0%" in value
-            if last_text is None or terminal or now - last_emit >= 1.0:
+            if last_text is None or terminal or last_emit is None or now - last_emit >= 1.0:
                 print(value, file=output, flush=True)
                 state.plain_last_emit[resolved] = now
                 state.plain_last_text[resolved] = value
@@ -181,6 +182,11 @@ def show_progress_line(
         existed = resolved in state.lines
         state.lines[resolved] = str(text)
         state.legacy_visible_key = resolved
+        interval = max(0.0, float(min_interval))
+        if existed and not terminal and last_emit is not None and now - last_emit < interval:
+            return
+        state.plain_last_emit[resolved] = now
+        state.plain_last_text[resolved] = value
         if existed and _update_existing(output, state, resolved):
             return
         if (

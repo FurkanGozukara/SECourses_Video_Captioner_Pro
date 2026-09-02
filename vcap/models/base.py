@@ -63,7 +63,9 @@ class GenParams:
     max_new_tokens: int = 2048
     do_sample: bool = False
     use_cache: bool = True
-    enable_thinking: bool = True
+    enable_thinking: bool = False
+    seed: int = -1
+    no_repeat_ngram_size: int = 0
     # Requested total token window (prompt, media, and response); None means
     # the model's own context cap. Backends never exceed the cap.
     context_tokens: int | None = None
@@ -79,6 +81,8 @@ class PreprocessParams:
     max_pixels: int = 297_920
     min_pixels: int | None = None
     use_audio_in_video: bool = True
+    total_pixel_cap: int = 0
+    adaptive_threshold: float = 2.0
     start: float | None = None
     end: float | None = None
 
@@ -113,6 +117,7 @@ class TokenUsage:
     prompt_tokens: int
     new_tokens: int
     finish_reason: Literal["eos", "length", "cancelled"] = "length"
+    seed: int | None = None
 
     def __getitem__(self, key: str) -> Any:
         """Allow metadata-style access while preserving the typed API."""

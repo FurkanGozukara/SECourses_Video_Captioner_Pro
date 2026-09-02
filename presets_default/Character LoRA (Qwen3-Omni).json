@@ -6,7 +6,7 @@
     "description": "Scene-split character captions with the trigger first and permanent identity traits omitted."
   },
   "settings": {
-    "model_key": "qwen3_omni_instruct_int8",
+    "model_key": "qwen3_omni_instruct_int4",
     "prompt_preset_id": "character_lora",
     "system_prompt": null,
     "user_prompt": "Write one {{LANGUAGE}} training caption whose very first token is {{TRIGGER}}, immediately followed by the generic class {{SUBJECT_CLASS}}. Do not describe identity-bound hair, face, facial features, body shape, age, ethnicity, or other permanent anatomy that the trigger should learn. Describe the visible outfit, accessories, pose, physical action, interaction, scene, and camera only when they vary in this sample. Follow any supplied outfit or action inclusion override exactly, and return one paragraph without labels or commentary. {{EXTRA_INSTRUCTIONS}} {{AVOID}}",
@@ -40,7 +40,10 @@
     "caption_suffix": "",
     "trigger_mode": "prefix",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": true,
     "save_reasoning": true,
     "overwrite_existing": false,

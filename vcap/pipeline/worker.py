@@ -7,6 +7,8 @@ import io
 import json
 import logging
 import os
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 import re
 import select
 import sys

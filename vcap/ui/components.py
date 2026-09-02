@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
@@ -14,7 +15,12 @@ import gradio as gr
 from vcap.core import gpu
 from vcap.core.captions_post import parse_replace_pairs, replace_pairs_to_html_chips
 from vcap.core.media import MediaInfo, probe_media
-from vcap.core.paths import guess_kind_by_extension, list_media_files, normalize_path
+from vcap.core.paths import (
+    guess_kind_by_extension,
+    list_media_files,
+    normalize_path,
+    sanitize_filename,
+)
 from vcap.core.presets import PresetError
 
 if TYPE_CHECKING:
@@ -64,6 +70,10 @@ class PresetBarHandles:
     save: gr.Button
     load: gr.Button
     delete: gr.Button
+    delete_confirmation: gr.Row
+    delete_question: gr.Markdown
+    delete_yes: gr.Button
+    delete_keep: gr.Button
     reset: gr.Button
     status: gr.Markdown
 
@@ -108,7 +118,38 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
             scale=3,
             min_width=320,
         )
-    handles = PresetBarHandles(dropdown, save_as, save, load, delete, reset, status)
+    with gr.Row(
+        visible=False,
+        elem_id="vc_preset_delete_confirmation",
+        elem_classes=["vc-confirm-bar", "vc-compact-row"],
+    ) as delete_confirmation:
+        delete_question = gr.Markdown("Delete the selected user preset?")
+        delete_yes = action_button(
+            "✔ Yes, delete",
+            "red",
+            size="sm",
+            variant="stop",
+            elem_id="vc_preset_delete_yes",
+        )
+        delete_keep = action_button(
+            "✖ Keep preset",
+            "slate",
+            size="sm",
+            elem_id="vc_preset_delete_keep",
+        )
+    handles = PresetBarHandles(
+        dropdown=dropdown,
+        save_as=save_as,
+        save=save,
+        load=load,
+        delete=delete,
+        delete_confirmation=delete_confirmation,
+        delete_question=delete_question,
+        delete_yes=delete_yes,
+        delete_keep=delete_keep,
+        reset=reset,
+        status=status,
+    )
     ctx.preset_handles = handles
     return handles
 
@@ -130,6 +171,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     # read the loaded values instead of component values that the browser may
     # not have applied yet.
     applied_state = gr.State({"name": "", "settings": {}})
+    delete_state = gr.State({})
 
     def applied(name: str | None, settings: dict[str, Any] | None = None) -> dict[str, Any]:
         return {"name": str(name or ""), "settings": dict(settings or {})}
@@ -195,16 +237,88 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             return (*skipped(), gr.skip(), applied(current))
         return load_preset(str(name))
 
-    def delete_preset(name: str) -> tuple[Any, str, Any]:
+    def request_delete_preset(name: str) -> tuple[Any, Any, Any, str]:
         try:
             if not name:
                 raise PresetError("Choose a preset to delete")
-            deleted = ctx.preset_store.delete(str(name))
-            message = f"Deleted {html.escape(str(name))}." if deleted else "Preset was already absent."
-            # Leave nothing selected: picking any preset afterwards applies it.
-            return gr.update(choices=_preset_choices(ctx), value=None), f"<span class='vc-ok'>{message}</span>", applied("")
+            selected = str(name)
+            entry = next(
+                (item for item in ctx.preset_store.list_presets() if item.name == selected),
+                None,
+            )
+            if entry is None:
+                raise PresetError(f"Preset not found: {selected}")
+            if entry.is_default:
+                # Delegate to the store so its established protected-preset
+                # refusal remains the exact message shown to the user.
+                ctx.preset_store.delete(selected)
+            question = f'⚠ Delete preset "{html.escape(selected)}"?'
+            return (
+                {"name": selected},
+                gr.update(visible=True),
+                question,
+                f"<span class='vc-warn'>{question}</span>",
+            )
         except Exception as exc:
-            return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", gr.skip()
+            return (
+                {},
+                gr.update(visible=False),
+                gr.skip(),
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+            )
+
+    def keep_preset(state: dict[str, Any] | None) -> tuple[dict[str, Any], Any, str]:
+        selected = str((state or {}).get("name") or "")
+        message = (
+            f"Kept preset {html.escape(selected)}."
+            if selected
+            else "No preset deletion was pending."
+        )
+        return {}, gr.update(visible=False), f"<span class='vc-help'>{message}</span>"
+
+    def confirm_delete_preset(state: dict[str, Any] | None) -> tuple[Any, ...]:
+        selected = str((state or {}).get("name") or "")
+        if not selected:
+            return (
+                *skipped(),
+                gr.skip(),
+                "<span class='vc-warn'>No preset deletion was pending.</span>",
+                gr.skip(),
+                gr.update(visible=False),
+                {},
+            )
+        try:
+            if not ctx.preset_store.delete(selected):
+                raise PresetError("Preset was already absent")
+            default_name = str(
+                getattr(ctx.preset_store, "default_preset_name", None) or ""
+            ).strip()
+            if not default_name:
+                from vcap.ui.app import DEFAULT_PRESET_NAME
+
+                default_name = DEFAULT_PRESET_NAME
+            loaded = ctx.preset_store.load(default_name)
+            coerced, _warnings = registry.coerce(loaded)
+            return (
+                *preset_values(coerced),
+                gr.update(choices=_preset_choices(ctx), value=default_name),
+                (
+                    "<span class='vc-ok'>Deleted "
+                    f"{html.escape(selected)}; loaded {html.escape(default_name)}.</span>"
+                ),
+                applied(default_name, coerced),
+                gr.update(visible=False),
+                {},
+            )
+        except Exception as exc:
+            return (
+                *skipped(),
+                gr.update(choices=_preset_choices(ctx)),
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+                gr.skip(),
+                gr.update(visible=False),
+                {},
+            )
 
     def reset_settings() -> tuple[Any, ...]:
         defaults = registry.defaults()
@@ -267,9 +381,32 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         api_visibility="private",
     )
     handles.delete.click(
-        delete_preset,
+        request_delete_preset,
         inputs=handles.dropdown,
-        outputs=[handles.dropdown, handles.status, applied_state],
+        outputs=[delete_state, handles.delete_confirmation, handles.delete_question, handles.status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    delete_confirm_event = handles.delete_yes.click(
+        confirm_delete_preset,
+        inputs=delete_state,
+        outputs=[
+            *components,
+            handles.dropdown,
+            handles.status,
+            applied_state,
+            handles.delete_confirmation,
+            delete_state,
+        ],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    handles.delete_keep.click(
+        keep_preset,
+        inputs=delete_state,
+        outputs=[delete_state, handles.delete_confirmation, handles.status],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -306,7 +443,13 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             ]
             return tuple(auto_vram["fn"](*resolved))
 
-        for dependency in (load_event, select_event, reset_event, startup_event):
+        for dependency in (
+            load_event,
+            select_event,
+            reset_event,
+            startup_event,
+            delete_confirm_event,
+        ):
             dependency.then(
                 follow_up,
                 inputs=[applied_state, *auto_vram["inputs"]],
@@ -322,10 +465,13 @@ class MediaInputHandles:
     files: gr.File
     path: gr.Textbox
     folder: gr.Textbox
+    zip_upload: gr.File
     output_folder: gr.Textbox
     recursive: gr.Checkbox
     overwrite: gr.Checkbox
     limit_items: gr.Number
+    include_kinds: gr.CheckboxGroup
+    name_filter: gr.Textbox
     rescan: gr.Button
     scan_summary: gr.Markdown
     video: gr.Video
@@ -434,6 +580,8 @@ def _folder_scan(
     output_folder: str = "",
     overwrite: bool = False,
     limit_items: int | float = 0,
+    include_kinds: Iterable[str] | None = None,
+    name_filter: str = "",
 ) -> tuple[list[str], str]:
     raw = str(folder or "").strip()
     if not raw:
@@ -444,12 +592,32 @@ def _folder_scan(
         return [], f"<span class='vc-err'>{html.escape(str(exc))}</span>"
     if not root.is_dir():
         return [], f"<span class='vc-err'>Folder does not exist: {html.escape(str(root))}</span>"
-    found = list_media_files(root, recursive=bool(recursive), kinds=("video", "audio", "image"))
+    found = list_media_files(
+        root,
+        recursive=bool(recursive),
+        kinds=("video", "audio", "image", "text"),
+    )
+    try:
+        # Task A owns this helper. The local import keeps the UI buildable while
+        # the backend branch is still landing in the shared working tree.
+        from vcap.core.media import filter_media_paths
+    except ImportError:
+        pass
+    else:
+        found = filter_media_paths(
+            found,
+            (
+                ["video", "audio", "image", "text"]
+                if include_kinds is None
+                else list(include_kinds)
+            ),
+            str(name_filter or ""),
+        )
     try:
         output_root = normalize_path(output_folder) if str(output_folder or "").strip() else None
     except Exception as exc:
         return [], f"<span class='vc-err'>Invalid output folder: {html.escape(str(exc))}</span>"
-    counts = {"video": 0, "audio": 0, "image": 0}
+    counts = {"video": 0, "audio": 0, "image": 0, "text": 0}
     existing = 0
     for path in found:
         kind = guess_kind_by_extension(path)
@@ -466,13 +634,100 @@ def _folder_scan(
     )
     summary = (
         f"🎬 {counts['video']} videos · 🎵 {counts['audio']} audios · "
-        f"🖼️ {counts['image']} images · {existing} already captioned in output folder. "
+        f"🖼️ {counts['image']} images · 📄 {counts['text']} texts · "
+        f"{existing} already captioned in output folder. "
         f"{overwrite_hint}"
     )
     limit = max(0, int(limit_items or 0))
     if limit:
         summary += f" · limiting to first {limit}"
     return [str(path) for path in found], summary
+
+
+def input_mode_from_tab(event: gr.SelectData) -> str:
+    """Map a Gradio Tabs selection payload to the authoritative input mode."""
+
+    values = [getattr(event, "value", event), getattr(event, "index", None)]
+    direct = {"upload": "upload", "path": "path", "folder": "folder"}
+    for value in values:
+        normalized = str(value or "").strip().casefold()
+        if normalized in direct:
+            return direct[normalized]
+        if "upload" in normalized:
+            return "upload"
+        if "file path" in normalized or normalized.endswith("path"):
+            return "path"
+        if "folder" in normalized:
+            return "folder"
+    index = getattr(event, "index", None)
+    if isinstance(index, int) and 0 <= index <= 2:
+        return ("upload", "path", "folder")[index]
+    return "upload"
+
+
+def _descend_single_top_level_folder(root: Path, max_depth: int = 5) -> Path:
+    """Descend through archive wrapper folders without hiding mixed roots."""
+
+    selected = normalize_path(root)
+    for _ in range(max(0, int(max_depth))):
+        try:
+            entries = list(selected.iterdir())
+        except OSError:
+            break
+        if len(entries) != 1 or not entries[0].is_dir():
+            break
+        selected = normalize_path(entries[0])
+    return selected
+
+
+def _filtered_light_media(
+    root: Path,
+    *,
+    recursive: bool,
+    include_kinds: Iterable[str] | None,
+    name_filter: str,
+) -> list[Path]:
+    found = list_media_files(
+        root,
+        recursive=recursive,
+        kinds=("video", "audio", "image", "text"),
+    )
+    try:
+        from vcap.core.media import filter_media_paths
+    except ImportError:
+        return found
+    return filter_media_paths(
+        found,
+        (
+            ["video", "audio", "image", "text"]
+            if include_kinds is None
+            else list(include_kinds)
+        ),
+        str(name_filter or ""),
+    )
+
+
+def extracted_batch_folder(
+    extraction_root: str | os.PathLike[str],
+    include_kinds: Iterable[str] | None = None,
+    name_filter: str = "",
+) -> tuple[Path, bool]:
+    """Choose an archive's useful root and whether media require recursion."""
+
+    selected = _descend_single_top_level_folder(normalize_path(extraction_root))
+    top_level = _filtered_light_media(
+        selected,
+        recursive=False,
+        include_kinds=include_kinds,
+        name_filter=name_filter,
+    )
+    recursive = _filtered_light_media(
+        selected,
+        recursive=True,
+        include_kinds=include_kinds,
+        name_filter=name_filter,
+    )
+    return selected, not top_level and bool(recursive)
 
 
 def _resolved_after_preview_edit(
@@ -519,7 +774,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
 
     with gr.Group(elem_classes=["vc-card"]):
         gr.Markdown("### Input", elem_classes=["vc-section-title"])
-        with gr.Tabs(selected="upload", elem_id="vc-input-tabs"):
+        with gr.Tabs(selected="upload", elem_id="vc-input-tabs") as input_tabs:
             with gr.Tab("📤 Upload files", id="upload") as upload_tab:
                 files = gr.File(
                     file_count="multiple",
@@ -566,6 +821,17 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     in_preset=False,
                     kind="str",
                 )
+                zip_upload = gr.File(
+                    label="…or upload a ZIP archive of media",
+                    file_types=[".zip"],
+                    type="filepath",
+                    elem_id="vc_batch_zip_upload",
+                )
+                gr.Markdown(
+                    "The archive is extracted safely below Outputs/uploaded_batches, then scanned with "
+                    "the folder options below.",
+                    elem_classes=["vc-help"],
+                )
                 output_folder = gr.Textbox(
                     value=str(ctx.outputs_dir / "batch_captions"),
                     label="Batch output folder",
@@ -580,6 +846,51 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     in_preset=False,
                     kind="str",
                 )
+                with gr.Row(elem_classes=["vc-compact-row"]):
+                    include_kinds = gr.CheckboxGroup(
+                        choices=[
+                            ("Video", "video"),
+                            ("Audio", "audio"),
+                            ("Image", "image"),
+                            ("Text", "text"),
+                        ],
+                        value=["video", "audio", "image", "text"],
+                        label="Include media kinds",
+                        info="Media kinds included when scanning the batch folder.",
+                        scale=3,
+                        elem_id="vc_batch_include_kinds",
+                    )
+                    ctx.reg(
+                        "batch_include_kinds",
+                        include_kinds,
+                        ["video", "audio", "image", "text"],
+                        section="input",
+                        description="Media kinds included when scanning the batch folder.",
+                        kind="list",
+                        choices=["video", "audio", "image", "text"],
+                    )
+                    name_filter = gr.Textbox(
+                        value="",
+                        label="File name filter",
+                        placeholder="*.mp4;clip_*",
+                        info=(
+                            "Optional glob on file names, for example *.mp4 or clip_*; "
+                            "separate several patterns with ;. Empty includes every file."
+                        ),
+                        scale=3,
+                        elem_id="vc_batch_name_filter",
+                    )
+                    ctx.reg(
+                        "batch_name_filter",
+                        name_filter,
+                        "",
+                        section="input",
+                        description=(
+                            "Optional glob on file names, for example *.mp4 or clip_*; "
+                            "separate several patterns with ;. Empty includes every file."
+                        ),
+                        kind="str",
+                    )
                 with gr.Row(elem_classes=["vc-compact-row"]):
                     recursive = gr.Checkbox(
                         value=False,
@@ -668,11 +979,11 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
 
     def choose_upload(value: Any) -> tuple[Any, ...]:
         selected = _paths(value)
-        return (*_preview_updates(selected), selected, "upload")
+        return (*_preview_updates(selected), selected)
 
     def choose_path(value: str) -> tuple[Any, ...]:
         selected = _paths(value)
-        return (*_preview_updates(selected), selected, "path")
+        return (*_preview_updates(selected), selected)
 
     def scan_folder(
         value: str,
@@ -680,6 +991,8 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         output_value: str,
         overwrite_value: bool,
         limit_value: int | float,
+        kinds_value: list[str] | None,
+        name_filter_value: str,
     ) -> tuple[Any, ...]:
         selected, summary = _folder_scan(
             value,
@@ -687,10 +1000,20 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
             output_value,
             overwrite_value,
             limit_value,
+            kinds_value,
+            name_filter_value,
         )
-        return (*_preview_updates(selected), selected, "folder", summary)
+        return (*_preview_updates(selected), selected, summary)
 
-    upload_outputs = [*preview_outputs, resolved_state, mode_state]
+    input_tabs.select(
+        input_mode_from_tab,
+        outputs=mode_state,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    upload_outputs = [*preview_outputs, resolved_state]
     files.change(
         choose_upload,
         inputs=files,
@@ -723,8 +1046,16 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         show_progress="hidden",
         api_visibility="private",
     )
-    folder_outputs = [*preview_outputs, resolved_state, mode_state, scan_summary]
-    folder_inputs = [folder, recursive, output_folder, overwrite, limit_items]
+    folder_outputs = [*preview_outputs, resolved_state, scan_summary]
+    folder_inputs = [
+        folder,
+        recursive,
+        output_folder,
+        overwrite,
+        limit_items,
+        include_kinds,
+        name_filter,
+    ]
     folder_tab.select(
         scan_folder,
         inputs=folder_inputs,
@@ -739,6 +1070,8 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         output_folder.change,
         overwrite.change,
         limit_items.change,
+        include_kinds.change,
+        name_filter.change,
         rescan.click,
     ):
         trigger(
@@ -749,6 +1082,125 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
             show_progress="hidden",
             api_visibility="private",
         )
+
+    def extract_batch_zip(
+        uploaded: Any,
+        recursive_value: bool,
+        output_value: str,
+        overwrite_value: bool,
+        limit_value: int | float,
+        kinds_value: list[str] | None,
+        name_filter_value: str,
+    ) -> tuple[Any, ...]:
+        raw = getattr(uploaded, "name", uploaded)
+        if not raw:
+            return (
+                gr.skip(),
+                gr.skip(),
+                *[gr.skip() for _ in preview_outputs],
+                gr.skip(),
+                "<span class='vc-help'>Choose a ZIP archive to extract.</span>",
+            )
+        try:
+            # Task F1 owns the extractor. Keep the UI importable while that
+            # backend update is landing in the shared working tree.
+            from vcap.core.archive import extract_zip
+        except ImportError:
+            return (
+                gr.skip(),
+                gr.skip(),
+                *[gr.skip() for _ in preview_outputs],
+                gr.skip(),
+                "<span class='vc-warn'>ZIP upload becomes available after the backend update.</span>",
+            )
+        try:
+            source = normalize_path(str(raw), must_exist=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            stem = sanitize_filename(source.stem) or "batch"
+            destination = normalize_path(
+                ctx.outputs_dir / "uploaded_batches" / f"{stem}_{stamp}"
+            )
+            suffix = 2
+            while destination.exists():
+                destination = normalize_path(
+                    ctx.outputs_dir
+                    / "uploaded_batches"
+                    / f"{stem}_{stamp}_{suffix}"
+                )
+                suffix += 1
+            report = extract_zip(source, destination)
+            report_destination = normalize_path(
+                getattr(report, "destination", destination)
+            )
+            selected_folder, nested_media_only = extracted_batch_folder(
+                report_destination,
+                kinds_value,
+                name_filter_value,
+            )
+            enabled_for_upload = nested_media_only and not bool(recursive_value)
+            effective_recursive = bool(recursive_value) or nested_media_only
+            selected, scan_text = _folder_scan(
+                str(selected_folder),
+                effective_recursive,
+                output_value,
+                overwrite_value,
+                limit_value,
+                kinds_value,
+                name_filter_value,
+            )
+            files = int(getattr(report, "files", 0) or 0)
+            total_bytes = int(getattr(report, "total_bytes", 0) or 0)
+            skipped = [str(value) for value in (getattr(report, "skipped", []) or [])]
+            skipped_text = ""
+            if skipped:
+                preview = ", ".join(html.escape(value) for value in skipped[:4])
+                extra = f" (+{len(skipped) - 4} more)" if len(skipped) > 4 else ""
+                skipped_text = (
+                    f" Skipped {len(skipped)} entr{'y' if len(skipped) == 1 else 'ies'}: "
+                    f"{preview}{extra}."
+                )
+            extraction_line = (
+                f"Extracted {files} files ({total_bytes / (1024 ** 2):.2f} MB); "
+                f"using {html.escape(str(selected_folder))}"
+            )
+            if enabled_for_upload:
+                extraction_line += (
+                    "; Scan subfolders enabled because the media sit in subfolders."
+                )
+            else:
+                extraction_line += "."
+            message = f"<span class='vc-ok'>{extraction_line}{skipped_text}</span><br>{scan_text}"
+            return (
+                str(selected_folder),
+                gr.update(value=effective_recursive),
+                *_preview_updates(selected),
+                selected,
+                message,
+            )
+        except Exception as exc:
+            return (
+                gr.skip(),
+                gr.skip(),
+                *[gr.skip() for _ in preview_outputs],
+                gr.skip(),
+                f"<span class='vc-err'>Could not extract ZIP: {html.escape(str(exc))}</span>",
+            )
+
+    zip_upload.upload(
+        extract_batch_zip,
+        inputs=[
+            zip_upload,
+            recursive,
+            output_folder,
+            overwrite,
+            limit_items,
+            include_kinds,
+            name_filter,
+        ],
+        outputs=[folder, recursive, *folder_outputs],
+        show_progress="minimal",
+        api_visibility="private",
+    )
 
     def accept_editor_value(
         value: str | None,
@@ -789,10 +1241,13 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         files,
         path,
         folder,
+        zip_upload,
         output_folder,
         recursive,
         overwrite,
         limit_items,
+        include_kinds,
+        name_filter,
         rescan,
         scan_summary,
         video,
@@ -837,15 +1292,31 @@ def merge_log_newest_first(current: str, new_lines: list[str], limit: int = LOG_
     return combined
 
 
+def poll_log_value(app_log: Any, cursor: int, current: str) -> tuple[Any, Any]:
+    """Return one live-log poll update, recovering an invalid future cursor."""
+
+    cursor_value = max(0, int(cursor or 0))
+    lines, new_revision, cursor_reset = app_log.snapshot_for_poll(
+        cursor_value,
+        recovery_limit=300,
+    )
+    if cursor_reset:
+        return newest_first("\n".join(lines)), new_revision
+    if new_revision == cursor_value:
+        return gr.skip(), gr.skip()
+    return merge_log_newest_first(str(current or ""), lines), new_revision
+
+
 def log_panel(ctx: "UiContext") -> LogPanelHandles:
     """Build revision-polled live logs and a Torch-free resource meter."""
 
+    initial_lines, initial_revision = ctx.app_log.tail_snapshot(300)
     with gr.Group(elem_classes=["vc-card"]):
         with gr.Row(elem_classes=["vc-compact-row"]):
             gr.Markdown("### Live log", elem_classes=["vc-section-title"])
             clear = action_button("⌫ Clear", "orange", size="md", min_width=86)
         log = gr.Textbox(
-            value=newest_first(ctx.app_log.tail(300)),
+            value=newest_first("\n".join(initial_lines)),
             label="Application log (newest first)",
             lines=14,
             max_lines=14,
@@ -857,15 +1328,16 @@ def log_panel(ctx: "UiContext") -> LogPanelHandles:
         )
         gpu_index = int(ctx.states.get("gpu_index_default", 0) or 0)
         meter = gr.HTML(gpu.render_resource_meter_html(gpu.resource_snapshot(gpu_index)))
-    revision = gr.State(ctx.app_log.revision)
+        gr.Markdown(
+            "Updates pause while this browser tab is hidden and catch up when it is visible again.",
+            elem_classes=["vc-help"],
+        )
+    revision = gr.State(initial_revision)
     log_timer = gr.Timer(0.5)
     meter_timer = gr.Timer(1.0)
 
     def poll_log(cursor: int, current: str) -> tuple[Any, Any]:
-        lines, new_revision = ctx.app_log.snapshot(int(cursor or 0))
-        if new_revision == int(cursor or 0):
-            return gr.skip(), gr.skip()
-        return merge_log_newest_first(str(current or ""), lines), new_revision
+        return poll_log_value(ctx.app_log, cursor, current)
 
     def poll_resources(selected_gpu: int | str | None) -> str:
         try:
@@ -1001,8 +1473,11 @@ __all__ = [
     "ProgressPanelHandles",
     "ReplaceWordsHandles",
     "action_button",
+    "extracted_batch_folder",
+    "input_mode_from_tab",
     "log_panel",
     "media_input_block",
+    "poll_log_value",
     "preset_bar",
     "progress_panel",
     "render_progress_html",

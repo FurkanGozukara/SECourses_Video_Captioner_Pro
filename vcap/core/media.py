@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import time
@@ -20,6 +22,19 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .paths import guess_kind_by_extension, normalize_path, sanitize_filename
+
+
+NVENC_PRESET_MAP: dict[str, str] = {
+    "ultrafast": "p1",
+    "superfast": "p2",
+    "veryfast": "p3",
+    "faster": "p4",
+    "fast": "p5",
+    "medium": "p5",
+    "slow": "p6",
+    "slower": "p7",
+}
+_VIDEO_ENCODERS = frozenset({"libx264", "h264_nvenc", "libx265", "hevc_nvenc"})
 
 
 class MediaError(RuntimeError):
@@ -109,10 +124,46 @@ def _exit_code_text(returncode: int) -> str:
     return f"exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
 
 
+def _configured_media_binary(name: str) -> str | None:
+    """Resolve an FFmpeg tool from the environment or global app settings."""
+
+    configured: list[str] = []
+    environment = os.environ.get("VCAP_FFMPEG_PATH", "").strip()
+    if environment:
+        configured.append(environment)
+    try:
+        from .app_settings import load_app_settings
+
+        setting = str(load_app_settings().get("ffmpeg_path") or "").strip()
+        if setting and setting not in configured:
+            configured.append(setting)
+    except Exception:
+        pass
+
+    executable = f"{name}.exe" if os.name == "nt" else name
+    for raw in configured:
+        try:
+            candidate = normalize_path(raw)
+        except (OSError, TypeError, ValueError):
+            continue
+        if candidate.is_dir():
+            resolved = candidate / executable
+        elif name == "ffmpeg":
+            resolved = candidate
+        else:
+            resolved = candidate.with_name(executable)
+        if resolved.is_file():
+            return str(resolved)
+    return None
+
+
 @lru_cache(maxsize=1)
 def find_ffmpeg() -> str | None:
     """Locate FFmpeg on PATH, in common Windows folders, or via imageio-ffmpeg."""
 
+    configured = _configured_media_binary("ffmpeg")
+    if configured:
+        return configured
     found = shutil.which("ffmpeg")
     if found:
         return found
@@ -135,6 +186,9 @@ def find_ffmpeg() -> str | None:
 def find_ffprobe() -> str | None:
     """Locate ffprobe beside FFmpeg, on PATH, or in common Windows folders."""
 
+    configured = _configured_media_binary("ffprobe")
+    if configured:
+        return configured
     found = shutil.which("ffprobe")
     if found:
         return found
@@ -148,6 +202,130 @@ def find_ffprobe() -> str | None:
             if candidate.is_file():
                 return str(candidate)
     return None
+
+
+@lru_cache(maxsize=1)
+def ffmpeg_encoders() -> frozenset[str]:
+    """Return FFmpeg's advertised encoder names, probing at most once per process."""
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return frozenset()
+    try:
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if completed.returncode != 0:
+        return frozenset()
+    names: set[str] = set()
+    for line in (completed.stdout or "").splitlines():
+        match = re.match(r"^\s*[A-Z\.]{6}\s+(\S+)", line)
+        if match:
+            names.add(match.group(1))
+    return frozenset(names)
+
+
+def resolve_video_encoder(requested: str) -> str:
+    """Resolve an available encoder, warning and falling back to libx264."""
+
+    selected = str(requested or "libx264").strip().casefold()
+    if selected not in _VIDEO_ENCODERS:
+        selected = "libx264"
+    available = ffmpeg_encoders()
+    if selected == "libx264" or selected in available:
+        return selected
+    from .logs import get_log
+
+    get_log().warn(
+        f"FFmpeg encoder {selected} is unavailable; falling back to libx264.",
+        scope="encode",
+    )
+    return "libx264"
+
+
+def video_encode_args(codec: str, crf: int = 18, preset: str = "veryfast") -> list[str]:
+    """Build FFmpeg constant-quality arguments for CPU and NVENC encoders."""
+
+    selected = str(codec or "libx264").strip().casefold()
+    if selected not in _VIDEO_ENCODERS:
+        selected = "libx264"
+    quality = max(0, min(51, int(crf)))
+    speed = str(preset or "veryfast").strip().casefold()
+    if speed not in NVENC_PRESET_MAP:
+        speed = "veryfast"
+    if selected.endswith("_nvenc"):
+        return [
+            "-c:v",
+            selected,
+            "-preset",
+            NVENC_PRESET_MAP[speed],
+            "-rc",
+            "vbr",
+            "-cq",
+            str(quality),
+        ]
+    return ["-c:v", selected, "-preset", speed, "-crf", str(quality)]
+
+
+def is_encoder_error(error: object) -> bool:
+    """Return whether an FFmpeg failure indicates an unavailable/broken encoder."""
+
+    text = str(error).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "unknown encoder",
+            "encoder not found",
+            "error while opening encoder",
+            "cannot load nvcuda",
+            "no nvenc capable devices",
+            "nvenc error",
+            "avcodec_open2",
+            "unsupported device",
+        )
+    )
+
+
+def filter_media_paths(
+    paths: Iterable[str | os.PathLike[str]],
+    include_kinds: Sequence[str] | str | None,
+    name_filter: str | None,
+) -> list[Path]:
+    """Filter media paths by extension kind and semicolon-separated filename globs."""
+
+    if include_kinds is None:
+        kinds = {"video", "audio", "image", "text"}
+    elif isinstance(include_kinds, str):
+        kinds = {
+            part.strip().casefold()
+            for part in re.split(r"[\s,;]+", include_kinds)
+            if part.strip()
+        }
+    else:
+        kinds = {str(part).strip().casefold() for part in include_kinds}
+    kinds &= {"video", "audio", "image", "text"}
+    patterns = [part.strip() for part in str(name_filter or "").split(";") if part.strip()]
+    insensitive = os.name == "nt"
+    selected: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        if guess_kind_by_extension(path) not in kinds:
+            continue
+        name = path.name.casefold() if insensitive else path.name
+        if patterns:
+            candidates = [pattern.casefold() for pattern in patterns] if insensitive else patterns
+            if not any(fnmatch.fnmatchcase(name, pattern) for pattern in candidates):
+                continue
+        selected.append(path)
+    return selected
 
 
 def _fraction(value: Any) -> float | None:
@@ -516,13 +694,22 @@ def extract_audio(
     return target
 
 
-def read_audio(path: str | os.PathLike[str], sample_rate: int = 16000) -> np.ndarray:
-    """Decode an audio stream to mono float32 samples through an FFmpeg pipe."""
+def read_audio(
+    path: str | os.PathLike[str], sample_rate: int | None = 16000
+) -> np.ndarray:
+    """Decode an audio stream to mono float32 samples through an FFmpeg pipe.
+
+    ``sample_rate=None`` keeps the probed source rate. Callers that need sample
+    offsets should retain that rate rather than assuming the model's 16 kHz rate.
+    """
 
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise MediaError("ffmpeg was not found")
     target = normalize_path(path, must_exist=True)
+    if sample_rate is None:
+        source_rate = probe_media(target).audio_sample_rate
+        sample_rate = int(source_rate or 16_000)
     completed = _run_media_tool(
         [
             ffmpeg,
@@ -551,6 +738,53 @@ def read_audio(path: str | os.PathLike[str], sample_rate: int = 16000) -> np.nda
     return np.frombuffer(completed.stdout, dtype="<f4").astype(np.float32, copy=True)
 
 
+def read_audio_with_rate(path: str | os.PathLike[str]) -> tuple[np.ndarray, int]:
+    """Decode mono audio at its actual stream rate and return ``(samples, rate)``."""
+
+    target = normalize_path(path, must_exist=True)
+    rate = int(probe_media(target).audio_sample_rate or 16_000)
+    return read_audio(target, sample_rate=rate), rate
+
+
+def resample_audio(
+    samples: np.ndarray,
+    source_rate: int,
+    target_rate: int = 16_000,
+) -> np.ndarray:
+    """Resample a mono float waveform while preserving its rounded duration."""
+
+    source = max(1, int(source_rate))
+    target = max(1, int(target_rate))
+    values = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+    if values.size == 0 or source == target:
+        return values.copy() if values.size else values
+    target_length = max(1, int(round(values.size * target / source)))
+    source_positions = np.arange(values.size, dtype=np.float64)
+    target_positions = np.arange(target_length, dtype=np.float64) * source / target
+    target_positions = np.minimum(target_positions, max(0, values.size - 1))
+    return np.interp(target_positions, source_positions, values).astype(np.float32)
+
+
+def read_model_audio(
+    path: str | os.PathLike[str],
+    start: float | None = None,
+    end: float | None = None,
+    *,
+    model_sample_rate: int = 16_000,
+) -> np.ndarray:
+    """Read, trim at the actual stream rate, then resample for model input."""
+
+    samples, source_rate = read_audio_with_rate(path)
+    first = max(0, min(samples.size, int(round(float(start or 0.0) * source_rate))))
+    last = (
+        samples.size
+        if end is None
+        else max(first, min(samples.size, int(round(float(end) * source_rate))))
+    )
+    sliced = np.ascontiguousarray(samples[first:last], dtype=np.float32)
+    return resample_audio(sliced, source_rate, model_sample_rate)
+
+
 def trim_media(
     src: str | os.PathLike[str],
     dst: str | os.PathLike[str],
@@ -558,6 +792,11 @@ def trim_media(
     end: float,
     mode: Literal["copy", "precise"] = "copy",
     keep_audio: bool = True,
+    *,
+    encode_codec: str = "libx264",
+    encode_crf: int = 18,
+    encode_preset: str = "veryfast",
+    encode_audio_bitrate: str = "192k",
 ) -> Path:
     """Trim media by stream copy or frame-accurate re-encoding."""
 
@@ -579,27 +818,52 @@ def trim_media(
         arguments.extend(["-c", "copy", "-avoid_negative_ts", "make_zero", str(target)])
     else:
         info = probe_media(source)
-        arguments = ["-y", "-i", str(source), "-ss", f"{beginning:.6f}", "-t", f"{duration:.6f}"]
-        if info.has_video:
-            arguments.extend(["-map", "0:v:0", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p"])
-        else:
-            arguments.append("-vn")
-        if keep_audio and info.has_audio:
-            arguments.extend(["-map", "0:a:0?"])
-            audio_suffix = target.suffix.casefold()
-            if audio_suffix == ".wav":
-                arguments.extend(["-c:a", "pcm_s16le"])
-            elif audio_suffix == ".mp3":
-                arguments.extend(["-c:a", "libmp3lame", "-q:a", "2"])
-            elif audio_suffix == ".flac":
-                arguments.extend(["-c:a", "flac"])
+        requested_encoder = str(encode_codec or "libx264").strip().casefold()
+        selected_encoder = resolve_video_encoder(requested_encoder)
+        audio_bitrate = str(encode_audio_bitrate or "192k").strip().casefold()
+        if audio_bitrate not in {"96k", "128k", "192k", "256k", "320k"}:
+            audio_bitrate = "192k"
+
+        def precise_arguments(codec: str) -> list[str]:
+            values = ["-y", "-i", str(source), "-ss", f"{beginning:.6f}", "-t", f"{duration:.6f}"]
+            if info.has_video:
+                values.extend(["-map", "0:v:0"])
+                values.extend(video_encode_args(codec, encode_crf, encode_preset))
+                values.extend(["-pix_fmt", "yuv420p"])
             else:
-                arguments.extend(["-c:a", "aac", "-b:a", "192k"])
-        else:
-            arguments.append("-an")
-        if target.suffix.casefold() == ".mp4":
-            arguments.extend(["-movflags", "+faststart"])
-        arguments.append(str(target))
+                values.append("-vn")
+            if keep_audio and info.has_audio:
+                values.extend(["-map", "0:a:0?"])
+                audio_suffix = target.suffix.casefold()
+                if audio_suffix == ".wav":
+                    values.extend(["-c:a", "pcm_s16le"])
+                elif audio_suffix == ".mp3":
+                    values.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+                elif audio_suffix == ".flac":
+                    values.extend(["-c:a", "flac"])
+                else:
+                    values.extend(["-c:a", "aac", "-b:a", audio_bitrate])
+            else:
+                values.append("-an")
+            if target.suffix.casefold() == ".mp4":
+                values.extend(["-movflags", "+faststart"])
+            values.append(str(target))
+            return values
+
+        arguments = precise_arguments(selected_encoder)
+        try:
+            run_ffmpeg(arguments, total_duration=duration)
+        except Exception as exc:
+            if selected_encoder == "libx264" or not is_encoder_error(exc):
+                raise
+            from .logs import get_log
+
+            get_log().warn(
+                f"FFmpeg encoder {selected_encoder} failed; falling back to libx264.",
+                scope="encode",
+            )
+            run_ffmpeg(precise_arguments("libx264"), total_duration=duration)
+        return target
     run_ffmpeg(arguments, total_duration=duration)
     return target
 
@@ -821,6 +1085,7 @@ def read_video_frames(
     size_multiple: int = 28,
     keep_aspect: bool = True,
     sampling: Literal["uniform", "fps", "keyframe", "adaptive"] = "uniform",
+    adaptive_threshold: float = 2.0,
     cancel_token: object | None = None,
     round_frames_to: int | None = None,
 ) -> VideoFrames:
@@ -1008,7 +1273,7 @@ def read_video_frames(
         original_height = original_height or fallback_height
 
     if sampling == "adaptive" and decoded_arrays:
-        indexes = _adaptive_frame_indexes(decoded_arrays)
+        indexes = _adaptive_frame_indexes(decoded_arrays, adaptive_threshold)
         decoded_arrays = [decoded_arrays[index] for index in indexes]
         decoded_times = [decoded_times[index] for index in indexes]
 
@@ -1297,13 +1562,22 @@ __all__ = [
     "VideoFrames",
     "extract_audio",
     "extract_frames_to_files",
+    "ffmpeg_encoders",
+    "filter_media_paths",
     "find_ffmpeg",
     "find_ffprobe",
+    "is_encoder_error",
     "make_thumbnail",
+    "NVENC_PRESET_MAP",
     "preview_safe_media",
     "probe_media",
     "read_audio",
+    "read_audio_with_rate",
+    "read_model_audio",
     "read_video_frames",
+    "resample_audio",
+    "resolve_video_encoder",
     "run_ffmpeg",
     "trim_media",
+    "video_encode_args",
 ]

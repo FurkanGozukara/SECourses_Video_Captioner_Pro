@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import math
 import os
@@ -16,7 +17,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, TypedDict
 
 import gradio as gr
+from PIL import Image, ImageDraw
 
+from vcap.core.archive import zip_directory
+from vcap.core.caption_stats import calculate_caption_statistics, render_caption_statistics
 from vcap.core.captions_post import (
     apply_replacements,
     caption_stats,
@@ -25,7 +29,7 @@ from vcap.core.captions_post import (
     parse_replace_pairs,
 )
 from vcap.core.export import export_dataset, read_flags, write_flags
-from vcap.core.media import preview_safe_media, probe_media
+from vcap.core.media import make_thumbnail, preview_safe_media, probe_media
 from vcap.core.outputs import OutputWriter
 from vcap.core.paths import (
     guess_kind_by_extension,
@@ -35,16 +39,16 @@ from vcap.core.paths import (
     open_in_file_manager,
     reveal_in_file_manager,
 )
-from vcap.models.registry import all_variant_choices, variant_to_family
+from vcap.models.registry import MODEL_SPECS, all_variant_choices, variant_to_family
 from vcap.pipeline.job import InputItem, JobSpec, OutputSpec, PostSpec
-from vcap.prompts.presets import get_preset, list_presets
+from vcap.prompts.presets import default_preset_for, get_preset, list_presets
 from vcap.ui.components import action_button
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
 
 
-CAPTION_EXTENSIONS = (".txt", ".json", ".srt")
+CAPTION_EXTENSIONS = (".txt", ".json", ".srt", ".vtt", ".jsonl")
 _RUN_DIR_RE = re.compile(r"^(?:batch_)?\d{4,}_.+", re.IGNORECASE)
 _IGNORED_JSON_NAMES = {
     ".vcap_flags.json",
@@ -68,6 +72,7 @@ _DEFAULT_FILTER = {
     "max_tokens": None,
     "flag": "all",
     "status": "all",
+    "token_limit": 512,
 }
 
 
@@ -576,6 +581,8 @@ def _matches_filter(item: Mapping[str, Any], spec: Mapping[str, Any]) -> bool:
     if wanted_flag in {"approved", "rejected"} and item.get("flag") != wanted_flag:
         return False
     wanted_status = str(spec.get("status") or "all").casefold()
+    if wanted_status == "over token limit":
+        return tokens > int(spec.get("token_limit") or 512)
     return wanted_status == "all" or item.get("status") == wanted_status
 
 
@@ -615,12 +622,17 @@ def _page_rows(state: EditorState) -> tuple[list[list[Any]], str]:
     page, pages, start, end = pagination_math(len(indices), int(state.get("page", 1)), int(state.get("page_size", 25)))
     state["page"] = page
     rows: list[list[Any]] = []
+    token_limit = int((state.get("filter") or {}).get("token_limit") or 512)
     for global_index in indices[start:end]:
         item = state["items"][global_index]
         name = Path(str(item.get("media_path") or item.get("caption_path") or "")).name
         preview = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
         preview = preview if len(preview) <= 120 else preview[:117].rstrip() + "..."
-        rows.append([global_index + 1, name, preview, int(item.get("chars") or 0), int(item.get("tokens") or 0), item.get("flag") or "-", item.get("status") or "empty"])
+        token_count = int(item.get("tokens") or 0)
+        flag = str(item.get("flag") or "-")
+        if token_count > token_limit:
+            flag = f"⚠ {flag}" if flag != "-" else "⚠"
+        rows.append([global_index + 1, name, preview, int(item.get("chars") or 0), token_count, flag, item.get("status") or "empty"])
     showing = "0" if not indices else f"{start + 1}-{end}"
     return rows, f"**Page {page} / {pages}** · showing {showing} of {len(indices)}"
 
@@ -633,7 +645,11 @@ def _counter_markdown(state: Mapping[str, Any]) -> str:
     return f"**{len(items)} items** · {captioned} captioned · {approved} approved · {failed} failed"
 
 
-def _stats_markdown(item: Mapping[str, Any] | None) -> str:
+def _state_token_limit(state: Mapping[str, Any] | None) -> int:
+    return max(1, int(((state or {}).get("filter") or {}).get("token_limit") or 512))
+
+
+def _stats_markdown(item: Mapping[str, Any] | None, token_limit: int = 512) -> str:
     if not item:
         return "**No item selected.**"
     stats = caption_stats(str(item.get("caption") or ""))
@@ -645,7 +661,14 @@ def _stats_markdown(item: Mapping[str, Any] | None) -> str:
     )
     duration = item.get("duration")
     duration_text = f" · {float(duration):.2f}s" if duration is not None else ""
-    return f"**{stats['chars']} chars** · {stats['words']} words · ~{stats['approx_tokens']} tokens{duration_text}<br>`{html.escape(raw)}`"
+    line = f"**{stats['chars']} chars** · {stats['words']} words · ~{stats['approx_tokens']} tokens{duration_text}<br>`{html.escape(raw)}`"
+    limit = max(1, int(token_limit or 512))
+    if int(stats["approx_tokens"]) > limit:
+        line += (
+            f"<br><span class='vc-warn'>⚠ {int(stats['approx_tokens'])} tokens > limit {limit} "
+            "(may be truncated by the trainer's text encoder)</span>"
+        )
+    return line
 
 
 def _refresh_item(item: EditorItem, caption: str) -> None:
@@ -701,7 +724,72 @@ def _selection_payload(
         except Exception:
             placeholder = gr.update(value="Media preview unavailable.", visible=True)
     state["dirty"], state["draft_caption"] = False, None
-    return video, audio, image, placeholder, str(item.get("caption") or ""), _stats_markdown(item)
+    token_limit = _state_token_limit(state)
+    return video, audio, image, placeholder, str(item.get("caption") or ""), _stats_markdown(item, token_limit)
+
+
+def _thumbnail_identity(path: Path) -> str:
+    try:
+        stat = path.stat()
+        raw = f"{path.resolve(strict=False)}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    except OSError:
+        raw = str(path.resolve(strict=False))
+    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:28]
+
+
+def _editor_icon(path: Path, target: Path, kind: str) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", (320, 190), (32, 38, 48))
+    draw = ImageDraw.Draw(image)
+    color = (77, 184, 160) if kind == "audio" else (123, 139, 168)
+    draw.rounded_rectangle((82, 28, 238, 162), radius=18, fill=(46, 55, 69), outline=color, width=4)
+    symbol = "AUDIO" if kind == "audio" else "CAPTION"
+    draw.text((160, 96), symbol, fill=(232, 238, 245), anchor="mm")
+    image.save(target, format="PNG")
+    return target
+
+
+def editor_thumbnail(item: Mapping[str, Any], cache_dir: str | os.PathLike[str]) -> Path:
+    """Return a path+mtime cached thumbnail for one editor item."""
+
+    raw = item.get("media_path") or item.get("source_media_path") or item.get("caption_path")
+    source = Path(str(raw or "caption"))
+    cache = normalize_path(cache_dir)
+    target = cache / f"{_thumbnail_identity(source)}_thumb.png"
+    if target.is_file() and target.stat().st_size:
+        return target
+    kind = str(item.get("kind") or guess_kind_by_extension(source))
+    if source.is_file() and kind in {"video", "video_no_audio", "image"}:
+        try:
+            return make_thumbnail(source, target, at_seconds=0.0, width=320)
+        except Exception:
+            pass
+    return _editor_icon(source, target, "audio" if kind == "audio" else "caption")
+
+
+def editor_page_gallery(
+    state: Mapping[str, Any],
+    cache_dir: str | os.PathLike[str],
+) -> tuple[list[tuple[str, str]], int | None]:
+    """Build current-page gallery entries and the synchronized local selection."""
+
+    indices = filtered_indices(state)
+    _, _, start, end = pagination_math(
+        len(indices), int(state.get("page", 1)), int(state.get("page_size", 25))
+    )
+    page_indices = indices[start:end]
+    values: list[tuple[str, str]] = []
+    for global_index in page_indices:
+        item = (state.get("items") or [])[global_index]
+        name = Path(str(item.get("media_path") or item.get("caption_path") or "caption")).name
+        excerpt = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
+        if len(excerpt) > 88:
+            excerpt = excerpt[:85].rstrip() + "..."
+        label = name + (f"\n{excerpt}" if excerpt else "\nNo caption")
+        values.append((str(editor_thumbnail(item, cache_dir)), label))
+    selected = state.get("selected_index")
+    local = page_indices.index(int(selected)) if selected is not None and int(selected) in page_indices else None
+    return values, local
 
 
 def _scope_indices(state: Mapping[str, Any], scope: str) -> list[int]:
@@ -756,8 +844,67 @@ def _preview_html(result: Mapping[str, Any]) -> str:
     return content
 
 
-def _prompt_choices() -> list[tuple[str, str]]:
-    return [(f"{preset.group} · {preset.label}", preset.id) for preset in list_presets()]
+def editor_item_modality(item: Mapping[str, Any] | None) -> str:
+    """Return the prompt-preset modality for an editor item."""
+
+    if not item:
+        return "video"
+    kind = str(item.get("kind") or "")
+    raw = item.get("media_path")
+    if kind in {"video", "video_no_audio"} or raw:
+        try:
+            info = probe_media(str(raw))
+            if info.has_video:
+                return "video_audio" if info.has_audio else "video"
+            kind = info.kind
+        except Exception:
+            pass
+    return kind if kind in {"audio", "image", "text"} else "video"
+
+
+def regeneration_prompt_choices(
+    variant_key: str,
+    item: Mapping[str, Any] | None,
+    current: str | None = None,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Filter regeneration prompts and retain a valid current selection."""
+
+    choices, selected, _ = resolve_regeneration_prompt_choices(
+        variant_key,
+        item,
+        current,
+    )
+    return choices, selected
+
+
+def resolve_regeneration_prompt_choices(
+    variant_key: str,
+    item: Mapping[str, Any] | None,
+    current: str | None = None,
+) -> tuple[list[tuple[str, str]], str | None, str | None]:
+    """Return compatible choices, a choice-safe value, and an unavailable message."""
+
+    family = variant_to_family(str(variant_key))
+    modality = editor_item_modality(item)
+    presets = list_presets(family, modality)
+    choices = [(f"{preset.group} · {preset.label}", preset.id) for preset in presets]
+    ids = {preset.id for preset in presets}
+    if not choices:
+        model_label = MODEL_SPECS[family].label
+        message = (
+            f"No prompt preset supports {modality} input with {model_label}; "
+            "pick another model"
+        )
+        return [], None, message
+
+    selected = str(current or "")
+    if selected not in ids:
+        try:
+            default_id = default_preset_for(family, modality).id
+        except Exception:
+            default_id = ""
+        selected = default_id if default_id in ids else presets[0].id
+    return choices, selected, None
 
 
 def _handler_error(total_outputs: int, state: Any, message: str) -> tuple[Any, ...]:
@@ -776,15 +923,17 @@ def editor_filter_handler(
     """Apply the editor filter and always return its complete ten outputs."""
 
     raw = list(values)
-    if len(raw) != 8:
+    if len(raw) not in {8, 9}:
         return _handler_error(10, current, "<span class='vc-err'>Invalid filter input count.</span>")
     next_state = deepcopy(current or initial_state or new_editor_state())
     next_state["filter"] = {
         "search": raw[0], "regex": bool(raw[1]), "min_length": raw[2],
         "max_length": raw[3], "min_tokens": raw[4], "max_tokens": raw[5],
         "flag": raw[6], "status": raw[7],
+        "token_limit": raw[8] if len(raw) == 9 else (current.get("filter") or {}).get("token_limit", 512),
     }
     try:
+        next_state["filter"]["token_limit"] = _optional_int(next_state["filter"].get("token_limit")) or 512
         if next_state["filter"]["search"] and next_state["filter"]["regex"]:
             re.compile(str(next_state["filter"]["search"]), flags=re.IGNORECASE)
         matches = filtered_indices(next_state)
@@ -880,13 +1029,13 @@ def editor_save_handler(
         next_state["dirty"], next_state["draft_caption"] = False, None
         rows, _ = _page_rows(next_state)
         message = f"Saved {path}."
-        return next_state, rows, _counter_markdown(next_state), _stats_markdown(item), (gr.skip() if quiet else message)
+        return next_state, rows, _counter_markdown(next_state), _stats_markdown(item, _state_token_limit(next_state)), (gr.skip() if quiet else message)
     except Exception as exc:
         return (
             next_state,
             gr.skip(),
             gr.skip(),
-            _stats_markdown(item),
+            _stats_markdown(item, _state_token_limit(next_state)),
             f"<span class='vc-err'>{html.escape(str(exc))}</span>",
         )
 
@@ -897,6 +1046,7 @@ def editor_export_handler(
     copy_media: bool = True,
     extension: str = ".txt",
     include_caption_only: bool = False,
+    create_zip: bool = False,
 ) -> str:
     """Export approved editor items and return a UI-ready summary."""
 
@@ -915,6 +1065,10 @@ def editor_export_handler(
         )
         if report.errors:
             message += " " + " | ".join(report.errors[:3])
+        if create_zip:
+            archive_path = zip_directory(report.out_root, Path(str(report.out_root) + ".zip"))
+            size_mib = archive_path.stat().st_size / float(1024**2)
+            message += f" ZIP: {archive_path} ({size_mib:.2f} MiB)."
         return message
     except Exception as exc:
         return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
@@ -929,7 +1083,6 @@ def build(ctx: "UiContext") -> None:
     autosave_timer = gr.Timer(0.5)
     preview_cache = ctx.temp_dir / "editor_previews"
     registry = ctx.settings_registry
-    registry_components = registry.components()
     model_entry = next((entry for entry in registry.entries() if entry.key == "model_key"), None)
 
     with gr.Row(elem_classes=["vc-compact-row"]):
@@ -959,6 +1112,7 @@ def build(ctx: "UiContext") -> None:
                     ("Empty", "empty"),
                     ("Failed", "failed"),
                     ("No media", "no media"),
+                    ("Over token limit", "over token limit"),
                 ],
                 value="all", label="Status", info="Show empty or failed captions only.",
             )
@@ -967,11 +1121,25 @@ def build(ctx: "UiContext") -> None:
             max_length = gr.Number(label="Max chars", precision=0, minimum=0, info="Maximum caption length; 0 = no limit.")
             min_tokens = gr.Number(label="Min tokens", precision=0, minimum=0, info="Minimum approximate token count; 0 = no limit.")
             max_tokens = gr.Number(label="Max tokens", precision=0, minimum=0, info="Maximum approximate token count; 0 = no limit.")
+            token_limit = gr.Number(
+                value=512,
+                label="Token limit (warn)",
+                precision=0,
+                minimum=1,
+                info="Warn and filter captions that may exceed the trainer text encoder limit.",
+                elem_id="vc_editor_token_limit",
+            )
             apply_filters = action_button("Apply filters", "blue", size="md", min_width=126)
 
     status = gr.Markdown("Ready to scan.", elem_classes=["vc-status"])
     with gr.Row(equal_height=False):
         with gr.Column(scale=5, min_width=520):
+            view_mode = gr.Radio(
+                choices=["Table", "Gallery"],
+                value="Table",
+                label="View",
+                elem_id="vc_editor_view_mode",
+            )
             table = gr.Dataframe(
                 value=[], headers=_TABLE_HEADERS,
                 datatype=["number", "str", "str", "number", "number", "str", "str"],
@@ -980,13 +1148,25 @@ def build(ctx: "UiContext") -> None:
                 column_widths=[55, 180, "46%", 70, 75, 90, 100], wrap=False,
                 buttons=["copy", "fullscreen"], label="Review queue",
             )
+            gallery = gr.Gallery(
+                value=[],
+                label="Review gallery",
+                columns=4,
+                rows=3,
+                height=520,
+                object_fit="cover",
+                allow_preview=False,
+                visible=False,
+                elem_id="vc_editor_gallery",
+                elem_classes=["vc-editor-gallery"],
+            )
             counters = gr.Markdown(_counter_markdown(initial_state))
             with gr.Row(elem_classes=["vc-compact-row"]):
                 previous_page = action_button("Prev page", "indigo", size="md", scale=1)
                 page_label = gr.Markdown("**Page 1 / 1** · showing 0 of 0", scale=3)
                 next_page = action_button("Next page", "sky", size="md", scale=1)
                 page_size = gr.Dropdown(
-                    choices=[25, 50, 100], value=25, label="Per page",
+                    choices=[10, 25, 50, 100, 200], value=25, label="Per page",
                     info="Rows shown on each editor page.", scale=1, min_width=105,
                 )
 
@@ -1026,43 +1206,171 @@ def build(ctx: "UiContext") -> None:
     hk_next_alias = gr.Button("Editor next alias", elem_id="hk_next", visible="hidden")
     hk_save_alias = gr.Button("Editor save alias", elem_id="hk_save", visible="hidden")
 
-    with gr.Accordion("🔁 Regenerate selected", open=False):
+    with gr.Accordion("🔁 Regenerate selected", open=False) as regeneration_accordion:
         variants = all_variant_choices()
         default_variant = (
             str(model_entry.default)
             if model_entry is not None
-            else next((key for _, key in variants if key == "qwen3_omni_instruct_int8"), variants[0][1])
+            else next((key for _, key in variants if key == "qwen3_omni_instruct_int4"), variants[0][1])
         )
-        prompts = _prompt_choices()
+        prompts, initial_regen_prompt, initial_regen_error = resolve_regeneration_prompt_choices(
+            default_variant,
+            None,
+        )
         with gr.Row(elem_classes=["vc-compact-row"]):
             regen_variant = gr.Dropdown(
                 choices=variants, value=default_variant, label="Model variant",
                 info="The selected checkpoint replaces only this caption.", scale=3,
             )
             regen_prompt = gr.Dropdown(
-                choices=prompts, value=prompts[0][1] if prompts else None, label="Prompt preset",
+                choices=prompts, value=initial_regen_prompt, label="Prompt preset",
                 info="Choose a task compatible with the media and model.", scale=3,
             )
+        regen_prompt_value = gr.State(initial_regen_prompt)
+        regen_prompt_error = gr.State(initial_regen_error or "")
         regen_override = gr.Textbox(
             label="User prompt override", lines=4,
             info="Leave blank to use the selected prompt preset unchanged.",
         )
         with gr.Row(elem_classes=["vc-compact-row"]):
-            regenerate = action_button("🔁 Regenerate", "fuchsia", size="md")
+            regenerate = action_button("Regenerate selected", "fuchsia", size="md", elem_id="vc_editor_regenerate_selected")
+            regenerate_all = action_button(
+                "Regenerate all in current filter", "navy", size="md",
+                elem_id="vc_editor_regenerate_all",
+            )
             keep_new = action_button("Keep new", "lime", size="md")
             revert = action_button("Revert", "red", size="md")
-        regen_status = gr.Markdown("No regeneration is pending.", elem_classes=["vc-status"])
+        regenerate_all_targets = gr.State([])
+        with gr.Row(
+            visible=False,
+            elem_id="vc_editor_regenerate_all_confirmation",
+            elem_classes=["vc-confirm-bar", "vc-compact-row"],
+        ) as regenerate_all_confirmation:
+            regenerate_all_question = gr.Markdown("Regenerate 0 captions?")
+            regenerate_all_yes = action_button(
+                "✔ Yes, regenerate", "maroon", size="sm", variant="stop",
+                elem_id="vc_editor_regenerate_all_yes",
+            )
+            regenerate_all_keep = action_button(
+                "✖ Keep current captions", "steel", size="sm",
+                elem_id="vc_editor_regenerate_all_keep",
+            )
+        regen_status = gr.Markdown(
+            initial_regen_error or "No regeneration is pending.",
+            elem_classes=["vc-status"],
+        )
         regen_diff = gr.HTML("")
 
+    def update_regeneration_prompts(
+        variant_key: str,
+        current: EditorState,
+        current_prompt: str | None,
+        previous_error: str,
+    ) -> tuple[Any, str | None, str, Any]:
+        selected = (current or {}).get("selected_index")
+        items = (current or {}).get("items") or []
+        item = items[int(selected)] if selected is not None and 0 <= int(selected) < len(items) else None
+        try:
+            choices, selected_prompt, message = resolve_regeneration_prompt_choices(
+                str(variant_key), item, current_prompt
+            )
+            status = message or ("No regeneration is pending." if previous_error else gr.skip())
+            return (
+                gr.update(choices=choices, value=selected_prompt),
+                selected_prompt,
+                message or "",
+                status,
+            )
+        except Exception as exc:
+            message = f"Could not filter regeneration prompts: {exc}"
+            return gr.update(choices=[], value=None), None, message, message
+
+    regeneration_prompt_inputs = [
+        regen_variant,
+        state,
+        regen_prompt_value,
+        regen_prompt_error,
+    ]
+    regeneration_prompt_outputs = [
+        regen_prompt,
+        regen_prompt_value,
+        regen_prompt_error,
+        regen_status,
+    ]
+
+    def with_regeneration_prompt_update(
+        result: tuple[Any, ...],
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+    ) -> tuple[Any, ...]:
+        next_state = result[0] if result else initial_state
+        return (
+            *result,
+            *update_regeneration_prompts(
+                variant_key,
+                next_state,
+                current_prompt,
+                previous_error,
+            ),
+        )
+
     if model_entry is not None:
+        def mirror_main_model_to_regeneration(
+            variant_key: str,
+            current: EditorState,
+            current_prompt: str | None,
+            previous_error: str,
+        ) -> tuple[Any, ...]:
+            return (
+                gr.update(value=variant_key),
+                *update_regeneration_prompts(
+                    variant_key,
+                    current,
+                    current_prompt,
+                    previous_error,
+                ),
+            )
+
         model_entry.component.change(
-            lambda value: gr.update(value=value),
-            inputs=model_entry.component,
-            outputs=regen_variant,
+            mirror_main_model_to_regeneration,
+            inputs=[
+                model_entry.component,
+                state,
+                regen_prompt_value,
+                regen_prompt_error,
+            ],
+            outputs=[regen_variant, *regeneration_prompt_outputs],
             queue=False,
             show_progress="hidden",
             api_visibility="private",
         )
+
+    regen_prompt.input(
+        lambda value: value,
+        inputs=regen_prompt,
+        outputs=regen_prompt_value,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    regen_variant.change(
+        update_regeneration_prompts,
+        inputs=regeneration_prompt_inputs,
+        outputs=regeneration_prompt_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    regeneration_accordion.expand(
+        update_regeneration_prompts,
+        inputs=regeneration_prompt_inputs,
+        outputs=regeneration_prompt_outputs,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
 
     with gr.Accordion("🔎 Find & replace across folder", open=False):
         with gr.Row(elem_classes=["vc-compact-row"]):
@@ -1115,11 +1423,37 @@ def build(ctx: "UiContext") -> None:
                 choices=[".txt", ".json", ".srt"], value=".txt", label="Caption extension",
                 info="Extension used for exported captions.",
             )
+            export_zip = gr.Checkbox(
+                value=False,
+                label="Also create ZIP archive",
+                info="Write a ZIP archive next to the exported folder.",
+                elem_id="vc_editor_export_zip",
+            )
             export_button = action_button("Export approved only", "pink", size="md")
         export_result = gr.Markdown("", elem_classes=["vc-status"])
 
+    with gr.Accordion(
+        "📊 Dataset statistics", open=False,
+        elem_id="vc_editor_statistics_accordion",
+    ):
+        compute_statistics = action_button(
+            "📊 Compute statistics", "olive", size="md",
+            elem_id="vc_editor_compute_statistics",
+        )
+        statistics_output = gr.Markdown(
+            "Scan a folder, then compute statistics for every item in the scan.",
+            elem_id="vc_editor_dataset_statistics",
+        )
+
     # Event handlers are kept in this module so their pure transforms remain testable.
-    def scan_handler(raw_folder: str, recurse: bool, size: int) -> tuple[Any, ...]:
+    def scan_handler(
+        raw_folder: str,
+        recurse: bool,
+        size: int,
+        variant_key: str = default_variant,
+        current_prompt: str | None = None,
+        previous_error: str = "",
+    ) -> tuple[Any, ...]:
         try:
             items = scan_folder(raw_folder, bool(recurse))
             next_state = new_editor_state(normalize_path(raw_folder))
@@ -1130,16 +1464,120 @@ def build(ctx: "UiContext") -> None:
             selection = _selection_payload(next_state, preview_cache, load_preview=False)
             message = f"Scanned {len(items)} review item(s) in {next_state['folder']}."
             ctx.app_log.log(message, scope="editor")
-            return next_state, rows, _counter_markdown(next_state), page_text, *selection, message
+            result = (
+                next_state,
+                rows,
+                _counter_markdown(next_state),
+                page_text,
+                *selection,
+                message,
+            )
         except Exception as exc:
             empty = new_editor_state(raw_folder)
             ctx.app_log.error(f"Editor scan failed: {exc}", scope="editor")
-            return empty, [], _counter_markdown(empty), "**Page 1 / 1**", *_selection_payload(empty, preview_cache, load_preview=False), f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+            result = (
+                empty,
+                [],
+                _counter_markdown(empty),
+                "**Page 1 / 1**",
+                *_selection_payload(empty, preview_cache, load_preview=False),
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+            )
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
 
     scan.click(
-        scan_handler, inputs=[folder, recursive, page_size],
-        outputs=[state, table, counters, page_label, video, audio, image, preview_placeholder, caption, stats, status],
+        scan_handler,
+        inputs=[
+            folder,
+            recursive,
+            page_size,
+            regen_variant,
+            regen_prompt_value,
+            regen_prompt_error,
+        ],
+        outputs=[
+            state,
+            table,
+            counters,
+            page_label,
+            video,
+            audio,
+            image,
+            preview_placeholder,
+            caption,
+            stats,
+            status,
+            *regeneration_prompt_outputs,
+        ],
         show_progress="minimal", api_visibility="private",
+    )
+    ctx.states["editor_open_binding"] = {
+        "folder": folder,
+        "recursive": recursive,
+        "scan_fn": scan_handler,
+        "inputs": [
+            folder,
+            recursive,
+            page_size,
+            regen_variant,
+            regen_prompt_value,
+            regen_prompt_error,
+        ],
+        "outputs": [
+            state,
+            table,
+            counters,
+            page_label,
+            video,
+            audio,
+            image,
+            preview_placeholder,
+            caption,
+            stats,
+            status,
+            *regeneration_prompt_outputs,
+        ],
+    }
+
+    def refresh_gallery(current: EditorState, mode: str = "Gallery") -> Any:
+        if str(mode) != "Gallery":
+            return gr.skip()
+        try:
+            values, selected = editor_page_gallery(current or initial_state, preview_cache)
+            return gr.update(value=values, selected_index=selected)
+        except Exception as exc:
+            ctx.app_log.warn(f"Editor gallery refresh failed: {exc}", scope="editor")
+            return gr.update(value=[], selected_index=None)
+
+    state.change(
+        refresh_gallery,
+        inputs=[state, view_mode],
+        outputs=gallery,
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    def toggle_editor_view(mode: str, current: EditorState) -> tuple[Any, Any]:
+        gallery_update = refresh_gallery(current, mode)
+        if isinstance(gallery_update, dict):
+            gallery_update = {**gallery_update, "visible": str(mode) == "Gallery"}
+        else:
+            gallery_update = gr.update(visible=str(mode) == "Gallery")
+        return gr.update(visible=str(mode) == "Table"), gallery_update
+
+    view_mode.change(
+        toggle_editor_view,
+        inputs=[view_mode, state],
+        outputs=[table, gallery],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
 
     def open_folder_handler(raw_folder: str) -> str:
@@ -1178,20 +1616,81 @@ def build(ctx: "UiContext") -> None:
         api_visibility="private",
     )
 
-    def filter_handler(current: EditorState, *values: Any) -> tuple[Any, ...]:
-        return editor_filter_handler(
+    def filter_handler(
+        current: EditorState,
+        search_value: str,
+        regex_value: bool,
+        min_length_value: Any,
+        max_length_value: Any,
+        min_tokens_value: Any,
+        max_tokens_value: Any,
+        flag_value: str,
+        status_value: str,
+        token_limit_value: Any,
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+    ) -> tuple[Any, ...]:
+        result = editor_filter_handler(
             current,
-            values,
+            [
+                search_value,
+                regex_value,
+                min_length_value,
+                max_length_value,
+                min_tokens_value,
+                max_tokens_value,
+                flag_value,
+                status_value,
+                token_limit_value,
+            ],
             initial_state=initial_state,
             preview_cache=preview_cache,
         )
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
 
-    apply_filters.click(
-        filter_handler,
-        inputs=[state, search, search_regex, min_length, max_length, min_tokens, max_tokens, flag_filter, status_filter],
-        outputs=[state, table, page_label, video, audio, image, preview_placeholder, caption, stats, status],
-        queue=False, show_progress="hidden", api_visibility="private",
-    )
+    filter_inputs = [
+        state,
+        search,
+        search_regex,
+        min_length,
+        max_length,
+        min_tokens,
+        max_tokens,
+        flag_filter,
+        status_filter,
+        token_limit,
+        regen_variant,
+        regen_prompt_value,
+        regen_prompt_error,
+    ]
+    filter_outputs = [
+        state,
+        table,
+        page_label,
+        video,
+        audio,
+        image,
+        preview_placeholder,
+        caption,
+        stats,
+        status,
+        *regeneration_prompt_outputs,
+    ]
+    for trigger in (apply_filters.click, token_limit.change, status_filter.change):
+        trigger(
+            filter_handler,
+            inputs=filter_inputs,
+            outputs=filter_outputs,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     def page_handler(current: EditorState, direction: int, selected_size: int) -> tuple[EditorState, list[list[Any]], str]:
         next_state = deepcopy(current or initial_state)
@@ -1204,7 +1703,13 @@ def build(ctx: "UiContext") -> None:
     next_page.click(lambda current, size: page_handler(current, 1, size), [state, page_size], [state, table, page_label], queue=False, show_progress="hidden", api_visibility="private")
     page_size.change(lambda current, size: page_handler(current, 0, size), [state, page_size], [state, table, page_label], queue=False, show_progress="hidden", api_visibility="private")
 
-    def select_handler(current: EditorState, evt: gr.SelectData) -> tuple[Any, ...]:
+    def select_handler(
+        current: EditorState,
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+        evt: gr.SelectData,
+    ) -> tuple[Any, ...]:
         next_state = deepcopy(current or initial_state)
         row = int(evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index)
         indices = filtered_indices(next_state)
@@ -1213,12 +1718,83 @@ def build(ctx: "UiContext") -> None:
         if 0 <= row < len(page_indices):
             next_state["selected_index"] = page_indices[row]
         selected_number = int(next_state.get("selected_index") or 0) + 1
-        return next_state, *_selection_payload(next_state, preview_cache), f"Selected item {selected_number}."
+        result = (
+            next_state,
+            *_selection_payload(next_state, preview_cache),
+            f"Selected item {selected_number}.",
+        )
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
 
     table.select(
-        select_handler, inputs=state,
-        outputs=[state, video, audio, image, preview_placeholder, caption, stats, status],
+        select_handler,
+        inputs=[state, regen_variant, regen_prompt_value, regen_prompt_error],
+        outputs=[
+            state,
+            video,
+            audio,
+            image,
+            preview_placeholder,
+            caption,
+            stats,
+            status,
+            *regeneration_prompt_outputs,
+        ],
         show_progress="minimal", api_visibility="private",
+    )
+
+    def gallery_select_handler(
+        current: EditorState,
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+        evt: gr.SelectData,
+    ) -> tuple[Any, ...]:
+        next_state = deepcopy(current or initial_state)
+        row = int(evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index)
+        indices = filtered_indices(next_state)
+        _, _, start, end = pagination_math(
+            len(indices), int(next_state.get("page", 1)), int(next_state.get("page_size", 25))
+        )
+        page_indices = indices[start:end]
+        if 0 <= row < len(page_indices):
+            next_state["selected_index"] = page_indices[row]
+        selected_number = int(next_state.get("selected_index") or 0) + 1
+        rows, _ = _page_rows(next_state)
+        result = (
+            next_state,
+            rows,
+            *_selection_payload(next_state, preview_cache),
+            f"Selected item {selected_number}.",
+        )
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
+
+    gallery.select(
+        gallery_select_handler,
+        inputs=[state, regen_variant, regen_prompt_value, regen_prompt_error],
+        outputs=[
+            state,
+            table,
+            video,
+            audio,
+            image,
+            preview_placeholder,
+            caption,
+            stats,
+            status,
+            *regeneration_prompt_outputs,
+        ],
+        show_progress="minimal",
+        api_visibility="private",
     )
 
     def mark_dirty(current: EditorState, text: str) -> tuple[EditorState, str]:
@@ -1228,7 +1804,7 @@ def build(ctx: "UiContext") -> None:
             item = next_state["items"][int(selected)]
             _refresh_item(item, str(text or ""))
             next_state.update(dirty=True, draft_caption=str(text or ""), last_edit=time.monotonic())
-            return next_state, _stats_markdown(item)
+            return next_state, _stats_markdown(item, _state_token_limit(next_state))
         return next_state, _stats_markdown(None)
 
     caption.input(
@@ -1278,7 +1854,7 @@ def build(ctx: "UiContext") -> None:
                 )
                 result[1], _ = _page_rows(saved_state)
                 result[2] = _counter_markdown(saved_state)
-                result[3] = _stats_markdown(selected_item)
+                result[3] = _stats_markdown(selected_item, _state_token_limit(saved_state))
         return tuple(result)
 
     autosave_timer.tick(
@@ -1286,7 +1862,13 @@ def build(ctx: "UiContext") -> None:
         queue=False, show_progress="hidden", api_visibility="private",
     )
 
-    def navigate_handler(current: EditorState, direction: int) -> tuple[Any, ...]:
+    def navigate_handler(
+        current: EditorState,
+        direction: int,
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+    ) -> tuple[Any, ...]:
         next_state = deepcopy(current or initial_state)
         if next_state.get("dirty") and next_state.get("selected_index") is not None:
             selected_item = next_state["items"][int(next_state["selected_index"])]
@@ -1294,27 +1876,65 @@ def build(ctx: "UiContext") -> None:
             next_state["dirty"] = False
         indices = filtered_indices(next_state)
         if not indices:
-            return next_state, *_selection_payload(next_state, preview_cache, load_preview=False), "No items match the current filter."
-        selected = next_state.get("selected_index")
-        try:
-            position = indices.index(int(selected)) if selected is not None else 0
-        except ValueError:
-            position = 0
-        position = min(len(indices) - 1, max(0, position + int(direction)))
-        next_state["selected_index"] = indices[position]
-        return next_state, *_selection_payload(next_state, preview_cache), f"Item {position + 1} of {len(indices)} in the filtered queue."
+            result = (
+                next_state,
+                *_selection_payload(next_state, preview_cache, load_preview=False),
+                "No items match the current filter.",
+            )
+        else:
+            selected = next_state.get("selected_index")
+            try:
+                position = indices.index(int(selected)) if selected is not None else 0
+            except ValueError:
+                position = 0
+            position = min(len(indices) - 1, max(0, position + int(direction)))
+            next_state["selected_index"] = indices[position]
+            result = (
+                next_state,
+                *_selection_payload(next_state, preview_cache),
+                f"Item {position + 1} of {len(indices)} in the filtered queue.",
+            )
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
 
     for trigger, direction in (
         (previous_item.click, -1), (hk_ed_prev.click, -1), (hk_prev_alias.click, -1),
         (next_item.click, 1), (hk_ed_next.click, 1), (hk_next_alias.click, 1),
     ):
         trigger(
-            lambda current, step=direction: navigate_handler(current, step), inputs=state,
-            outputs=[state, video, audio, image, preview_placeholder, caption, stats, status],
+            lambda current, variant, prompt, error, step=direction: navigate_handler(
+                current,
+                step,
+                variant,
+                prompt,
+                error,
+            ),
+            inputs=[state, regen_variant, regen_prompt_value, regen_prompt_error],
+            outputs=[
+                state,
+                video,
+                audio,
+                image,
+                preview_placeholder,
+                caption,
+                stats,
+                status,
+                *regeneration_prompt_outputs,
+            ],
             show_progress="minimal", api_visibility="private",
         )
 
-    def flag_handler(current: EditorState, flag: str) -> tuple[Any, ...]:
+    def flag_handler(
+        current: EditorState,
+        flag: str,
+        variant_key: str,
+        current_prompt: str | None,
+        previous_error: str,
+    ) -> tuple[Any, ...]:
         result = editor_flag_handler(
             current,
             flag,
@@ -1326,12 +1946,37 @@ def build(ctx: "UiContext") -> None:
             ctx.app_log.error(re.sub(r"<[^>]+>", "", message), scope="editor")
         else:
             ctx.app_log.log(message, scope="editor")
-        return result
+        return with_regeneration_prompt_update(
+            result,
+            variant_key,
+            current_prompt,
+            previous_error,
+        )
 
     for trigger, flag in ((approve.click, "approved"), (hk_ed_approve.click, "approved"), (reject.click, "rejected"), (hk_ed_reject.click, "rejected")):
         trigger(
-            lambda current, value=flag: flag_handler(current, value), inputs=state,
-            outputs=[state, table, counters, page_label, video, audio, image, preview_placeholder, caption, stats, status],
+            lambda current, variant, prompt, error, value=flag: flag_handler(
+                current,
+                value,
+                variant,
+                prompt,
+                error,
+            ),
+            inputs=[state, regen_variant, regen_prompt_value, regen_prompt_error],
+            outputs=[
+                state,
+                table,
+                counters,
+                page_label,
+                video,
+                audio,
+                image,
+                preview_placeholder,
+                caption,
+                stats,
+                status,
+                *regeneration_prompt_outputs,
+            ],
             show_progress="minimal", api_visibility="private",
         )
 
@@ -1369,7 +2014,7 @@ def build(ctx: "UiContext") -> None:
             selected_item = next_state["items"][int(selected)] if selected is not None else None
             message = f"Applied {preview['replacement_count']} replacement(s) across {preview['files_changed']} file(s)."
             ctx.app_log.log(message, scope="editor")
-            return next_state, rows, _counter_markdown(next_state), (selected_item.get("caption", "") if selected_item else ""), _stats_markdown(selected_item), _preview_html(preview), message
+            return next_state, rows, _counter_markdown(next_state), (selected_item.get("caption", "") if selected_item else ""), _stats_markdown(selected_item, _state_token_limit(next_state)), _preview_html(preview), message
         except Exception as exc:
             ctx.app_log.error(f"Find/replace failed: {exc}", scope="editor")
             error = f"<span class='vc-err'>{html.escape(str(exc))}</span>"
@@ -1405,7 +2050,7 @@ def build(ctx: "UiContext") -> None:
             selected_item = next_state["items"][int(selected)] if selected is not None else None
             message = f"Updated {changed} caption(s)."
             ctx.app_log.log(message, scope="editor")
-            return next_state, rows, _counter_markdown(next_state), (selected_item.get("caption", "") if selected_item else ""), _stats_markdown(selected_item), message, message
+            return next_state, rows, _counter_markdown(next_state), (selected_item.get("caption", "") if selected_item else ""), _stats_markdown(selected_item, _state_token_limit(next_state)), message, message
         except Exception as exc:
             ctx.app_log.error(f"Bulk edit failed: {exc}", scope="editor")
             error = f"<span class='vc-err'>{html.escape(str(exc))}</span>"
@@ -1425,6 +2070,7 @@ def build(ctx: "UiContext") -> None:
         copy_media: bool,
         extension: str,
         include_caption_only: bool,
+        create_zip: bool,
     ) -> str:
         message = editor_export_handler(
             current,
@@ -1432,6 +2078,7 @@ def build(ctx: "UiContext") -> None:
             copy_media,
             extension,
             include_caption_only,
+            create_zip,
         )
         if "vc-err" in message:
             ctx.app_log.error(f"Approved export failed: {message}", scope="editor")
@@ -1441,8 +2088,27 @@ def build(ctx: "UiContext") -> None:
 
     export_button.click(
         export_handler,
-        inputs=[state, export_destination, export_copy_media, export_extension, export_caption_only],
+        inputs=[state, export_destination, export_copy_media, export_extension, export_caption_only, export_zip],
         outputs=export_result, show_progress="minimal", api_visibility="private",
+    )
+
+    def statistics_handler(current: EditorState, trigger_word: str) -> str:
+        try:
+            calculated = calculate_caption_statistics(
+                (current or {}).get("items") or [],
+                str(trigger_word or ""),
+            )
+            return render_caption_statistics(calculated)
+        except Exception as exc:
+            return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+
+    compute_statistics.click(
+        statistics_handler,
+        inputs=[state, ctx.caption_handles.controls["trigger_word"]],
+        outputs=statistics_output,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
 
     class _RegenerationSink:
@@ -1459,10 +2125,197 @@ def build(ctx: "UiContext") -> None:
         def on_item(self, event: Any) -> None:
             self.events.put(("progress", getattr(event, "message", str(event))))
 
+    def request_regenerate_all(
+        current: EditorState,
+        variant: str,
+        prompt_id: str | None,
+    ) -> tuple[list[int], Any, str, str]:
+        indices = [
+            index
+            for index in filtered_indices(current or initial_state)
+            if (current or initial_state)["items"][index].get("media_path")
+            and Path(str((current or initial_state)["items"][index]["media_path"])).is_file()
+        ]
+        count = len(indices)
+        if not count:
+            return [], gr.update(visible=False), "Regenerate 0 captions?", "<span class='vc-warn'>No filtered captions have available media.</span>"
+        items = (current or initial_state).get("items") or []
+        for index in indices:
+            _, _, message = resolve_regeneration_prompt_choices(
+                variant,
+                items[index],
+                prompt_id,
+            )
+            if message:
+                return [], gr.update(visible=False), "Regenerate 0 captions?", message
+        return indices, gr.update(visible=True), f"Regenerate {count} captions?", f"Ready to regenerate {count} caption(s)."
+
+    regenerate_all.click(
+        request_regenerate_all,
+        inputs=[state, regen_variant, regen_prompt_value],
+        outputs=[regenerate_all_targets, regenerate_all_confirmation, regenerate_all_question, regen_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    regenerate_all_keep.click(
+        lambda: ([], gr.update(visible=False), "Regeneration cancelled; captions were not changed."),
+        outputs=[regenerate_all_targets, regenerate_all_confirmation, regen_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def regenerate_all_handler(
+        current: EditorState,
+        target_indices: list[int],
+        variant: str,
+        prompt_id: str | None,
+        override: str,
+        *runtime_values: Any,
+    ):
+        next_state = deepcopy(current or initial_state)
+        indices = [
+            int(index)
+            for index in (target_indices or [])
+            if 0 <= int(index) < len(next_state.get("items") or [])
+        ]
+        if not indices:
+            yield gr.update(visible=False), "<span class='vc-warn'>No captions are queued for regeneration.</span>", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
+            return
+        target_items = [next_state["items"][index] for index in indices]
+        for target_item in target_items:
+            _, _, message = resolve_regeneration_prompt_choices(
+                variant,
+                target_item,
+                prompt_id,
+            )
+            if message:
+                yield gr.update(visible=False), message, next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
+                return
+        selected = next_state.get("selected_index")
+        reference_item = (
+            next_state["items"][int(selected)]
+            if selected is not None and int(selected) in indices
+            else target_items[0]
+        )
+        _, prompt_id, _ = resolve_regeneration_prompt_choices(
+            variant,
+            reference_item,
+            prompt_id,
+        )
+        try:
+            settings = registry.values_to_dict(runtime_values)
+            media_paths = [str(item.get("media_path") or "") for item in target_items]
+            caption_paths = [Path(str(item["caption_path"])) for item in target_items]
+            formats = sorted(
+                {
+                    path.suffix.casefold().lstrip(".")
+                    for path in caption_paths
+                    if path.suffix.casefold().lstrip(".") in {"txt", "json", "srt", "vtt", "jsonl"}
+                }
+            ) or ["txt"]
+            settings.update(
+                model_key=variant,
+                variant_key=variant,
+                prompt_preset_id=prompt_id,
+                system_prompt=None,
+                user_prompt=(str(override).strip() or None),
+                overwrite_existing=True,
+                output_formats=formats,
+                continue_on_error=True,
+            )
+            get_preset(prompt_id)
+            variant_to_family(variant)
+            output = OutputSpec(
+                kind="batch",
+                outputs_root=str(ctx.outputs_dir),
+                batch_output_dir=str(normalize_path(next_state.get("folder") or ctx.outputs_dir)),
+                mirror_names=False,
+                overwrite=True,
+            )
+            spec = JobSpec.from_settings(
+                settings,
+                [InputItem(path=path) for path in media_paths],
+                output,
+            )
+            spec = replace(
+                spec,
+                post=replace(spec.post, formats=tuple(formats)),
+                internal={
+                    **dict(spec.internal or {}),
+                    "output_dirs": [str(path.parent) for path in caption_paths],
+                    "output_stems": [path.stem for path in caption_paths],
+                    "metadata_name": "editor_regeneration_metadata.json",
+                    "continue_on_error": True,
+                },
+            )
+        except Exception as exc:
+            yield gr.update(visible=False), f"<span class='vc-err'>{html.escape(str(exc))}</span>", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
+            return
+
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        terminal: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
+                terminal["result"] = ctx.pipeline.run_job(spec, _RegenerationSink(events))
+            except BaseException as exc:
+                terminal["error"] = exc
+            finally:
+                events.put(("terminal", None))
+
+        threading.Thread(target=work, daemon=True, name="vcap-editor-regenerate-all").start()
+        yield gr.update(visible=False), f"Starting regeneration of {len(indices)} captions...", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
+        while True:
+            kind, payload = events.get()
+            if kind == "terminal":
+                break
+            yield gr.skip(), html.escape(str(payload)), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        if "error" in terminal:
+            exc = terminal["error"]
+            ctx.app_log.error(f"Editor filtered regeneration failed: {exc}", scope="editor")
+            yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
+            return
+
+        changed = 0
+        for index, caption_path in zip(indices, caption_paths):
+            try:
+                new_caption, field = _read_caption(caption_path)
+                item = next_state["items"][index]
+                item["caption_field"] = field or item.get("caption_field")
+                _refresh_item(item, new_caption)
+                changed += 1
+            except Exception as exc:
+                ctx.app_log.warn(f"Could not refresh regenerated caption {caption_path}: {exc}", scope="editor")
+        next_state["dirty"] = False
+        rows, _ = _page_rows(next_state)
+        selected = next_state.get("selected_index")
+        selected_item = next_state["items"][int(selected)] if selected is not None else None
+        caption_value = str(selected_item.get("caption") or "") if selected_item else ""
+        result = terminal.get("result")
+        counts = dict(getattr(result, "counts", {}) or {})
+        message = (
+            f"Regenerated {changed}/{len(indices)} caption(s); "
+            f"failed {int(counts.get('failed', 0) or 0)}."
+        )
+        ctx.app_log.log(message, scope="editor")
+        yield (
+            gr.update(visible=False),
+            message,
+            next_state,
+            rows,
+            _counter_markdown(next_state),
+            caption_value,
+            _stats_markdown(selected_item, _state_token_limit(next_state)),
+            [],
+        )
+
     def regenerate_handler(
         current: EditorState,
         variant: str,
-        prompt_id: str,
+        prompt_id: str | None,
         override: str,
         *runtime_values: Any,
     ):
@@ -1472,6 +2325,14 @@ def build(ctx: "UiContext") -> None:
             yield gr.skip(), "<span class='vc-err'>No caption is selected.</span>", *(gr.skip() for _ in range(6))
             return
         item = next_state["items"][int(selected)]
+        _, prompt_id, message = resolve_regeneration_prompt_choices(
+            variant,
+            item,
+            prompt_id,
+        )
+        if message:
+            yield gr.skip(), message, *(gr.skip() for _ in range(6))
+            return
         media_path = item.get("media_path")
         if not media_path or not Path(media_path).is_file():
             yield gr.skip(), "<span class='vc-err'>The selected caption has no media to regenerate.</span>", *(gr.skip() for _ in range(6))
@@ -1559,17 +2420,10 @@ def build(ctx: "UiContext") -> None:
             }
             message = f"Regenerated {caption_path.name}. Review the diff, then keep or revert."
             ctx.app_log.log(message, scope="editor")
-            yield diff_html(old, new), message, next_state, new, _stats_markdown(item), rows, _counter_markdown(next_state), backup
+            yield diff_html(old, new), message, next_state, new, _stats_markdown(item, _state_token_limit(next_state)), rows, _counter_markdown(next_state), backup
         except Exception as exc:
             ctx.app_log.error(f"Could not load regenerated caption: {exc}", scope="editor")
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
-
-    regenerate.click(
-        regenerate_handler,
-        inputs=[state, regen_variant, regen_prompt, regen_override, *registry_components],
-        outputs=[regen_diff, regen_status, state, caption, stats, table, counters, regeneration_backup],
-        concurrency_id="gpu_queue", concurrency_limit=1, show_progress="hidden", api_visibility="private",
-    )
 
     def keep_handler(backup: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if not backup:
@@ -1601,7 +2455,7 @@ def build(ctx: "UiContext") -> None:
             selected_item = next_state["items"][int(selected)] if selected is not None else None
             rows, _ = _page_rows(next_state)
             ctx.app_log.log(f"Reverted regenerated caption {path}", scope="editor")
-            return "", "Reverted to the previous caption.", next_state, old, _stats_markdown(selected_item), rows, _counter_markdown(next_state), {}
+            return "", "Reverted to the previous caption.", next_state, old, _stats_markdown(selected_item, _state_token_limit(next_state)), rows, _counter_markdown(next_state), {}
         except Exception as exc:
             return gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(5)), backup
 
@@ -1611,6 +2465,95 @@ def build(ctx: "UiContext") -> None:
         show_progress="minimal", api_visibility="private",
     )
     ctx.states["editor_state"] = state
+    ctx.states["editor_regeneration_binding"] = {
+        "prompt_update_handler": update_regeneration_prompts,
+        "scan_handler": scan_handler,
+        "select_handler": select_handler,
+        "gallery_select_handler": gallery_select_handler,
+        "navigate_handler": navigate_handler,
+        "flag_handler": flag_handler,
+        "prompt_inputs": regeneration_prompt_inputs,
+        "prompt_outputs": regeneration_prompt_outputs,
+        "regenerate": regenerate,
+        "regenerate_handler": regenerate_handler,
+        "regenerate_inputs": [state, regen_variant, regen_prompt_value, regen_override],
+        "regenerate_outputs": [
+            regen_diff,
+            regen_status,
+            state,
+            caption,
+            stats,
+            table,
+            counters,
+            regeneration_backup,
+        ],
+        "regenerate_all_yes": regenerate_all_yes,
+        "regenerate_all_confirmation": regenerate_all_confirmation,
+        "regenerate_all_handler": regenerate_all_handler,
+        "regenerate_all_inputs": [
+            state,
+            regenerate_all_targets,
+            regen_variant,
+            regen_prompt_value,
+            regen_override,
+        ],
+        "regenerate_all_outputs": [
+            regenerate_all_confirmation,
+            regen_status,
+            state,
+            table,
+            counters,
+            caption,
+            stats,
+            regenerate_all_targets,
+        ],
+        "wired": False,
+    }
+
+
+def wire(ctx: "UiContext") -> None:
+    """Wire registry-wide regeneration events after every tab has registered."""
+
+    binding = ctx.states.get("editor_regeneration_binding")
+    if not isinstance(binding, dict):
+        raise RuntimeError("editor_tab.build() must run before wire()")
+    if binding.get("wired"):
+        return
+
+    registry_components = ctx.settings_registry.components()
+    confirm_event = binding["regenerate_all_yes"].click(
+        lambda: gr.update(visible=False),
+        outputs=binding["regenerate_all_confirmation"],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    regenerate_all_event = confirm_event.then(
+        binding["regenerate_all_handler"],
+        inputs=[*binding["regenerate_all_inputs"], *registry_components],
+        outputs=binding["regenerate_all_outputs"],
+        concurrency_id="gpu_queue",
+        concurrency_limit=1,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    regenerate_event = binding["regenerate"].click(
+        binding["regenerate_handler"],
+        inputs=[*binding["regenerate_inputs"], *registry_components],
+        outputs=binding["regenerate_outputs"],
+        concurrency_id="gpu_queue",
+        concurrency_limit=1,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    binding.update(
+        {
+            "wired": True,
+            "registry_components": registry_components,
+            "regenerate_event": regenerate_event,
+            "regenerate_all_event": regenerate_all_event,
+        }
+    )
 
 
 __all__ = [
@@ -1621,7 +2564,9 @@ __all__ = [
     "editor_export_handler",
     "editor_filter_handler",
     "editor_flag_handler",
+    "editor_page_gallery",
     "editor_save_handler",
+    "editor_thumbnail",
     "filter_items",
     "filtered_indices",
     "find_replace_preview",
@@ -1629,6 +2574,9 @@ __all__ = [
     "paginate_items",
     "pagination_math",
     "preview_find_replace",
+    "regeneration_prompt_choices",
+    "resolve_regeneration_prompt_choices",
     "resolve_media_from_metadata",
     "scan_folder",
+    "wire",
 ]

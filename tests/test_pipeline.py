@@ -703,7 +703,7 @@ def test_batch_directory_expansion_excludes_caption_sidecars(tmp_path: Path) -> 
         OutputSpec(kind="batch", outputs_root=tmp_path / "runs", source_root=source, recursive=True),
     )
     resolved = pipeline_runner._resolve_inputs(spec)
-    assert [entry.path.name for entry in resolved if entry.path is not None] == ["still.png"]
+    assert [entry.path.name for entry in resolved if entry.path is not None] == ["notes.md", "still.png"]
 
 
 def test_batch_trim_is_ignored_once(
@@ -756,7 +756,8 @@ def test_split_clips_are_temporary_and_subtitle_cues_only_get_replacements(
                 trainer_target="wan",
                 save_clips=False,
                 caption_prefix="PRE",
-                trigger_word="TRIG",
+                    trigger_word="TRIG",
+                    trigger_mode="prefix",
                 caption_suffix="POST",
                 replace_pairs=[["caption", "description"]],
                 output_formats=["txt", "srt"],

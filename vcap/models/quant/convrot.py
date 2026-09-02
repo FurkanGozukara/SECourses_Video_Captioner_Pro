@@ -37,7 +37,7 @@ _DTYPE_BYTES = {
     "U64": 8,
     "F64": 8,
 }
-_HADAMARD_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+_HADAMARD_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
 _HADAMARD_LOCK = threading.Lock()
 _KERNEL_CACHE_PATH = Path(__file__).with_name(".kernel_cache.json")
 _KERNEL_CACHE_LOCK = threading.Lock()
@@ -48,7 +48,7 @@ _TRITON_QUANT_KERNEL = None
 _TRITON_SILU_MUL_KERNEL = None
 _TRITON_ROUTE_REDUCE_KERNEL = None
 _TRITON_FAILED = False
-_DECODE_DISPATCH_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+_DECODE_DISPATCH_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
 def clear_device_caches() -> int:
@@ -147,7 +147,7 @@ def estimate_checkpoint_vram_gb(path: str | os.PathLike[str]) -> float:
 
 
 def _regular_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (size, str(device), dtype)
+    key = (size, torch.device(device), dtype)
     with _HADAMARD_LOCK:
         cached = _HADAMARD_CACHE.get(key)
         if cached is not None:
@@ -170,10 +170,15 @@ def _regular_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> to
         return matrix
 
 
-def _rotate_activation(x: torch.Tensor, group_size: int) -> torch.Tensor:
+def _rotate_activation(
+    x: torch.Tensor,
+    group_size: int,
+    matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
     if x.shape[-1] % group_size:
         raise ValueError(f"Input width {x.shape[-1]} is not divisible by ConvRot group {group_size}")
-    matrix = _regular_hadamard(group_size, x.device, x.dtype)
+    if matrix is None or matrix.device != x.device or matrix.dtype != x.dtype:
+        matrix = _regular_hadamard(group_size, x.device, x.dtype)
     shape = x.shape
     return x.reshape(-1, shape[-1] // group_size, group_size).matmul(matrix).reshape(shape)
 
@@ -614,7 +619,7 @@ def _grouped_dispatch(
 
     assignment_count = expert_ids.numel()
     if assignment_count <= 16:
-        key = (str(expert_ids.device), assignment_count)
+        key = (expert_ids.device, assignment_count)
         dispatch = _DECODE_DISPATCH_CACHE.get(key)
         if dispatch is None:
             dispatch = torch.arange(assignment_count, device=expert_ids.device, dtype=torch.int32)
@@ -815,9 +820,10 @@ def _quantized_linear(
     bias: torch.Tensor | None,
     scheme: str,
     group_size: int,
+    hadamard: torch.Tensor | None = None,
 ) -> torch.Tensor:
     shape = x.shape
-    rotated = _rotate_activation(x, group_size).reshape(-1, shape[-1])
+    rotated = _rotate_activation(x, group_size, hadamard).reshape(-1, shape[-1])
     kernel = "int_mm"
     if rotated.shape[0] <= 16:
         # Decode is latency-bound. The fused kernel consumes row-major INT8 or
@@ -846,14 +852,25 @@ class _ConvRotLinearBase(nn.Module):
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.group_size = int(group_size)
+        self.__dict__["_hadamard"] = None
         self.register_parameter(
             "bias",
             nn.Parameter(torch.empty(out_features, device=device), requires_grad=False) if bias else None,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        matrix = self.__dict__.get("_hadamard")
+        if matrix is None or matrix.device != x.device or matrix.dtype != x.dtype:
+            matrix = _regular_hadamard(self.group_size, x.device, x.dtype)
+            self.__dict__["_hadamard"] = matrix
         return _quantized_linear(
-            x, self.weight, self.weight_scale, self.bias, self.scheme, self.group_size
+            x,
+            self.weight,
+            self.weight_scale,
+            self.bias,
+            self.scheme,
+            self.group_size,
+            matrix,
         )
 
     def extra_repr(self) -> str:
@@ -891,8 +908,8 @@ class ConvRotInt4W4A8Linear(_ConvRotLinearBase):
         )
 
 
-class _FusedQKVProjection(nn.Module):
-    """One ConvRot projection shared by the Q/K/V proxy modules."""
+class _FusedProjection(nn.Module):
+    """One row-concatenated ConvRot projection shared by lightweight proxies."""
 
     def __init__(self, projections: tuple[_ConvRotLinearBase, ...]) -> None:
         super().__init__()
@@ -901,14 +918,39 @@ class _FusedQKVProjection(nn.Module):
         self.group_size = first.group_size
         self.in_features = first.in_features
         self.output_sizes = tuple(item.out_features for item in projections)
-        self.register_buffer("weight", torch.cat([item.weight for item in projections], dim=0))
-        self.register_buffer(
-            "weight_scale", torch.cat([item.weight_scale for item in projections], dim=0)
-        )
+        self.decode_only = len(projections) == 2
+        self.__dict__["_hadamard"] = first.__dict__.get("_hadamard")
+        device = first.weight.device
         biases = [item.bias for item in projections]
+        if device.type == "cuda":
+            # Staging one projection group through host memory avoids briefly
+            # owning both complete separate and concatenated CUDA buffers.
+            weight_parts = [item.weight.detach().cpu() for item in projections]
+            scale_parts = [item.weight_scale.detach().cpu() for item in projections]
+            bias_parts = (
+                [item.detach().cpu() for item in biases]
+                if all(item is not None for item in biases)
+                else None
+            )
+            for item in projections:
+                item._buffers["weight"] = torch.empty(0, dtype=item.weight.dtype)
+                item._buffers["weight_scale"] = torch.empty(
+                    0, dtype=item.weight_scale.dtype
+                )
+                if item.bias is not None:
+                    item._parameters["bias"] = None
+            weight = torch.cat(weight_parts, dim=0).to(device)
+            weight_scale = torch.cat(scale_parts, dim=0).to(device)
+            bias = torch.cat(bias_parts).to(device) if bias_parts is not None else None
+        else:
+            weight = torch.cat([item.weight for item in projections], dim=0)
+            weight_scale = torch.cat([item.weight_scale for item in projections], dim=0)
+            bias = torch.cat(biases) if all(item is not None for item in biases) else None
+        self.register_buffer("weight", weight)
+        self.register_buffer("weight_scale", weight_scale)
         self.register_parameter(
             "bias",
-            nn.Parameter(torch.cat(biases), requires_grad=False) if all(item is not None for item in biases) else None,
+            nn.Parameter(bias, requires_grad=False) if bias is not None else None,
         )
         self._cached_input: weakref.ReferenceType[torch.Tensor] | None = None
         self._cached_outputs: tuple[torch.Tensor, ...] | None = None
@@ -916,16 +958,41 @@ class _FusedQKVProjection(nn.Module):
     def project(self, index: int, x: torch.Tensor) -> torch.Tensor:
         cached_input = self._cached_input() if self._cached_input is not None else None
         if cached_input is not x or self._cached_outputs is None:
-            combined = _quantized_linear(
-                x,
-                self.weight,
-                self.weight_scale,
-                self.bias,
-                self.scheme,
-                self.group_size,
-            )
+            matrix = self.__dict__.get("_hadamard")
+            if matrix is None or matrix.device != x.device or matrix.dtype != x.dtype:
+                matrix = _regular_hadamard(self.group_size, x.device, x.dtype)
+                self.__dict__["_hadamard"] = matrix
             self._cached_input = weakref.ref(x)
-            self._cached_outputs = combined.split(self.output_sizes, dim=-1)
+            rows = x.numel() // max(1, int(x.shape[-1]))
+            if self.decode_only and rows > 16:
+                outputs: list[torch.Tensor] = []
+                start = 0
+                for size in self.output_sizes:
+                    stop = start + size
+                    outputs.append(
+                        _quantized_linear(
+                            x,
+                            self.weight[start:stop],
+                            self.weight_scale[start:stop],
+                            self.bias[start:stop] if self.bias is not None else None,
+                            self.scheme,
+                            self.group_size,
+                            matrix,
+                        )
+                    )
+                    start = stop
+                self._cached_outputs = tuple(outputs)
+            else:
+                combined = _quantized_linear(
+                    x,
+                    self.weight,
+                    self.weight_scale,
+                    self.bias,
+                    self.scheme,
+                    self.group_size,
+                    matrix,
+                )
+                self._cached_outputs = combined.split(self.output_sizes, dim=-1)
         output = self._cached_outputs[index]
         if index == len(self.output_sizes) - 1:
             self._cached_input = None
@@ -933,8 +1000,8 @@ class _FusedQKVProjection(nn.Module):
         return output
 
 
-class _QKVProjectionProxy(nn.Module):
-    def __init__(self, shared: _FusedQKVProjection, index: int, *, owner: bool) -> None:
+class _ProjectionProxy(nn.Module):
+    def __init__(self, shared: _FusedProjection, index: int, *, owner: bool) -> None:
         super().__init__()
         self.in_features = shared.in_features
         self.out_features = shared.output_sizes[index]
@@ -945,7 +1012,7 @@ class _QKVProjectionProxy(nn.Module):
         else:
             self.__dict__["_shared_ref"] = weakref.ref(shared)
 
-    def _shared(self) -> _FusedQKVProjection:
+    def _shared(self) -> _FusedProjection:
         owned = self._modules.get("shared")
         if owned is not None:
             return owned
@@ -959,27 +1026,31 @@ class _QKVProjectionProxy(nn.Module):
 
 
 def _fuse_quantized_qkv(model: nn.Module) -> int:
-    """Fuse adjacent Q/K/V ConvRot modules after their checkpoint tensors are loaded."""
+    """Fuse Q/K/V and dense gate/up ConvRot groups after loading their tensors."""
 
     fused = 0
     for module in list(model.modules()):
-        projections = tuple(getattr(module, name, None) for name in ("q_proj", "k_proj", "v_proj"))
-        if not all(isinstance(item, _ConvRotLinearBase) for item in projections):
-            continue
-        first = projections[0]
-        if any(
-            item.scheme != first.scheme
-            or item.group_size != first.group_size
-            or item.in_features != first.in_features
-            or (item.bias is None) != (first.bias is None)
-            for item in projections[1:]
-        ):
-            continue
-        shared = _FusedQKVProjection(projections)
-        module.q_proj = _QKVProjectionProxy(shared, 0, owner=True)
-        module.k_proj = _QKVProjectionProxy(shared, 1, owner=False)
-        module.v_proj = _QKVProjectionProxy(shared, 2, owner=False)
-        fused += 1
+        for names in (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")):
+            projections = tuple(getattr(module, name, None) for name in names)
+            if not all(isinstance(item, _ConvRotLinearBase) for item in projections):
+                continue
+            first = projections[0]
+            if any(
+                item.scheme != first.scheme
+                or item.group_size != first.group_size
+                or item.in_features != first.in_features
+                or (item.bias is None) != (first.bias is None)
+                for item in projections[1:]
+            ):
+                continue
+            shared = _FusedProjection(projections)
+            for index, name in enumerate(names):
+                setattr(
+                    module,
+                    name,
+                    _ProjectionProxy(shared, index, owner=index == 0),
+                )
+            fused += 1
     return fused
 
 
@@ -1062,6 +1133,7 @@ class _ConvRotExpertsBase(nn.Module):
         self.intermediate_dim = int(intermediate_dim)
         self.group_size = int(group_size)
         self.act_fn = act_fn
+        self.__dict__["_hadamard"] = None
         packed_divisor = 2 if self.scheme == "int4_convrot_w4a8" else 1
         self.register_buffer(
             "gate_up_weight",
@@ -1106,8 +1178,12 @@ class _ConvRotExpertsBase(nn.Module):
             expert_ids, self.num_experts, 16
         )
         packed = self.scheme == "int4_convrot_w4a8"
+        matrix = self.__dict__.get("_hadamard")
+        if matrix is None or matrix.device != hidden_states.device or matrix.dtype != hidden_states.dtype:
+            matrix = _regular_hadamard(self.group_size, hidden_states.device, hidden_states.dtype)
+            self.__dict__["_hadamard"] = matrix
 
-        rotated = _rotate_activation(hidden_states, self.group_size)
+        rotated = _rotate_activation(hidden_states, self.group_size, matrix)
         activation, activation_scale = _quantize_activation(rotated)
         gate_up = _triton_grouped_moe_mm(
             activation,
@@ -1133,7 +1209,7 @@ class _ConvRotExpertsBase(nn.Module):
         else:
             gate, up = gate_up.chunk(2, dim=-1)
             intermediate = self.act_fn(gate) * up
-        rotated_intermediate = _rotate_activation(intermediate, self.group_size)
+        rotated_intermediate = _rotate_activation(intermediate, self.group_size, matrix)
         intermediate_q, intermediate_scale = _quantize_activation(rotated_intermediate)
         current = _triton_grouped_moe_mm(
             intermediate_q,
@@ -1177,6 +1253,10 @@ class _ConvRotExpertsBase(nn.Module):
         sorted_weights = assignment_weights[order]
         unique, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
         output = torch.zeros_like(hidden_states)
+        matrix = self.__dict__.get("_hadamard")
+        if matrix is None or matrix.device != hidden_states.device or matrix.dtype != hidden_states.dtype:
+            matrix = _regular_hadamard(self.group_size, hidden_states.device, hidden_states.dtype)
+            self.__dict__["_hadamard"] = matrix
 
         # Copy the compact dispatch table once. Calling .item() for every id
         # and offset serializes the CUDA stream three times per active expert
@@ -1198,6 +1278,7 @@ class _ConvRotExpertsBase(nn.Module):
                 None,
                 self.scheme,
                 self.group_size,
+                matrix,
             )
             gate, up = gate_up.chunk(2, dim=-1)
             current = self.act_fn(gate) * up
@@ -1208,6 +1289,7 @@ class _ConvRotExpertsBase(nn.Module):
                 None,
                 self.scheme,
                 self.group_size,
+                matrix,
             )
             current = current * sorted_weights[begin:end, None]
             output.index_add_(0, token_index, current.to(output.dtype))
@@ -1424,6 +1506,50 @@ def _materialize_meta_buffers(
                 module._buffers[name] = rebuilt.to(device=module_device, dtype=value.dtype)
 
 
+def _cache_hadamard_on_modules(model: nn.Module, matrix: torch.Tensor) -> None:
+    """Give every ConvRot module a direct shared matrix reference for its hot path."""
+
+    module_types = (_ConvRotLinearBase, _FusedProjection, _ConvRotExpertsBase)
+    for module in model.modules():
+        if isinstance(module, module_types) and int(module.group_size) == int(matrix.shape[0]):
+            module.__dict__["_hadamard"] = matrix
+
+
+def _warm_fused_decode(model: nn.Module) -> None:
+    """Compile each distinct dense fused decode kernel before timed generation."""
+
+    warmed: set[tuple[Any, ...]] = set()
+    warm_device: torch.device | None = None
+    for module in model.modules():
+        if not isinstance(module, _FusedProjection) or not module.decode_only:
+            continue
+        if module.weight.device.type != "cuda":
+            continue
+        key = (
+            module.scheme,
+            module.group_size,
+            module.in_features,
+            module.output_sizes,
+            module.weight.device,
+            module.weight.dtype,
+        )
+        if key in warmed:
+            continue
+        warmed.add(key)
+        warm_device = module.weight.device
+        matrix = module.__dict__.get("_hadamard")
+        sample = torch.ones(
+            (1, module.in_features),
+            device=module.weight.device,
+            dtype=matrix.dtype if isinstance(matrix, torch.Tensor) else torch.bfloat16,
+        )
+        with torch.inference_mode():
+            module.project(0, sample)
+            module.project(1, sample)
+    if warm_device is not None:
+        torch.cuda.synchronize(warm_device)
+
+
 def apply_quantized_checkpoint(
     model: nn.Module,
     safetensors_path: str | os.PathLike[str],
@@ -1550,7 +1676,9 @@ def apply_quantized_checkpoint(
 
     if meta is not None:
         _fuse_quantized_qkv(model)
-        _regular_hadamard(meta.group_size, target_device, dtype)
+        matrix = _regular_hadamard(meta.group_size, target_device, dtype)
+        _cache_hadamard_on_modules(model, matrix)
+        _warm_fused_decode(model)
     _materialize_meta_buffers(model, target_device, layer_device)
     _move_non_meta_buffers(model, target_device, layer_device)
     if tower_offload is True or (meta is not None and tower_offload is None):
@@ -1570,7 +1698,7 @@ def apply_quantized_checkpoint(
         raise RuntimeError(f"Checkpoint load left meta tensors: {preview}")
     model.eval()
     if target_device.type == "cuda":
-        # QKV fusion briefly owns both the separate and concatenated buffers.
+        # Projection fusion briefly owns both the separate and concatenated buffers.
         # Return those staging blocks to CUDA before a near-capacity INT8 model
         # enters generation instead of letting WDDM page live expert weights.
         torch.cuda.empty_cache()

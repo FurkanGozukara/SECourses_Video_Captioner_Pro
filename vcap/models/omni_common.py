@@ -6,6 +6,7 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import queue
+import secrets
 import threading
 import time
 from typing import Any, Iterable, Mapping, Sequence
@@ -15,7 +16,13 @@ from PIL import Image, ImageOps
 
 from vcap.core import console_progress
 from vcap.core.logs import get_log
-from vcap.core.media import MediaInfo, probe_media, read_audio, read_video_frames
+from vcap.core.media import (
+    MediaInfo,
+    probe_media,
+    read_audio,
+    read_video_frames,
+    resample_audio,
+)
 from vcap.core.progress import TokenSpeedMeter
 from vcap.prompts.postprocess import (
     POST_PROCESSORS,
@@ -197,7 +204,10 @@ def _default_gen(family: str) -> GenParams:
         repetition_penalty=float(values.get("repetition_penalty", 1.0)),
         max_new_tokens=int(values.get("max_new_tokens", 2048)),
         do_sample=bool(values.get("do_sample", False)),
-        enable_thinking=bool(values.get("enable_thinking", True)),
+        use_cache=bool(values.get("use_cache", True)),
+        enable_thinking=bool(values.get("enable_thinking", False)),
+        seed=-1,
+        no_repeat_ngram_size=int(values.get("no_repeat_ngram_size", 0)),
     )
 
 
@@ -235,10 +245,56 @@ def _parts(media: MediaInput) -> list[MediaPart]:
     return list(media.parts) if media.parts else [_infer_part(media)]
 
 
-def _slice_audio(samples: np.ndarray, start: float | None, end: float | None) -> np.ndarray:
-    first = max(0, int(round(float(start or 0.0) * 16_000)))
-    last = len(samples) if end is None else max(first, int(round(float(end) * 16_000)))
+def _slice_audio(
+    samples: np.ndarray,
+    start: float | None,
+    end: float | None,
+    sample_rate: int = 16_000,
+) -> np.ndarray:
+    rate = max(1, int(sample_rate))
+    first = min(len(samples), max(0, int(round(float(start or 0.0) * rate))))
+    last = (
+        len(samples)
+        if end is None
+        else min(len(samples), max(first, int(round(float(end) * rate))))
+    )
     return np.ascontiguousarray(samples[first:last], dtype=np.float32)
+
+
+def _read_model_audio(
+    path: str | Path,
+    start: float | None,
+    end: float | None,
+) -> np.ndarray:
+    info = probe_media(path)
+    sample_rate = max(1, int(getattr(info, "audio_sample_rate", None) or 16_000))
+    try:
+        samples = read_audio(path, sample_rate=sample_rate)
+    except TypeError:
+        # Some lightweight third-party/test decoders expose the older one-argument API.
+        samples = read_audio(path)
+    sliced = _slice_audio(samples, start, end, sample_rate)
+    return resample_audio(sliced, sample_rate, 16_000)
+
+
+def _sampling_seed(gen: GenParams, callbacks: Callbacks, scope: str) -> int | None:
+    if not gen.do_sample:
+        return None
+    if gen.temperature <= 0:
+        warning = "Sampling is enabled but temperature is 0; greedy decoding is used."
+        get_log().warn(warning, scope=scope)
+        _callback(callbacks.progress, warning, level="warning")
+        return None
+    return int(gen.seed) if int(gen.seed) >= 0 else secrets.randbits(32)
+
+
+def _seed_torch(torch: Any, seed: int | None) -> None:
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    cuda = getattr(torch, "cuda", None)
+    if cuda is not None and callable(getattr(cuda, "manual_seed_all", None)):
+        cuda.manual_seed_all(seed)
 
 
 def _text_for_part(part: MediaPart) -> str:
@@ -350,20 +406,34 @@ class OmniCaptionerBase(BaseCaptioner):
                             f"{self.spec.label} supports clips up to {self.spec.limits.max_duration_s:g}s; split this input first"
                         )
                 frame_max_pixels = int(pre.max_pixels)
-                if self.size_multiple == 28:
-                    if pre.sampling_strategy in {"uniform", "keyframe"}:
-                        estimated_frames = int(pre.max_frames)
-                    else:
-                        estimated_frames = max(4, int(math.floor(max(0.0, duration) * pre.fps / 2.0)) * 2)
-                    estimated_frames = min(estimated_frames, pre.max_frames)
-                    if info.nb_frames:
-                        estimated_frames = min(estimated_frames, info.nb_frames)
-                    total_pixel_cap = 20_070_400
-                    adaptive_cap = max(
-                        min(602_112, int(total_pixel_cap / max(1, estimated_frames) * 2)),
-                        int((pre.min_pixels or self.spec.limits.min_pixels) * 1.05),
+                if pre.sampling_strategy in {"uniform", "keyframe"}:
+                    estimated_frames = int(pre.max_frames)
+                else:
+                    estimated_frames = max(
+                        4,
+                        int(math.floor(max(0.0, duration) * pre.fps / 2.0)) * 2,
                     )
-                    frame_max_pixels = min(frame_max_pixels, adaptive_cap)
+                estimated_frames = min(estimated_frames, pre.max_frames)
+                if info.nb_frames:
+                    estimated_frames = min(estimated_frames, info.nb_frames)
+                total_pixel_cap = int(pre.total_pixel_cap or 20_070_400)
+                family_frame_cap = 602_112 if self.size_multiple == 28 else frame_max_pixels
+                adaptive_cap = max(
+                    min(
+                        family_frame_cap,
+                        int(total_pixel_cap / max(1, estimated_frames) * 2),
+                    ),
+                    int((pre.min_pixels or self.spec.limits.min_pixels) * 1.05),
+                )
+                reduced_pixels = min(frame_max_pixels, adaptive_cap)
+                if reduced_pixels < frame_max_pixels:
+                    warning = (
+                        f"Total pixel cap {total_pixel_cap:,} reduced per-frame pixels from "
+                        f"{frame_max_pixels:,} to {reduced_pixels:,} for {part.path}."
+                    )
+                    prepared.warnings.append(warning)
+                    get_log().warn(warning, scope="caption")
+                frame_max_pixels = reduced_pixels
                 frames = read_video_frames(
                     part.path,
                     start=start,
@@ -375,6 +445,7 @@ class OmniCaptionerBase(BaseCaptioner):
                     min_pixels=pre.min_pixels or self.spec.limits.min_pixels,
                     size_multiple=self.size_multiple,
                     sampling=pre.sampling_strategy,
+                    adaptive_threshold=float(pre.adaptive_threshold),
                     round_frames_to=2,
                 )
                 prepared.content.append({"type": "video"})
@@ -383,7 +454,7 @@ class OmniCaptionerBase(BaseCaptioner):
                 prepared.video_infos.append(info)
                 if prepared.use_audio_in_video:
                     if info.has_audio:
-                        samples = _slice_audio(read_audio(part.path), start, end)
+                        samples = _read_model_audio(part.path, start, end)
                     else:
                         sample_count = max(1, int(round(max(duration, 0.01) * 16_000)))
                         samples = np.zeros(sample_count, dtype=np.float32)
@@ -401,7 +472,7 @@ class OmniCaptionerBase(BaseCaptioner):
                     prepared.warnings.append(warning)
                     get_log().warn(warning, scope="caption")
                 prepared.content.append({"type": "audio"})
-                prepared.audio.append(_slice_audio(read_audio(part.path), start, end))
+                prepared.audio.append(_read_model_audio(part.path, start, end))
             elif part.type == "image":
                 if part.path is None:
                     raise ValueError("Image parts require a path")
@@ -518,10 +589,13 @@ class OmniCaptionerBase(BaseCaptioner):
     def _stopping(self, prompt_tokens: int, callbacks: Callbacks, started: float) -> tuple[Any, Any]:
         import torch
         from transformers import StoppingCriteria, StoppingCriteriaList
+        from vcap.core.progress import UiThrottle
 
         meter = TokenSpeedMeter()
         state = {"first": None, "tokens": 0, "speed": 0.0}
         key = f"caption-generate-{id(state)}"
+        throttle = UiThrottle(0.1)
+        stop_result = torch.zeros(1, dtype=torch.bool, device=self.loaded.device)
 
         class ConsoleProgressStoppingCriteria(StoppingCriteria):
             def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
@@ -532,11 +606,19 @@ class OmniCaptionerBase(BaseCaptioner):
                     meter.start()
                 state["tokens"] = count
                 state["speed"] = meter.update(max(0, count - 1))
-                message = f"Generating: {count} tokens | {state['speed']:.2f} tok/s"
-                console_progress.show_progress_line(message, key=key)
-                _callback(callbacks.progress, message, new_tokens=count, tok_per_s=state["speed"])
                 stop = _cancelled(callbacks.cancel)
-                return torch.full((input_ids.shape[0],), stop, dtype=torch.bool, device=input_ids.device)
+                if throttle.should_emit(force=count <= 1 or stop):
+                    message = f"Generating: {count} tokens | {state['speed']:.2f} tok/s"
+                    console_progress.show_progress_line(message, key=key)
+                    _callback(
+                        callbacks.progress,
+                        message,
+                        new_tokens=count,
+                        tok_per_s=state["speed"],
+                    )
+                if stop:
+                    stop_result.fill_(True)
+                return stop_result
 
         return StoppingCriteriaList([ConsoleProgressStoppingCriteria()]), (state, key, started)
 
@@ -554,8 +636,8 @@ class OmniCaptionerBase(BaseCaptioner):
             native = timechat_parse(raw)
             post = PostResult(
                 text=post.text,
-                structured=native.structured,
-                segments=native.segments,
+                structured=post.structured if post.structured is not None else native.structured,
+                segments=post.segments,
             )
         return post, reasoning
 
@@ -611,6 +693,7 @@ class OmniCaptionerBase(BaseCaptioner):
         generation: dict[str, Any],
         callbacks: Callbacks,
         input_length: int,
+        seed: int | None,
     ) -> tuple[Any, dict[str, Any], float, float]:
         import torch
         from transformers import TextIteratorStreamer
@@ -638,6 +721,7 @@ class OmniCaptionerBase(BaseCaptioner):
                     self.loaded.dtype,
                 )
                 with torch.inference_mode(), runtime_context:
+                    _seed_torch(torch, seed)
                     shared["output"] = self.loaded.model.generate(
                         **inputs,
                         use_audio_in_video=prepared.use_audio_in_video,
@@ -837,6 +921,7 @@ class OmniCaptionerBase(BaseCaptioner):
                 top_p=float(generation_params.top_p),
                 top_k=int(generation_params.top_k),
             )
+        actual_seed = _sampling_seed(generation_params, callbacks, "chat")
         try:
             output, state, started, ended = self._stream_chat_generate(
                 inputs,
@@ -844,6 +929,7 @@ class OmniCaptionerBase(BaseCaptioner):
                 generation,
                 callbacks,
                 input_length,
+                actual_seed,
             )
         except Exception as exc:
             if (
@@ -869,6 +955,7 @@ class OmniCaptionerBase(BaseCaptioner):
                 generation,
                 callbacks,
                 input_length,
+                actual_seed,
             )
         _record_generation_memory(
             self.loaded,
@@ -931,7 +1018,7 @@ class OmniCaptionerBase(BaseCaptioner):
             text=answer,
             raw_text=raw,
             reasoning=reasoning,
-            usage=TokenUsage(prompt_tokens, new_tokens, finish_reason),
+            usage=TokenUsage(prompt_tokens, new_tokens, finish_reason, actual_seed),
             timing=CaptionTiming(prefill, decode, speed, elapsed, new_tokens),
             peak_vram_gb=float(peak),
             cancelled=cancelled,
@@ -953,11 +1040,28 @@ class OmniCaptionerBase(BaseCaptioner):
         """Decode media, process multimodal tensors, generate, and normalize output."""
 
         self._validate_loaded()
-        parts = _parts(media)
-        self._validate_capabilities(parts)
         pre = pre or _default_pre(self.spec.family)
         gen = gen or _default_gen(self.spec.family)
         cb = cb or Callbacks()
+        parts = _parts(media)
+        if (
+            pre.max_frames == 0
+            and self.spec.family.startswith("qwen3_omni_")
+            and any(part.type in {"video", "video_audio"} for part in parts)
+        ):
+            converted: list[MediaPart] = []
+            for part in parts:
+                if part.type not in {"video", "video_audio"}:
+                    converted.append(part)
+                    continue
+                if part.path is None or not probe_media(part.path).has_audio:
+                    raise ValueError("Visual frames are disabled, but the video has no audio track")
+                converted.append(replace(part, type="audio"))
+            parts = converted
+            message = "Visual frames disabled (Maximum frames = 0): captioning the audio track only."
+            get_log().log(message, scope="preprocess")
+            _callback(cb.progress, message)
+        self._validate_capabilities(parts)
         max_tokens = min(int(gen.max_new_tokens), self.spec.limits.max_new_tokens_cap)
         if max_tokens != gen.max_new_tokens:
             gen = replace(gen, max_new_tokens=max_tokens)
@@ -997,6 +1101,8 @@ class OmniCaptionerBase(BaseCaptioner):
             "use_cache": bool(gen.use_cache),
             "stopping_criteria": stopping,
         }
+        if int(gen.no_repeat_ngram_size) > 0:
+            generation["no_repeat_ngram_size"] = int(gen.no_repeat_ngram_size)
         generation_config = getattr(self.loaded.model, "generation_config", None)
         eos_token_ids = getattr(generation_config, "eos_token_id", None)
         if isinstance(eos_token_ids, int):
@@ -1021,9 +1127,11 @@ class OmniCaptionerBase(BaseCaptioner):
             )
         model = self.loaded.model
         _, runtime_context = resolve_attention(self.loaded.attention, self.spec.family, self.loaded.dtype)
+        actual_seed = _sampling_seed(gen, cb, "caption")
         try:
             try:
                 with torch.inference_mode(), runtime_context:
+                    _seed_torch(torch, actual_seed)
                     output = model.generate(
                         **inputs,
                         use_audio_in_video=prepared.use_audio_in_video,
@@ -1047,6 +1155,7 @@ class OmniCaptionerBase(BaseCaptioner):
                 state, progress_key, _ = timing_state
                 generation["stopping_criteria"] = stopping
                 with torch.inference_mode():
+                    _seed_torch(torch, actual_seed)
                     output = model.generate(
                         **inputs,
                         use_audio_in_video=prepared.use_audio_in_video,
@@ -1120,7 +1229,7 @@ class OmniCaptionerBase(BaseCaptioner):
             reasoning=reasoning,
             structured=post.structured,
             segments=list(post.segments),
-            usage=TokenUsage(prompt_tokens, new_tokens, finish_reason),
+            usage=TokenUsage(prompt_tokens, new_tokens, finish_reason, actual_seed),
             timing=CaptionTiming(prefill, decode, speed, elapsed, new_tokens),
             peak_vram_gb=float(peak),
             cancelled=cancelled,

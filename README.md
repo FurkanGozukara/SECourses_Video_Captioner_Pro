@@ -18,6 +18,8 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Use protected shipped presets that also cover Chat, apply any preset the moment it is selected, save writable user presets, auto-load the last-used preset, restore settings from `metadata.json` in Recover Settings, and persist global paths and preferences in `app_settings.json`.
 - Select one GPU or multiple data-parallel batch GPUs, apply tier-aware attention plans with automatic decoder block swap that keeps 2 GB of dedicated VRAM free instead of paging into Windows shared GPU memory, recover from supported OOM cases, inspect live VRAM/RAM/shared-memory and model health, and choose CUDA graphs or full `torch.compile` with fallbacks.
 - Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server` that fits itself to device memory, while 63.4 GB Qwen3 BF16 checkpoints run through pinned-RAM block swap on smaller GPUs.
+- Tune every backend value from the interface: seed, repetition guard (`no_repeat_ngram_size` and repeated-sentence removal), maximum caption characters and join separator, subtitle cue minimum and line wrapping, context carry words and wrapper prompt, re-encode codec/CRF/preset/audio bitrate (also used by trimming), rejection thresholds (black luma, silence RMS, analysis frames), adaptive sampling sensitivity, total pixel cap, OOM retries and degrade factor, planner slack and pinned RAM budget, the summary stage token limit, and the full llama.cpp option set (frames, JPEG quality, threads, batch sizes, flash attention, cache reuse, tier-context bypass, min-p, repeat window, presence/frequency penalties, fit headroom, startup/idle timeouts, extra arguments). Every clamp the backend still applies is logged.
+- Work faster after a run: Copy caption, Retry failed items, Results ZIP, Open in Caption Editor, Unload model, and a Run history panel that opens, edits, or recovers the settings of any earlier run. Folder batches accept a ZIP upload (extracted below `outputs/uploaded_batches`) and media-kind/file-name filters; a personal prompt library stores named system/user prompt pairs; System & Models can delete model files (with confirmation and on-disk size) and check for updates; Global Settings adds the logs directory and an FFmpeg path.
 
 ## Requirements
 
@@ -27,7 +29,7 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - An NVIDIA driver and CUDA 13 environment compatible with the supplied PyTorch 2.13.0+cu130 wheels. The Windows installer also expects cuDNN 9.17 or newer.
 - Git plus `ffmpeg` and `ffprobe` available on `PATH`.
 - Windows: Visual Studio Community/Build Tools with the MSVC C++ workload for full TorchInductor compilation. The app can fall back to Triton-only, CUDA graphs, or eager execution.
-- Linux GGUF users: CMake and a C++ toolchain are needed to build the pinned llama.cpp runtime because that release has no prebuilt Ubuntu CUDA archive.
+- Linux GGUF users: the CUDA toolkit with `nvcc`, CMake, and a C++ toolchain are required. The pinned llama.cpp release has no prebuilt Ubuntu CUDA archive, so the cloud installers build it automatically.
 
 Model downloads range from about 6.5 GB to 63.4 GB per variant. Leave additional disk space for the virtual environment, resumable partial files, outputs, and temporary media.
 
@@ -61,10 +63,8 @@ Start it later with:
 
 ```bash
 export HF_HOME="/workspace"
-cd /workspace/SECourses_Video_Captioner_Pro
-source venv/bin/activate
-unset LD_LIBRARY_PATH
-python secourses_app.py --share
+cd /workspace
+cd SECourses_Video_Captioner_Pro && git pull && source venv/bin/activate && unset LD_LIBRARY_PATH && python secourses_app.py --share
 ```
 
 ### Massed Compute or local Linux
@@ -79,13 +79,10 @@ chmod +x Massed_Compute_Install.sh
 Then launch from the repository:
 
 ```bash
-cd SECourses_Video_Captioner_Pro
-source venv/bin/activate
-unset LD_LIBRARY_PATH
-python secourses_app.py --share
+cd SECourses_Video_Captioner_Pro && git pull && source venv/bin/activate && unset LD_LIBRARY_PATH && python secourses_app.py --share
 ```
 
-Both shell installers use `apt-get` for missing Git, FFmpeg, CMake, and a C++ build toolchain when root or `sudo` is available, install Python 3.12 through `uv`, and create `SECourses_Video_Captioner_Pro/venv`. They preserve an existing `HF_HOME`; otherwise RunPod uses `/workspace` and Massed Compute/local Linux uses a `huggingface_cache` folder beside the installer.
+Both shell installers use `apt-get` for Git, FFmpeg, CMake, build-essential, and libcurl development files when needed. RunPod/SimplePod provisions a uv-managed Python 3.12; Massed Compute uses stable Python 3.12.13 or newer from deadsnakes when available and falls back to uv-managed 3.12.13. Both create `SECourses_Video_Captioner_Pro/venv`, install `video_caption_requirements.txt`, and attempt the pinned llama.cpp CUDA build without auto-starting the app. Set `HF_HOME` in the terminal as shown above or in the distribution instruction file.
 
 ## First Run and Models
 
@@ -105,7 +102,7 @@ On Linux/cloud, the equivalent menu is:
 SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py
 ```
 
-The downloader menu includes Qwen3-Omni Instruct, Thinking, and Captioner in both GGUF Q4_K_M and Q8_0 forms. On Linux the model files can be downloaded from this menu, but the pinned `llama-server` runtime must be built with CMake and a C++ compiler and selected with `VCAP_LLAMACPP_SERVER`; see [docs/GGUF_BACKEND.md](docs/GGUF_BACKEND.md).
+The downloader menu includes Qwen3-Omni Instruct, Thinking, and Captioner in both GGUF Q4_K_M and Q8_0 forms. On Linux the cloud installer automatically builds the pinned CUDA `llama-server`; if that best-effort step fails, use **System & Models -> Install / repair llama.cpp** to run the same installer again. Build output is retained in `llamacpp/downloads/b10621/build.log`; see [docs/GGUF_BACKEND.md](docs/GGUF_BACKEND.md) for the automatic layout and manual fallback.
 
 The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM tier that matches the physical GPU; the app then applies the associated precision, media budget, and attention plan. Decoder placement is automatic on every tier: at load time the app measures free VRAM, estimates the job's activation peak from the media it will process, keeps 2 GB free, and block-swaps the remaining decoder layers from pinned RAM through a prefetching ring of GPU slots (see [docs/BLOCK_SWAP.md](docs/BLOCK_SWAP.md)). The `Block swap & offload plan` section of the Model panel shows what that resolves to: with `Automatic block swap` on, the `Decoder layers to block-swap` slider displays the swapped-layer count the loader is expected to choose for the selected variant, GPU, media budget, and reserve, and the line under it reports the expected peak against free VRAM. Uncheck `Automatic block swap` to set the swapped count yourself (0 keeps the whole decoder on the GPU); `VRAM to keep free (GB)` and `Swap slots` tune the automatic plan.
 

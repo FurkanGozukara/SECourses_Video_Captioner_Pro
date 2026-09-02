@@ -30,7 +30,7 @@ def test_build_app_registry_and_presets_smoke(tmp_path: Path, monkeypatch) -> No
         assert defaults["pin_cpu"] is True
         entries = {entry.key: entry for entry in registry.entries()}
         assert entries["vram_reserve_gb"].section == "model"
-        assert entries["swap_slots"].choices == (2, 3)
+        assert entries["swap_slots"].choices == (1, 2, 3, 4)
         assert entries["blocks_to_swap"].maximum == 48
         # Presets saved before the block-swap controls existed still apply.
         legacy, legacy_warnings = registry.coerce(
@@ -55,7 +55,9 @@ def test_build_app_registry_and_presets_smoke(tmp_path: Path, monkeypatch) -> No
             if not entry.is_default:
                 continue
             shipped = demo.vcap_context.preset_store.load(entry.name)
-            assert chat_keys <= set(shipped), entry.name
+            # v1.4 controls are filled from registry defaults when loading
+            # presets written before those controls existed.
+            assert (chat_keys - {"chat_seed", "chat_repetition_penalty"}) <= set(shipped), entry.name
             _, warnings = registry.coerce(shipped)
             assert not warnings, (entry.name, warnings)
     finally:

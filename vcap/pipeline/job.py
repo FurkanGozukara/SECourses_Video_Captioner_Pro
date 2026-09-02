@@ -12,6 +12,23 @@ from typing import Any, Literal, Mapping, Sequence
 from vcap import OUTPUTS_DIR
 
 
+DEFAULT_SUMMARY_PROMPT = (
+    'You are given timestamped captions of consecutive segments of one video. Write (1) one '
+    'paragraph summarizing the whole video in {{LANGUAGE}}, then (2) a chapter list with one line '
+    'per chapter formatted as "MM:SS-MM:SS Title - one sentence". Use only information present '
+    "in the captions and keep the chronological order."
+)
+DEFAULT_CONTEXT_CARRY_PROMPT = "Context from the previous segment (do not repeat it): {{CONTEXT}}"
+
+_ENCODE_CODECS = frozenset({"libx264", "h264_nvenc", "libx265", "hevc_nvenc"})
+_ENCODE_PRESETS = frozenset(
+    {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower"}
+)
+_AUDIO_BITRATES = frozenset({"96k", "128k", "192k", "256k", "320k"})
+_GGUF_FLASH_ATTN = frozenset({"auto", "on", "off"})
+_MEDIA_KINDS = ("video", "audio", "image", "text")
+
+
 def _json_safe(value: Any) -> Any:
     if is_dataclass(value):
         return _json_safe(asdict(value))
@@ -140,6 +157,24 @@ def _formats(value: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(normalized))
 
 
+def _media_kinds(value: Any, default: Sequence[str] = _MEDIA_KINDS) -> tuple[str, ...]:
+    if value is None:
+        values: Sequence[Any] = default
+    elif isinstance(value, str):
+        values = [part for part in re.split(r"[\s,;]+", value) if part]
+    elif isinstance(value, Sequence):
+        values = value
+    else:
+        values = default
+    normalized = [str(item).strip().casefold() for item in values]
+    return tuple(dict.fromkeys(item for item in normalized if item in _MEDIA_KINDS))
+
+
+def _choice(value: Any, choices: frozenset[str], default: str) -> str:
+    selected = str(value or "").strip().casefold()
+    return selected if selected in choices else default
+
+
 def _replace_pairs(value: Any) -> tuple[tuple[str, str], ...]:
     if value is None:
         return ()
@@ -184,6 +219,8 @@ class OffloadSpec:
     pin_cpu: bool = True
     vram_reserve_gb: float = 2.0
     swap_slots: int = 2
+    pinned_ram_budget_gb: float = 0.0
+    plan_slack_mib: int = 512
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "gpu_layers", _gpu_layers(self.gpu_layers))
@@ -191,13 +228,23 @@ class OffloadSpec:
         object.__setattr__(self, "pin_cpu", _bool(self.pin_cpu, True))
         object.__setattr__(self, "vram_reserve_gb", max(0.0, _float(self.vram_reserve_gb, 2.0)))
         object.__setattr__(self, "swap_slots", max(1, min(4, _int(self.swap_slots, 2))))
+        object.__setattr__(
+            self,
+            "pinned_ram_budget_gb",
+            max(0.0, min(1024.0, _float(self.pinned_ram_budget_gb, 0.0))),
+        )
+        object.__setattr__(
+            self,
+            "plan_slack_mib",
+            max(0, min(8192, _int(self.plan_slack_mib, 512))),
+        )
 
 
 @dataclass(frozen=True)
 class ModelChoice:
     """Selected checkpoint and model-loading policy."""
 
-    variant_key: str = "qwen3_omni_instruct_int8"
+    variant_key: str = "qwen3_omni_instruct_int4"
     attention: str = "auto"
     vram_preset: str = "auto"
     offload: OffloadSpec = field(default_factory=OffloadSpec)
@@ -224,9 +271,19 @@ class GenParams:
     max_new_tokens: int = 2048
     do_sample: bool = False
     use_cache: bool = True
-    enable_thinking: bool = True
+    enable_thinking: bool = False
+    seed: int = -1
+    no_repeat_ngram_size: int = 0
     # Requested context window; None defers to the model's cap.
     context_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "seed", max(-1, min(2_147_483_647, _int(self.seed, -1))))
+        object.__setattr__(
+            self,
+            "no_repeat_ngram_size",
+            max(0, min(20, _int(self.no_repeat_ngram_size, 0))),
+        )
 
 
 @dataclass(frozen=True)
@@ -243,6 +300,23 @@ class PreprocessSpec:
     normalize_clip: bool = False
     use_audio_in_video: bool = True
     audio_sample_rate: int = 16_000
+    total_pixel_cap: int = 0
+    adaptive_threshold: float = 2.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_frames", max(0, _int(self.max_frames, 160)))
+        object.__setattr__(self, "max_pixels", max(1, _int(self.max_pixels, 297_920)))
+        object.__setattr__(self, "audio_sample_rate", max(1, _int(self.audio_sample_rate, 16_000)))
+        object.__setattr__(
+            self,
+            "total_pixel_cap",
+            max(0, min(400_000_000, _int(self.total_pixel_cap, 0))),
+        )
+        object.__setattr__(
+            self,
+            "adaptive_threshold",
+            max(0.1, min(50.0, _float(self.adaptive_threshold, 2.0))),
+        )
 
 
 @dataclass(frozen=True)
@@ -252,24 +326,54 @@ class SplitSpec:
     mode: Literal["whole", "scenes", "fixed", "trainer"] = "whole"
     cut_mode: Literal["copy", "precise"] = "copy"
     scene_threshold: float = 27.0
-    scene_min_len_s: float = 1.0
-    scene_max_len_s: float = 0.0
+    scene_min_len_s: float = 2.0
+    scene_max_len_s: float = 60.0
     merge_short_scenes: bool = True
-    merge_below_s: float = 1.0
+    merge_below_s: float = 2.0
     fade_detection: bool = False
+    fade_threshold: float = 12.0
     scene_detector: Literal["content", "adaptive", "threshold"] = "content"
     scene_downscale: int = 0
-    fixed_chunk_s: float = 0.0
+    fixed_chunk_s: float = 30.0
     model_max_duration_s: float | None = None
     trainer_target: Any = None
-    overlap_s: float = 0.0
+    overlap_s: float = 0.5
+    encode_codec: str = "libx264"
+    encode_crf: int = 18
+    encode_preset: str = "veryfast"
+    encode_audio_bitrate: str = "192k"
+    quality_frames: int = 8
     auto_reject: bool = False
     reject_min_duration_s: float = 0.0
-    reject_max_black_ratio: float = 1.0
+    reject_max_black_ratio: float = 0.98
     reject_max_static_score: float = -1.0
     reject_min_sharpness: float = 0.0
     reject_require_audio: bool = False
     reject_max_silence_ratio: float = 1.0
+    reject_black_luma: int = 16
+    reject_silence_rms: float = 0.001
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fade_threshold", max(1.0, min(100.0, _float(self.fade_threshold, 12.0))))
+        object.__setattr__(self, "encode_codec", _choice(self.encode_codec, _ENCODE_CODECS, "libx264"))
+        object.__setattr__(self, "encode_crf", max(0, min(51, _int(self.encode_crf, 18))))
+        object.__setattr__(self, "encode_preset", _choice(self.encode_preset, _ENCODE_PRESETS, "veryfast"))
+        object.__setattr__(
+            self,
+            "encode_audio_bitrate",
+            _choice(self.encode_audio_bitrate, _AUDIO_BITRATES, "192k"),
+        )
+        object.__setattr__(self, "quality_frames", max(4, min(32, _int(self.quality_frames, 8))))
+        object.__setattr__(
+            self,
+            "reject_black_luma",
+            max(0, min(255, _int(self.reject_black_luma, 16))),
+        )
+        object.__setattr__(
+            self,
+            "reject_silence_rms",
+            max(0.0, min(0.1, _float(self.reject_silence_rms, 0.001))),
+        )
 
 
 @dataclass(frozen=True)
@@ -279,18 +383,45 @@ class PostSpec:
     prefix: str = ""
     suffix: str = ""
     trigger: str = ""
-    trigger_mode: Literal["prefix", "suffix", "none"] = "prefix"
+    trigger_mode: Literal["prefix", "suffix", "none"] = "none"
     replace_pairs: tuple[tuple[str, str], ...] = ()
     replace_regex: bool = False
     replace_case_insensitive: bool = True
     replace_whole_words: bool = True
     collapse_whitespace: bool = False
     formats: tuple[str, ...] = ("txt",)
-    save_reasoning: bool = False
+    save_reasoning: bool = True
+    max_caption_chars: int = 0
+    dedupe_repeated_sentences: bool = True
+    subtitle_min_cue_s: float = 0.5
+    subtitle_max_line_chars: int = 0
+    join_separator: str = " "
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "formats", _formats(self.formats))
         object.__setattr__(self, "replace_pairs", _replace_pairs(self.replace_pairs))
+        object.__setattr__(
+            self,
+            "max_caption_chars",
+            max(0, min(100_000, _int(self.max_caption_chars, 0))),
+        )
+        object.__setattr__(
+            self,
+            "dedupe_repeated_sentences",
+            _bool(self.dedupe_repeated_sentences, True),
+        )
+        object.__setattr__(
+            self,
+            "subtitle_min_cue_s",
+            max(0.0, min(5.0, _float(self.subtitle_min_cue_s, 0.5))),
+        )
+        object.__setattr__(
+            self,
+            "subtitle_max_line_chars",
+            max(0, min(200, _int(self.subtitle_max_line_chars, 0))),
+        )
+        separator = " " if self.join_separator is None else str(self.join_separator)
+        object.__setattr__(self, "join_separator", separator[:16])
 
 
 @dataclass(frozen=True)
@@ -307,6 +438,8 @@ class OutputSpec:
     save_clips: bool = False
     recursive: bool = False
     limit_items: int = 0
+    include_kinds: tuple[str, ...] = _MEDIA_KINDS
+    name_filter: str = ""
 
     def __post_init__(self) -> None:
         selected = str(self.kind).casefold()
@@ -319,6 +452,8 @@ class OutputSpec:
         if self.source_root is not None:
             object.__setattr__(self, "source_root", os.fspath(self.source_root))
         object.__setattr__(self, "limit_items", max(0, int(self.limit_items)))
+        object.__setattr__(self, "include_kinds", _media_kinds(self.include_kinds))
+        object.__setattr__(self, "name_filter", str(self.name_filter or "").strip())
 
 
 @dataclass(frozen=True)
@@ -331,12 +466,99 @@ class RuntimeSpec:
     gpu_index: int = 0
     gpu_indices: tuple[int, ...] = ()
     compile: bool = False
+    oom_retries: int = 2
+    gguf_max_frames: int = 32
+    gguf_jpeg_quality: int = 90
+    gguf_threads: int = 0
+    gguf_batch_size: int = 2048
+    gguf_ubatch_size: int = 512
+    gguf_flash_attn: str = "auto"
+    gguf_cache_reuse: int = 0
+    gguf_ignore_tier_context: bool = False
+    gguf_extra_args: str = ""
+    oom_degrade_factor: float = 0.75
+    gguf_min_p: float = 0.05
+    gguf_repeat_last_n: int = 64
+    gguf_presence_penalty: float = 0.0
+    gguf_frequency_penalty: float = 0.0
+    gguf_fit_headroom_mib: int = 1536
+    gguf_startup_timeout_s: int = 900
+    gguf_stream_idle_timeout_s: int = 120
 
     def __post_init__(self) -> None:
         primary = max(0, int(self.gpu_index))
         indices = _gpu_indices(self.gpu_indices, primary)
         object.__setattr__(self, "gpu_index", primary)
         object.__setattr__(self, "gpu_indices", indices)
+        object.__setattr__(self, "oom_retries", max(0, min(4, _int(self.oom_retries, 2))))
+        object.__setattr__(self, "gguf_max_frames", max(1, min(128, _int(self.gguf_max_frames, 32))))
+        object.__setattr__(
+            self,
+            "gguf_jpeg_quality",
+            max(50, min(100, _int(self.gguf_jpeg_quality, 90))),
+        )
+        object.__setattr__(self, "gguf_threads", max(0, min(256, _int(self.gguf_threads, 0))))
+        object.__setattr__(
+            self,
+            "gguf_batch_size",
+            max(64, min(8192, _int(self.gguf_batch_size, 2048))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_ubatch_size",
+            max(32, min(4096, _int(self.gguf_ubatch_size, 512))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_flash_attn",
+            _choice(self.gguf_flash_attn, _GGUF_FLASH_ATTN, "auto"),
+        )
+        object.__setattr__(
+            self,
+            "gguf_cache_reuse",
+            max(0, min(4096, _int(self.gguf_cache_reuse, 0))),
+        )
+        object.__setattr__(self, "gguf_extra_args", str(self.gguf_extra_args or ""))
+        object.__setattr__(
+            self,
+            "oom_degrade_factor",
+            max(0.5, min(0.95, _float(self.oom_degrade_factor, 0.75))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_min_p",
+            max(0.0, min(1.0, _float(self.gguf_min_p, 0.05))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_repeat_last_n",
+            max(0, min(4096, _int(self.gguf_repeat_last_n, 64))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_presence_penalty",
+            max(-2.0, min(2.0, _float(self.gguf_presence_penalty, 0.0))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_frequency_penalty",
+            max(-2.0, min(2.0, _float(self.gguf_frequency_penalty, 0.0))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_fit_headroom_mib",
+            max(0, min(8192, _int(self.gguf_fit_headroom_mib, 1536))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_startup_timeout_s",
+            max(60, min(3600, _int(self.gguf_startup_timeout_s, 900))),
+        )
+        object.__setattr__(
+            self,
+            "gguf_stream_idle_timeout_s",
+            max(0, min(3600, _int(self.gguf_stream_idle_timeout_s, 120))),
+        )
 
 
 @dataclass(frozen=True)
@@ -353,8 +575,31 @@ class JobSpec:
     post: PostSpec = field(default_factory=PostSpec)
     runtime: RuntimeSpec = field(default_factory=RuntimeSpec)
     context_carry_over: bool = False
+    context_carry_words: int = 60
+    context_carry_prompt: str = DEFAULT_CONTEXT_CARRY_PROMPT
+    summarize_segments: bool = False
+    summary_prompt: str = DEFAULT_SUMMARY_PROMPT
+    summary_max_new_tokens: int = 1024
     settings: dict[str, Any] = field(default_factory=dict)
     internal: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "context_carry_words",
+            max(10, min(400, _int(self.context_carry_words, 60))),
+        )
+        object.__setattr__(self, "summary_prompt", str(self.summary_prompt or DEFAULT_SUMMARY_PROMPT))
+        object.__setattr__(
+            self,
+            "context_carry_prompt",
+            str(self.context_carry_prompt or DEFAULT_CONTEXT_CARRY_PROMPT),
+        )
+        object.__setattr__(
+            self,
+            "summary_max_new_tokens",
+            max(64, min(8192, _int(self.summary_max_new_tokens, 1024))),
+        )
 
     @property
     def gen(self) -> GenParams:
@@ -383,10 +628,12 @@ class JobSpec:
         )
         family_defaults: dict[str, Any] = {}
         default_preset: str | None = None
+        supports_audio_only = False
         try:
             from vcap.models.registry import MODEL_SPECS, variant_to_family
 
             model_spec = MODEL_SPECS[variant_to_family(variant_key)]
+            supports_audio_only = "audio" in model_spec.capabilities
             family_defaults = {item.name: item.default for item in model_spec.param_schema}
             family_defaults.update(
                 fps=model_spec.limits.default_fps,
@@ -482,6 +729,34 @@ class JobSpec:
                         ),
                     ),
                 ),
+                pinned_ram_budget_gb=max(
+                    0.0,
+                    min(
+                        1024.0,
+                        _float(
+                            _setting(
+                                source,
+                                "pinned_ram_budget_gb",
+                                default=offload_data.get("pinned_ram_budget_gb", 0.0),
+                            ),
+                            0.0,
+                        ),
+                    ),
+                ),
+                plan_slack_mib=max(
+                    0,
+                    min(
+                        8192,
+                        _int(
+                            _setting(
+                                source,
+                                "plan_slack_mib",
+                                default=offload_data.get("plan_slack_mib", 512),
+                            ),
+                            512,
+                        ),
+                    ),
+                ),
             ),
         )
 
@@ -510,15 +785,56 @@ class JobSpec:
         def generation_value(key: str, fallback: Any) -> Any:
             return _setting(source, key, default=preset_generation.get(key, family_defaults.get(key, fallback)))
 
+        def family_generation_default(key: str, fallback: Any) -> Any:
+            return family_defaults.get(key, fallback)
+
         generation = GenParams(
-            temperature=_float(generation_value("temperature", 0.0), 0.0),
-            top_p=_float(generation_value("top_p", 1.0), 1.0),
-            top_k=_int(generation_value("top_k", 0), 0),
-            repetition_penalty=_float(generation_value("repetition_penalty", 1.0), 1.0),
-            max_new_tokens=max(1, _int(generation_value("max_new_tokens", 2048), 2048)),
-            do_sample=_bool(generation_value("do_sample", False), False),
-            use_cache=_bool(generation_value("use_cache", True), True),
-            enable_thinking=_bool(generation_value("enable_thinking", True), True),
+            temperature=_float(
+                generation_value("temperature", 0.0),
+                _float(family_generation_default("temperature", 0.0), 0.0),
+            ),
+            top_p=_float(
+                generation_value("top_p", 1.0),
+                _float(family_generation_default("top_p", 1.0), 1.0),
+            ),
+            top_k=_int(
+                generation_value("top_k", 0),
+                _int(family_generation_default("top_k", 0), 0),
+            ),
+            repetition_penalty=_float(
+                generation_value("repetition_penalty", 1.0),
+                _float(family_generation_default("repetition_penalty", 1.0), 1.0),
+            ),
+            max_new_tokens=max(
+                1,
+                _int(
+                    generation_value("max_new_tokens", 2048),
+                    _int(family_generation_default("max_new_tokens", 2048), 2048),
+                ),
+            ),
+            do_sample=_bool(
+                generation_value("do_sample", False),
+                _bool(family_generation_default("do_sample", False), False),
+            ),
+            use_cache=_bool(
+                generation_value("use_cache", True),
+                _bool(family_generation_default("use_cache", True), True),
+            ),
+            enable_thinking=_bool(
+                generation_value("enable_thinking", False),
+                _bool(family_generation_default("enable_thinking", False), False),
+            ),
+            seed=max(
+                -1,
+                min(2_147_483_647, _int(_setting(source, "seed", default=-1), -1)),
+            ),
+            no_repeat_ngram_size=max(
+                0,
+                min(
+                    20,
+                    _int(_setting(source, "no_repeat_ngram_size", default=0), 0),
+                ),
+            ),
             context_tokens=_context_tokens(_setting(source, "context_tokens", default=None)),
         )
         # ``family_defaults["max_frames"]`` is the family cap; the UI keeps a
@@ -526,17 +842,26 @@ class JobSpec:
         # cap is enforced here instead.
         default_frames = max(1, _int(family_defaults.get("max_frames", 160), 160))
         selected_frames = _int(_setting(source, "max_frames", default=default_frames), default_frames)
-        if selected_frames <= 0:
-            selected_frames = default_frames
+        selected_frames = max(0, selected_frames)
+        if selected_frames == 0 and not supports_audio_only:
+            selected_frames = 4
         selected_frames = min(selected_frames, default_frames)
+        default_fps = max(0.01, _float(family_defaults.get("fps", 2.0), 2.0))
+        default_pixels = max(1, _int(family_defaults.get("max_pixels", 297_920), 297_920))
         preprocess = PreprocessSpec(
             trim_start_s=max(0.0, _float(_setting(source, "trim_start_s", "trim_start", default=0.0), 0.0)),
             trim_end_s=_optional_float(_setting(source, "trim_end_s", "trim_end", default=None)),
-            fps=max(0.01, _float(_setting(source, "fps", default=family_defaults.get("fps", 2.0)), 2.0)),
+            fps=max(0.01, _float(_setting(source, "fps", default=default_fps), default_fps)),
             max_frames=selected_frames,
-            max_pixels=max(1, _int(_setting(source, "max_pixels", default=family_defaults.get("max_pixels", 297_920)), 297_920)),
+            max_pixels=max(1, _int(_setting(source, "max_pixels", default=default_pixels), default_pixels)),
             min_pixels=(
-                max(1, _int(_setting(source, "min_pixels", default=family_defaults.get("min_pixels")), 1))
+                max(
+                    1,
+                    _int(
+                        _setting(source, "min_pixels", default=family_defaults.get("min_pixels")),
+                        max(1, _int(family_defaults.get("min_pixels", 1), 1)),
+                    ),
+                )
                 if _setting(source, "min_pixels", default=family_defaults.get("min_pixels")) is not None
                 else None
             ),
@@ -547,6 +872,20 @@ class JobSpec:
                 True,
             ),
             audio_sample_rate=max(1, _int(_setting(source, "audio_sample_rate", default=16_000), 16_000)),
+            total_pixel_cap=max(
+                0,
+                min(
+                    400_000_000,
+                    _int(_setting(source, "total_pixel_cap", default=0), 0),
+                ),
+            ),
+            adaptive_threshold=max(
+                0.1,
+                min(
+                    50.0,
+                    _float(_setting(source, "adaptive_threshold", default=2.0), 2.0),
+                ),
+            ),
         )
 
         raw_segment_mode = str(_setting(source, "segment_mode", "segmentation_mode", default="")).casefold()
@@ -567,39 +906,110 @@ class JobSpec:
             mode=raw_segment_mode,  # type: ignore[arg-type]
             cut_mode=cut_mode,  # type: ignore[arg-type]
             scene_threshold=_float(_setting(source, "scene_threshold", default=scene_data.get("threshold", 27.0)), 27.0),
-            scene_min_len_s=max(0.0, _float(_setting(source, "scene_min_len_s", default=scene_data.get("min_scene_len_s", 1.0)), 1.0)),
-            scene_max_len_s=max(0.0, _float(_setting(source, "scene_max_len_s", default=scene_data.get("max_scene_len_s", 0.0)), 0.0)),
+            scene_min_len_s=max(0.0, _float(_setting(source, "scene_min_len_s", default=scene_data.get("min_scene_len_s", 2.0)), 2.0)),
+            scene_max_len_s=max(0.0, _float(_setting(source, "scene_max_len_s", default=scene_data.get("max_scene_len_s", 60.0)), 60.0)),
             merge_short_scenes=_bool(_setting(source, "merge_short_scenes", default=scene_data.get("merge_short_scenes", True)), True),
-            merge_below_s=max(0.0, _float(_setting(source, "merge_below_s", default=scene_data.get("merge_below_s", 1.0)), 1.0)),
+            merge_below_s=max(0.0, _float(_setting(source, "merge_below_s", default=scene_data.get("merge_below_s", 2.0)), 2.0)),
             fade_detection=_bool(_setting(source, "fade_detection", default=scene_data.get("fade_detection", False))),
+            fade_threshold=max(
+                1.0,
+                min(
+                    100.0,
+                    _float(
+                        _setting(source, "fade_threshold", default=scene_data.get("fade_threshold", 12.0)),
+                        12.0,
+                    ),
+                ),
+            ),
             scene_detector=str(_setting(source, "scene_detector", default=scene_data.get("detector", "content"))),  # type: ignore[arg-type]
             scene_downscale=max(0, _int(_setting(source, "scene_downscale", default=scene_data.get("downscale", 0)), 0)),
-            fixed_chunk_s=max(0.0, _float(_setting(source, "fixed_chunk_s", "chunk_s", default=0.0), 0.0)),
+            fixed_chunk_s=max(0.0, _float(_setting(source, "fixed_chunk_s", "chunk_s", default=30.0), 30.0)),
             model_max_duration_s=_optional_float(
                 _setting(source, "model_max_duration_s", "max_clip_duration_s", default=None)
             ),
             trainer_target=_setting(source, "trainer_target", default=None),
-            overlap_s=max(0.0, _float(_setting(source, "sub_split_overlap_s", "overlap_s", default=0.0), 0.0)),
+            overlap_s=max(0.0, _float(_setting(source, "sub_split_overlap_s", "overlap_s", default=0.5), 0.5)),
+            encode_codec=_choice(
+                _setting(source, "encode_codec", default="libx264"),
+                _ENCODE_CODECS,
+                "libx264",
+            ),
+            encode_crf=max(0, min(51, _int(_setting(source, "encode_crf", default=18), 18))),
+            encode_preset=_choice(
+                _setting(source, "encode_preset", default="veryfast"),
+                _ENCODE_PRESETS,
+                "veryfast",
+            ),
+            encode_audio_bitrate=_choice(
+                _setting(source, "encode_audio_bitrate", default="192k"),
+                _AUDIO_BITRATES,
+                "192k",
+            ),
+            quality_frames=max(
+                4,
+                min(32, _int(_setting(source, "quality_frames", default=8), 8)),
+            ),
             auto_reject=_bool(_setting(source, "auto_reject", "auto_reject_enabled", default=False)),
             reject_min_duration_s=max(0.0, _float(_setting(source, "reject_min_duration_s", default=0.0), 0.0)),
-            reject_max_black_ratio=_float(_setting(source, "reject_max_black_ratio", default=1.0), 1.0),
+            reject_max_black_ratio=_float(_setting(source, "reject_max_black_ratio", default=0.98), 0.98),
             reject_max_static_score=_float(_setting(source, "reject_max_static_score", default=-1.0), -1.0),
             reject_min_sharpness=max(0.0, _float(_setting(source, "reject_min_sharpness", default=0.0), 0.0)),
             reject_require_audio=_bool(_setting(source, "reject_require_audio", default=False)),
             reject_max_silence_ratio=_float(_setting(source, "reject_max_silence_ratio", default=1.0), 1.0),
+            reject_black_luma=max(
+                0,
+                min(255, _int(_setting(source, "reject_black_luma", default=16), 16)),
+            ),
+            reject_silence_rms=max(
+                0.0,
+                min(
+                    0.1,
+                    _float(_setting(source, "reject_silence_rms", default=0.001), 0.001),
+                ),
+            ),
         )
         post = PostSpec(
             prefix=str(_setting(source, "caption_prefix", "prefix", default="") or ""),
             suffix=str(_setting(source, "caption_suffix", "suffix", default="") or ""),
             trigger=str(_setting(source, "trigger_word", "trigger", default="") or ""),
-            trigger_mode=str(_setting(source, "trigger_mode", default="prefix")),  # type: ignore[arg-type]
+            trigger_mode=str(_setting(source, "trigger_mode", default="none")),  # type: ignore[arg-type]
             replace_pairs=_replace_pairs(_setting(source, "replace_pairs", "replace_words", default=())),
             replace_regex=_bool(_setting(source, "replace_regex", "regex_replace", default=False)),
             replace_case_insensitive=_bool(_setting(source, "replace_case_insensitive", default=True), True),
             replace_whole_words=_bool(_setting(source, "replace_whole_words", "replace_whole_words_only", default=True), True),
             collapse_whitespace=_bool(_setting(source, "collapse_whitespace", default=False)),
             formats=_formats(_setting(source, "output_formats", "formats", default=("txt",))),
-            save_reasoning=_bool(_setting(source, "save_reasoning", default=False)),
+            save_reasoning=_bool(_setting(source, "save_reasoning", default=True), True),
+            max_caption_chars=max(
+                0,
+                min(
+                    100_000,
+                    _int(_setting(source, "max_caption_chars", default=0), 0),
+                ),
+            ),
+            dedupe_repeated_sentences=_bool(
+                _setting(source, "dedupe_repeated_sentences", default=True),
+                True,
+            ),
+            subtitle_min_cue_s=max(
+                0.0,
+                min(
+                    5.0,
+                    _float(_setting(source, "subtitle_min_cue_s", default=0.5), 0.5),
+                ),
+            ),
+            subtitle_max_line_chars=max(
+                0,
+                min(
+                    200,
+                    _int(_setting(source, "subtitle_max_line_chars", default=0), 0),
+                ),
+            ),
+            join_separator=(
+                " "
+                if _setting(source, "caption_join_separator", "join_separator", default=" ") is None
+                else str(_setting(source, "caption_join_separator", "join_separator", default=" "))
+            )[:16],
         )
         resolved_output = replace(
             output,
@@ -611,6 +1021,17 @@ class JobSpec:
             save_clips=_bool(_setting(source, "save_clips", default=output.save_clips), output.save_clips),
             mirror_names=_bool(_setting(source, "mirror_names", default=output.mirror_names), output.mirror_names),
             recursive=_bool(_setting(source, "recursive", "batch_recursive", default=output.recursive), output.recursive),
+            include_kinds=_media_kinds(
+                _setting(
+                    source,
+                    "batch_include_kinds",
+                    default=output.include_kinds,
+                ),
+                output.include_kinds,
+            ),
+            name_filter=str(
+                _setting(source, "batch_name_filter", default=output.name_filter) or ""
+            ).strip(),
         )
         gpu_index = max(0, _int(_setting(source, "gpu_index", default=0), 0))
         runtime = RuntimeSpec(
@@ -620,6 +1041,94 @@ class JobSpec:
             gpu_index=gpu_index,
             gpu_indices=_gpu_indices(_setting(source, "gpu_indices", "multi_gpu_indices", default=None), gpu_index),
             compile=_bool(_setting(source, "compile", "torch_compile", default=False)),
+            oom_retries=max(0, min(4, _int(_setting(source, "oom_retries", default=2), 2))),
+            gguf_max_frames=max(
+                1,
+                min(128, _int(_setting(source, "gguf_max_frames", default=32), 32)),
+            ),
+            gguf_jpeg_quality=max(
+                50,
+                min(100, _int(_setting(source, "gguf_jpeg_quality", default=90), 90)),
+            ),
+            gguf_threads=max(
+                0,
+                min(256, _int(_setting(source, "gguf_threads", default=0), 0)),
+            ),
+            gguf_batch_size=max(
+                64,
+                min(8192, _int(_setting(source, "gguf_batch_size", default=2048), 2048)),
+            ),
+            gguf_ubatch_size=max(
+                32,
+                min(4096, _int(_setting(source, "gguf_ubatch_size", default=512), 512)),
+            ),
+            gguf_flash_attn=_choice(
+                _setting(source, "gguf_flash_attn", default="auto"),
+                _GGUF_FLASH_ATTN,
+                "auto",
+            ),
+            gguf_cache_reuse=max(
+                0,
+                min(4096, _int(_setting(source, "gguf_cache_reuse", default=0), 0)),
+            ),
+            gguf_ignore_tier_context=_bool(
+                _setting(source, "gguf_ignore_tier_context", default=False),
+                False,
+            ),
+            gguf_extra_args=str(_setting(source, "gguf_extra_args", default="") or ""),
+            oom_degrade_factor=max(
+                0.5,
+                min(
+                    0.95,
+                    _float(_setting(source, "oom_degrade_factor", default=0.75), 0.75),
+                ),
+            ),
+            gguf_min_p=max(
+                0.0,
+                min(1.0, _float(_setting(source, "gguf_min_p", default=0.05), 0.05)),
+            ),
+            gguf_repeat_last_n=max(
+                0,
+                min(
+                    4096,
+                    _int(_setting(source, "gguf_repeat_last_n", default=64), 64),
+                ),
+            ),
+            gguf_presence_penalty=max(
+                -2.0,
+                min(
+                    2.0,
+                    _float(_setting(source, "gguf_presence_penalty", default=0.0), 0.0),
+                ),
+            ),
+            gguf_frequency_penalty=max(
+                -2.0,
+                min(
+                    2.0,
+                    _float(_setting(source, "gguf_frequency_penalty", default=0.0), 0.0),
+                ),
+            ),
+            gguf_fit_headroom_mib=max(
+                0,
+                min(
+                    8192,
+                    _int(_setting(source, "gguf_fit_headroom_mib", default=1536), 1536),
+                ),
+            ),
+            gguf_startup_timeout_s=max(
+                60,
+                min(
+                    3600,
+                    _int(_setting(source, "gguf_startup_timeout_s", default=900), 900),
+                ),
+            ),
+            gguf_stream_idle_timeout_s=max(
+                0,
+                min(
+                    3600,
+                    _int(_setting(source, "gguf_stream_idle_timeout_s", default=120), 120),
+                ),
+            ),
         )
         return cls(
             inputs=[item if isinstance(item, InputItem) else InputItem(**item) for item in inputs],
@@ -632,6 +1141,29 @@ class JobSpec:
             post=post,
             runtime=runtime,
             context_carry_over=_bool(_setting(source, "context_carry_over", default=False), False),
+            context_carry_words=max(
+                10,
+                min(400, _int(_setting(source, "context_carry_words", default=60), 60)),
+            ),
+            context_carry_prompt=str(
+                _setting(source, "context_carry_prompt", default=DEFAULT_CONTEXT_CARRY_PROMPT)
+                or DEFAULT_CONTEXT_CARRY_PROMPT
+            ),
+            summarize_segments=_bool(
+                _setting(source, "summarize_segments", default=False),
+                False,
+            ),
+            summary_prompt=str(
+                _setting(source, "summary_prompt", default=DEFAULT_SUMMARY_PROMPT)
+                or DEFAULT_SUMMARY_PROMPT
+            ),
+            summary_max_new_tokens=max(
+                64,
+                min(
+                    8192,
+                    _int(_setting(source, "summary_max_new_tokens", default=1024), 1024),
+                ),
+            ),
             settings=_json_safe(source),
         )
 
@@ -672,6 +1204,19 @@ class JobSpec:
             post=PostSpec(**post_data),
             runtime=RuntimeSpec(**runtime_data),
             context_carry_over=_bool(data.get("context_carry_over"), False),
+            context_carry_words=max(
+                10,
+                min(400, _int(data.get("context_carry_words"), 60)),
+            ),
+            context_carry_prompt=str(
+                data.get("context_carry_prompt") or DEFAULT_CONTEXT_CARRY_PROMPT
+            ),
+            summarize_segments=_bool(data.get("summarize_segments"), False),
+            summary_prompt=str(data.get("summary_prompt") or DEFAULT_SUMMARY_PROMPT),
+            summary_max_new_tokens=max(
+                64,
+                min(8192, _int(data.get("summary_max_new_tokens"), 1024)),
+            ),
             settings=dict(data.get("settings") or {}),
             internal=dict(data.get("internal") or {}),
         )
@@ -698,6 +1243,9 @@ class ItemResult:
     peak_vram_gb: float = 0.0
     traceback_tail: str = ""
     gpu_index: int | None = None
+    summary: str = ""
+    summary_usage: dict[str, Any] = field(default_factory=dict)
+    summary_timing: dict[str, Any] = field(default_factory=dict)
 
     def __getitem__(self, key: str) -> Any:
         """Allow lightweight mapping-style access in UI table adapters."""
@@ -744,6 +1292,8 @@ class JobResult:
 
 
 __all__ = [
+    "DEFAULT_CONTEXT_CARRY_PROMPT",
+    "DEFAULT_SUMMARY_PROMPT",
     "GenParams",
     "InputItem",
     "ItemResult",

@@ -7,24 +7,29 @@ is comfortably newer than the b8775 minimum needed for Qwen3-Omni audio.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 import zipfile
 
 import requests
 
 from vcap import APP_DIR
 from vcap.core.logs import get_log, setup_utf8_stdio
-from vcap.core.subprocess_runner import CancelledError, build_child_env
+from vcap.core.subprocess_runner import CancelledError, build_child_env, kill_process_tree
 
 
 ProgressCallback = Callable[..., None]
@@ -311,6 +316,220 @@ def _find_binary(folder: Path, stem: str) -> Path | None:
     )
 
 
+def _run_streaming_command(
+    command: Sequence[str | os.PathLike[str]],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    label: str,
+    progress_cb: ProgressCallback | None,
+    cancel: object | None,
+) -> None:
+    """Run one build command while mirroring its combined output to log/UI."""
+
+    if _cancelled(cancel):
+        raise CancelledError(f"llama.cpp build cancelled before {label}")
+    argv = [os.fspath(value) for value in command]
+    rendered = shlex.join(argv)
+    _emit(progress_cb, f"{label}: {rendered}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    popen_kwargs: dict[str, Any] = {}
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    with log_path.open("a", encoding="utf-8", newline="\n") as log_handle:
+        log_handle.write(f"\n$ {rendered}\n")
+        log_handle.flush()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            message = f"Could not start llama.cpp {label}: {exc}"
+            log_handle.write(f"ERROR: {message}\n")
+            raise RuntimeError(message) from exc
+
+        assert process.stdout is not None
+        output: "queue.Queue[str | None]" = queue.Queue()
+
+        def read_output() -> None:
+            try:
+                for raw in iter(process.stdout.readline, ""):
+                    output.put(raw)
+            finally:
+                output.put(None)
+
+        reader = threading.Thread(
+            target=read_output,
+            name=f"vcap-llamacpp-{label.replace(' ', '-')}-output",
+            daemon=True,
+        )
+        reader.start()
+        tail: deque[str] = deque(maxlen=40)
+        was_cancelled = False
+        while True:
+            if _cancelled(cancel):
+                was_cancelled = True
+                kill_process_tree(process.pid)
+                break
+            try:
+                raw = output.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None and not reader.is_alive():
+                    break
+                continue
+            if raw is None:
+                break
+            line = raw.rstrip("\r\n")
+            log_handle.write(raw if raw.endswith(("\n", "\r")) else raw + "\n")
+            log_handle.flush()
+            if line:
+                tail.append(line)
+                _emit(progress_cb, f"{label}: {line}")
+
+        reader.join(timeout=2.0)
+        process.stdout.close()
+        try:
+            return_code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            kill_process_tree(process.pid)
+            return_code = -1
+
+        if was_cancelled:
+            message = f"llama.cpp build cancelled during {label}"
+            log_handle.write(f"ERROR: {message}\n")
+            raise CancelledError(message)
+        if return_code != 0:
+            detail = "\n".join(tail)
+            message = f"llama.cpp {label} failed with exit code {return_code}. See {log_path}."
+            if detail:
+                message += f"\nLast output:\n{detail}"
+            log_handle.write(f"ERROR: {message}\n")
+            raise RuntimeError(message)
+
+
+def _find_nvcc(fallback: Path | None = None) -> Path:
+    """Locate the CUDA compiler without allowing a CPU-only fallback."""
+
+    on_path = shutil.which("nvcc")
+    if on_path:
+        return Path(on_path).resolve(strict=False)
+    candidate = fallback or Path("/usr/local/cuda/bin/nvcc")
+    if candidate.is_file():
+        return candidate.resolve(strict=False)
+    raise RuntimeError(
+        "CUDA toolkit compiler nvcc was not found on PATH or at "
+        "/usr/local/cuda/bin/nvcc. Install the NVIDIA CUDA toolkit (the driver "
+        "alone is not enough), then retry from the System & Models tab."
+    )
+
+
+def _detect_cuda_architectures() -> list[str]:
+    """Return installed GPUs' real CUDA architecture targets without raising."""
+
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except Exception:
+        return []
+    if getattr(completed, "returncode", 1) != 0:
+        return []
+    architectures: list[str] = []
+    for line in str(getattr(completed, "stdout", "") or "").splitlines():
+        match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", line)
+        if not match:
+            continue
+        value = f"{int(match.group(1))}{int(match.group(2))}-real"
+        if value not in architectures:
+            architectures.append(value)
+    return architectures
+
+
+def _linux_build_commands(
+    install_root: Path,
+    *,
+    jobs: int | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    source = install_root / "src" / LLAMACPP_TAG
+    build = install_root / "build" / LLAMACPP_TAG
+    clone = [
+        "git",
+        "clone",
+        "--branch",
+        LLAMACPP_TAG,
+        "--depth",
+        "1",
+        "https://github.com/ggml-org/llama.cpp.git",
+        str(source),
+    ]
+    configure = [
+        "cmake",
+        "-S",
+        str(source),
+        "-B",
+        str(build),
+        "-DGGML_CUDA=ON",
+        "-DGGML_NATIVE=OFF",
+        "-DLLAMA_CURL=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+    override = os.environ.get("VCAP_LLAMACPP_CUDA_ARCHS")
+    if override is not None and override.strip():
+        architecture_value = override
+    else:
+        detected = _detect_cuda_architectures()
+        architecture_value = ";".join(detected)
+    if architecture_value:
+        configure.append(f"-DCMAKE_CUDA_ARCHITECTURES={architecture_value}")
+        get_log().log(
+            f"Building llama.cpp for CUDA architectures: {architecture_value}",
+            scope="llama.cpp",
+        )
+    else:
+        get_log().warn(
+            "CUDA architecture detection failed; llama.cpp will build the full default "
+            "architecture list (slow).",
+            scope="llama.cpp",
+        )
+    compile_command = [
+        "cmake",
+        "--build",
+        str(build),
+        "--config",
+        "Release",
+        "-j",
+        str(max(1, int(jobs if jobs is not None else (os.cpu_count() or 1)))),
+        "--target",
+        "llama-server",
+        "llama-mtmd-cli",
+    ]
+    return clone, configure, compile_command
+
+
 def _version_build(server: Path) -> tuple[int, str]:
     try:
         completed = subprocess.run(
@@ -349,6 +568,153 @@ def _validate_install(folder: Path) -> Path:
         raise RuntimeError(
             f"llama.cpp b{build} is too old for Qwen3-Omni audio; b{MIN_QWEN3_OMNI_BUILD}+ is required.\n{output}"
         )
+    return server
+
+
+def _build_linux_cuda(
+    root: Path,
+    target: Path,
+    *,
+    progress_cb: ProgressCallback | None,
+    cancel: object | None,
+) -> Path:
+    """Build the pinned Linux CUDA tools and atomically activate them."""
+
+    download_dir = root / "downloads" / LLAMACPP_TAG
+    download_dir.mkdir(parents=True, exist_ok=True)
+    log_path = download_dir / "build.log"
+    log_path.write_text(
+        f"SECourses Video Captioner Pro llama.cpp {LLAMACPP_TAG} Linux CUDA build\n",
+        encoding="utf-8",
+    )
+    source = root / "src" / LLAMACPP_TAG
+    build = root / "build" / LLAMACPP_TAG
+    clone_command, configure_command, compile_command = _linux_build_commands(root)
+    root.mkdir(parents=True, exist_ok=True)
+    source.parent.mkdir(parents=True, exist_ok=True)
+
+    _emit(progress_cb, f"Preparing llama.cpp {LLAMACPP_TAG} Linux CUDA source build")
+    if source.exists():
+        _emit(progress_cb, f"Reusing llama.cpp source at {source}")
+    else:
+        _run_streaming_command(
+            clone_command,
+            cwd=root,
+            env=build_child_env(),
+            log_path=log_path,
+            label="Cloning llama.cpp",
+            progress_cb=progress_cb,
+            cancel=cancel,
+        )
+
+    if _cancelled(cancel):
+        raise CancelledError("llama.cpp build cancelled before CUDA toolkit discovery")
+    nvcc = _find_nvcc()
+    _emit(progress_cb, f"Using CUDA compiler: {nvcc}")
+    build_env = build_child_env(extra={"CUDACXX": str(nvcc)})
+
+    _run_streaming_command(
+        configure_command,
+        cwd=root,
+        env=build_env,
+        log_path=log_path,
+        label="Configuring llama.cpp CUDA build",
+        progress_cb=progress_cb,
+        cancel=cancel,
+    )
+    _run_streaming_command(
+        compile_command,
+        cwd=root,
+        env=build_env,
+        log_path=log_path,
+        label="Building llama.cpp CUDA tools",
+        progress_cb=progress_cb,
+        cancel=cancel,
+    )
+
+    build_bin = build / "bin"
+    binaries: list[Path] = []
+    for stem in ("llama-server", "llama-mtmd-cli"):
+        binary = _find_binary(build_bin, stem) if build_bin.is_dir() else None
+        if binary is None:
+            raise RuntimeError(
+                f"llama.cpp build completed but {stem} was not found under {build_bin}. "
+                f"See {log_path}."
+            )
+        binaries.append(binary)
+    libraries = sorted(
+        (path for path in build_bin.rglob("lib*.so*") if path.is_file()),
+        key=lambda path: (path.name.casefold(), str(path).casefold()),
+    )
+
+    staging = root / f".{LLAMACPP_TAG}.building.{os.getpid()}"
+    backup = root / f".{LLAMACPP_TAG}.previous.{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        copied_names: set[str] = set()
+        for source_file in [*binaries, *libraries]:
+            if _cancelled(cancel):
+                raise CancelledError("llama.cpp build cancelled while installing files")
+            if source_file.name in copied_names:
+                continue
+            copied_names.add(source_file.name)
+            destination = staging / source_file.name
+            shutil.copy2(source_file, destination)
+            _emit(progress_cb, f"Installing {source_file.name}")
+        for binary in binaries:
+            destination = staging / binary.name
+            destination.chmod(
+                destination.stat().st_mode
+                | stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH
+            )
+
+        if _cancelled(cancel):
+            raise CancelledError("llama.cpp build cancelled before verification")
+        _emit(progress_cb, "Verifying the built llama.cpp server and multimodal CLI")
+        staged_server = _validate_install(staging)
+        staged_build, version_text = _version_build(staged_server)
+        metadata = {
+            "tag": LLAMACPP_TAG,
+            "build": staged_build,
+            "minimum_build": MIN_QWEN3_OMNI_BUILD,
+            "version_output": version_text,
+            "source": "https://github.com/ggml-org/llama.cpp.git",
+            "source_path": str(source),
+            "build_path": str(build),
+            "cuda_compiler": str(nvcc),
+            "build_log": str(log_path),
+            "cmake_options": configure_command[5:],
+        }
+        (staging / "vcap_install.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if target.exists():
+            if backup.exists():
+                shutil.rmtree(backup)
+            target.rename(backup)
+        staging.rename(target)
+        if backup.exists():
+            shutil.rmtree(backup)
+    except Exception:
+        if not target.exists() and backup.exists():
+            backup.rename(target)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    server = _validate_install(target)
+    build_number, _ = _version_build(server)
+    _emit(
+        progress_cb,
+        f"llama.cpp b{build_number} Linux CUDA build installed at {target}",
+        fraction=1.0,
+    )
     return server
 
 
@@ -448,11 +814,15 @@ def ensure_llamacpp(
     elif sys.platform.startswith("linux"):
         assets = _linux_cuda_assets(remote_assets)
         if not assets:
-            raise RuntimeError(
-                f"llama.cpp {LLAMACPP_TAG} publishes no Ubuntu x64 CUDA archive. "
-                "Build llama-server and llama-mtmd-cli with GGML_CUDA=ON, set "
-                "VCAP_LLAMACPP_SERVER to the resulting llama-server, then use -hf or "
-                "the app's local --model/--mmproj files. See docs/GGUF_BACKEND.md."
+            _emit(
+                progress_cb,
+                f"llama.cpp {LLAMACPP_TAG} has no Ubuntu x64 CUDA archive; building from source.",
+            )
+            return _build_linux_cuda(
+                root,
+                target,
+                progress_cb=progress_cb,
+                cancel=cancel,
             )
     else:
         raise RuntimeError(
@@ -524,6 +894,11 @@ def ensure_llamacpp(
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install the pinned llama.cpp CUDA runtime")
+    parser.add_argument(
+        "--build-if-needed",
+        action="store_true",
+        help="reuse a runnable pinned server, otherwise install or build it",
+    )
     parser.add_argument("--force", action="store_true", help="replace an existing pinned build")
     args = parser.parse_args(argv)
     setup_utf8_stdio()

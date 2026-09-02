@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 from pathlib import Path
 from typing import Sequence
 

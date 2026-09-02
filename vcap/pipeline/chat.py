@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import math
 import os
 from pathlib import Path
+import secrets
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -37,6 +38,14 @@ def _json_safe(value: Any) -> Any:
     import json
 
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _seed_value(value: Any) -> int:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        parsed = -1
+    return max(-1, min(2_147_483_647, parsed))
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,7 @@ class ChatResponse:
     context_tokens: int = 0
     retained_history: tuple[ChatMessage, ...] = ()
     context_limit: int = 0
+    seed: int | None = None
 
     @classmethod
     def from_result(cls, model_key: str, result: ChatResult) -> "ChatResponse":
@@ -120,6 +130,7 @@ class ChatResponse:
             context_tokens=int(result.context_tokens),
             retained_history=tuple(result.retained_history),
             context_limit=int(getattr(result, "context_limit", 0) or 0),
+            seed=getattr(result.usage, "seed", None),
         )
 
     @classmethod
@@ -206,6 +217,35 @@ def _partial_thinking(raw: str) -> tuple[str, str]:
     if stripped and "<think>".startswith(stripped):
         return "", ""
     return "", raw[leading:]
+
+
+def _publish_terminal(response: ChatResponse, publish: EventCallback) -> None:
+    """Always publish the authoritative final usage after streamed callbacks."""
+
+    detail = (
+        "stopped by EOS"
+        if response.finish_reason == "eos"
+        else f"reached the token limit"
+        if response.finish_reason == "length"
+        else "cancelled"
+    )
+    publish(
+        {
+            "ev": "status",
+            "message": (
+                f"Chat finished: {response.new_tokens} new tokens in "
+                f"{response.total_s:.1f}s ({detail})"
+            ),
+            "data": {
+                "new_tokens": response.new_tokens,
+                "tok_per_s": response.tokens_per_s,
+                "finish_reason": response.finish_reason,
+                "cancelled": response.cancelled,
+                "prompt_tokens": response.context_tokens or response.prompt_tokens,
+                "context_limit": response.context_limit,
+            },
+        }
+    )
 
 
 class _StreamAccumulator:
@@ -314,6 +354,20 @@ def _fake_chat(request: ChatRequest, emit: EventCallback, cancel: CancelToken) -
     elapsed = time.perf_counter() - started
     cancelled = _is_cancelled(cancel)
     tokens = max(1, math.ceil((len(built) + len(built_reasoning)) / 4))
+    temperature = float(
+        request.generation.get(
+            "temperature",
+            request.settings.get("chat_temperature", 0.2),
+        )
+        or 0.0
+    )
+    sampled = bool(request.generation.get("do_sample", temperature > 0)) and temperature > 0
+    configured_seed = _seed_value(
+        request.generation.get("seed", request.settings.get("chat_seed", -1))
+    )
+    actual_seed = (
+        configured_seed if configured_seed >= 0 else secrets.randbits(32)
+    ) if sampled else None
     return ChatResponse(
         model_key=model_key,
         text=built,
@@ -329,6 +383,7 @@ def _fake_chat(request: ChatRequest, emit: EventCallback, cancel: CancelToken) -
         peak_vram_gb=0.0,
         cancelled=cancelled,
         retained_history=request.history,
+        seed=actual_seed,
     )
 
 
@@ -364,6 +419,19 @@ def run_chat(
             selected.system_prompt,
         )
     publish({"ev": "status", "message": f"Preparing chat with {MODEL_SPECS[family].label}", "data": {}})
+    preview_values = dict(selected.generation)
+    preview_temperature = float(
+        preview_values.get("temperature", settings.get("chat_temperature", 0.2)) or 0.0
+    )
+    if bool(preview_values.get("do_sample", preview_temperature > 0)) and preview_temperature <= 0:
+        publish(
+            {
+                "ev": "log",
+                "text": "Sampling is enabled but temperature is 0; greedy decoding is used.",
+                "level": "warning",
+                "scope": "chat",
+            }
+        )
     if os.environ.get("VCAP_FAKE_CHAT", os.environ.get("VCAP_FAKE_CAPTIONER", "")).strip().casefold() in {
         "1",
         "true",
@@ -371,7 +439,7 @@ def run_chat(
         "on",
     }:
         response = _fake_chat(selected, publish, token)
-        publish({"ev": "status", "message": "Mock chat finished", "data": {"finish_reason": response.finish_reason}})
+        _publish_terminal(response, publish)
         return response
 
     from vcap.pipeline.job import InputItem, JobSpec, OutputSpec
@@ -402,7 +470,11 @@ def run_chat(
         top_p=float(values.get("top_p", settings.get("chat_top_p", 0.95)) or 1.0),
         top_k=int(values.get("top_k", settings.get("chat_top_k", 20)) or 0),
         repetition_penalty=float(
-            values.get("repetition_penalty", settings.get("repetition_penalty", 1.0)) or 1.0
+            values.get(
+                "repetition_penalty",
+                settings.get("chat_repetition_penalty", 1.0),
+            )
+            or 1.0
         ),
         max_new_tokens=max(
             1,
@@ -411,8 +483,9 @@ def run_chat(
         do_sample=bool(values.get("do_sample", temperature > 0)),
         use_cache=bool(values.get("use_cache", True)),
         enable_thinking=bool(
-            values.get("enable_thinking", settings.get("chat_enable_thinking", True))
+            values.get("enable_thinking", settings.get("chat_enable_thinking", False))
         ),
+        seed=_seed_value(values.get("seed", settings.get("chat_seed", -1))),
         context_tokens=requested_context if requested_context > 0 else None,
     )
     pre = job.preprocess
@@ -423,6 +496,8 @@ def run_chat(
         max_pixels=pre.max_pixels,
         min_pixels=pre.min_pixels,
         use_audio_in_video=pre.use_audio_in_video,
+        total_pixel_cap=pre.total_pixel_cap,
+        adaptive_threshold=pre.adaptive_threshold,
         start=pre.trim_start_s or None,
         end=pre.trim_end_s,
     )
@@ -445,6 +520,7 @@ def run_chat(
             cb=Callbacks(progress=progress, delta=accumulator, cancel=token),
         )
         response = ChatResponse.from_result(model_key, result)
+        _publish_terminal(response, publish)
         return response
     finally:
         if not job.runtime.keep_model_loaded:

@@ -47,6 +47,16 @@ class OffloadPlan:
     swap_slots: int = field(
         default=2, metadata={"description": "GPU staging slots for block swap (2 = one layer of prefetch)."}
     )
+    pinned_ram_budget_gb: float = field(
+        default=0.0,
+        metadata={
+            "description": "Maximum pinned host RAM in GiB; zero keeps 6 GiB of total RAM free."
+        },
+    )
+    plan_slack_mib: int = field(
+        default=512,
+        metadata={"description": "Fixed CUDA allocator slack included in the block-swap VRAM plan."},
+    )
 
     def __post_init__(self) -> None:
         value = self.gpu_layers
@@ -64,6 +74,14 @@ class OffloadPlan:
         slots = self.swap_slots
         if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 4:
             raise ValueError("swap_slots must be an integer between 1 and 4")
+        pinned_budget = float(self.pinned_ram_budget_gb)
+        if pinned_budget < 0.0 or not math.isfinite(pinned_budget):
+            raise ValueError("pinned_ram_budget_gb must be a non-negative number")
+        object.__setattr__(self, "pinned_ram_budget_gb", min(1024.0, pinned_budget))
+        slack_mib = int(self.plan_slack_mib)
+        if not 0 <= slack_mib <= 8192:
+            raise ValueError("plan_slack_mib must be between 0 and 8192")
+        object.__setattr__(self, "plan_slack_mib", slack_mib)
 
     @property
     def uses_legacy_offload(self) -> bool:
@@ -307,6 +325,7 @@ def plan_model_folder(
     free_vram_bytes: int,
     total_vram_bytes: int,
     ram_available_bytes: int | None = None,
+    ram_total_bytes: int | None = None,
 ) -> BlockSwapBudget:
     """Resolve the residency plan for a local checkpoint folder without loading it.
 
@@ -333,6 +352,7 @@ def plan_model_folder(
         total_vram_bytes=total_vram_bytes,
         activation_bytes=activation,
         ram_available_bytes=ram_available_bytes,
+        ram_total_bytes=ram_total_bytes,
     )
 
 
@@ -441,6 +461,19 @@ def vram_budget_gb(
     snapshot = resource_snapshot(int(gpu_index))
     free = float(snapshot.get("vram_free_gb", 0.0) or 0.0)
     return max(0.0, free - max(0.0, reserve_gb) - max(0.0, kv_gb) - max(0.0, vision_peak_gb))
+
+
+def pinned_ram_budget_bytes(
+    plan: OffloadPlan,
+    total_ram_bytes: int,
+) -> int:
+    """Resolve the user pin limit; zero leaves 6 GiB of total host RAM unpinned."""
+
+    total = max(0, int(total_ram_bytes))
+    requested = max(0.0, float(plan.pinned_ram_budget_gb))
+    if requested > 0:
+        return min(total, int(requested * 2**30))
+    return max(0, total - 6 * 2**30)
 
 
 def checkpoint_layout(
@@ -679,12 +712,8 @@ def observed_activation_ratio(variant_key: str) -> float:
     return min(OBSERVED_RATIO_MAX, max(OBSERVED_RATIO_MIN, ratio))
 
 
-# The CUDA caching allocator keeps cached segments and workspace pools that never show up
-# in ``max_memory_allocated``; measured runs ended about 0.5-1 GiB below the reserve target
-# without this term. It is budgeted like activations so the reserve is met against real
-# free VRAM rather than against allocated bytes.
-ALLOCATOR_SLACK_BYTES = 512 * 2**20
-# Cached-but-unallocated segments scale with the transient prefill volume: measured at
+# The fixed allocator allowance comes from ``OffloadPlan.plan_slack_mib``. Cached-but-
+# unallocated segments also scale with the transient prefill volume: measured at
 # 0.6-0.85x the activation peak across the tier matrix on Windows (no expandable segments).
 ALLOCATOR_SLACK_RATIO = 0.5
 
@@ -697,6 +726,7 @@ def plan_block_swap(
     total_vram_bytes: int,
     activation_bytes: int,
     ram_available_bytes: int | None = None,
+    ram_total_bytes: int | None = None,
 ) -> BlockSwapBudget:
     """Resolve the resident/swapped decoder-layer split for one load."""
 
@@ -708,7 +738,7 @@ def plan_block_swap(
     free = max(0, int(free_vram_bytes))
     total = max(0, int(total_vram_bytes))
     activation = max(0, int(activation_bytes))
-    slack = ALLOCATOR_SLACK_BYTES + int(ALLOCATOR_SLACK_RATIO * activation)
+    slack = int(plan.plan_slack_mib) * mib + int(ALLOCATOR_SLACK_RATIO * activation)
     reserve = max(0, int(float(plan.vram_reserve_gb) * gib))
     tower_bytes = max(0, min(int(getattr(layout, "tower_bytes", 0) or 0), non_layer_bytes))
     # With the towers staged on CPU between prefills, the decode phase no longer holds them;
@@ -826,11 +856,16 @@ def plan_block_swap(
         )
 
     if ram_available_bytes is not None:
-        safe_ram = int(ram_available_bytes) - 4 * gib
+        configured_limit = pinned_ram_budget_bytes(
+            plan,
+            ram_total_bytes if ram_total_bytes is not None else ram_available_bytes,
+        )
+        safe_ram = min(max(0, int(ram_available_bytes)), max(0, configured_limit))
         if pinned_bytes > safe_ram:
             notes.append(
                 f"Swapped layers need {pinned_bytes / gib:.2f} GiB of pinned RAM, but only "
-                f"{max(0, safe_ram) / gib:.2f} GiB is available after the 4 GiB host reserve; "
+                f"{max(0, safe_ram) / gib:.2f} GiB is allowed by the pinned RAM budget and "
+                "currently available; "
                 "some layers will stay pageable."
             )
 
@@ -939,6 +974,7 @@ __all__ = [
     "plan_block_swap",
     "plan_model_folder",
     "planning_config",
+    "pinned_ram_budget_bytes",
     "record_observed_activation_bytes",
     "vram_budget_gb",
 ]

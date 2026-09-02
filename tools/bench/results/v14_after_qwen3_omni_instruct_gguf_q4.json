@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:10:05.127527+03:00",
+  "summary": {
+    "variant": "qwen3_omni_instruct_gguf_q4",
+    "checkpoint_gb": 19.88207408,
+    "load_s": 15.408808100037277,
+    "peak_vram_gib": 24.940292358398438,
+    "prefill_tok_s_mean": 2913.7766467338424,
+    "decode_tok_s_mean": 237.73792365640924,
+    "generated_tokens_mean": 113,
+    "wall_clock_s_mean": 7.72383420006372,
+    "finish_reason": "eos",
+    "caption_preview": "The video opens on a dark, nighttime scene of a street intersection, with the only illumination coming from streetlights, vehicle headlights, and taillights. Cars are seen moving through the intersect",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "qwen3_omni_instruct_gguf_q4",
+    "family": "qwen3_omni_instruct",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "unfused_gate_up_control": false,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "llamacpp",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 128,
+      "sampling_strategy": "fps",
+      "max_pixels": 262144,
+      "min_pixels": 4096,
+      "use_audio_in_video": true,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 15.408808100037277,
+    "peak_vram_gb": 24.161762237548828,
+    "checkpoint_bytes": 19882074080,
+    "attention": "llamacpp",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 0,
+    "bf16_layers": 0,
+    "compile_mode": "llama.cpp",
+    "warnings": [],
+    "block_swap": {
+      "backend": "llamacpp",
+      "mode": "fit",
+      "fit": true,
+      "fit_target_mib": 3584,
+      "requested_gpu_layers": null,
+      "requested_n_cpu_moe": null,
+      "requested_context_size": 32768,
+      "context_tier_ignored": false,
+      "context_was_clamped": false,
+      "n_gpu_layers": null,
+      "n_cpu_moe": null,
+      "n_ctx": 32768
+    },
+    "resident_bytes": 0,
+    "activation_estimate_bytes": 0,
+    "vram_cap_bytes": 0
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 8514,
+      "generated_tokens": 113,
+      "finish_reason": "eos",
+      "prefill_s": 2.921981,
+      "decode_s": 0.47110700000000005,
+      "prefill_tok_s": 2913.7766467338424,
+      "decode_tok_s": 237.73792365640924,
+      "generation_s": 3.5676536000100896,
+      "wall_clock_s": 7.72383420006372,
+      "peak_vram_gib": 24.940292358398438,
+      "caption_chars": 556,
+      "caption_preview": "The video opens on a dark, nighttime scene of a street intersection, with the only illumination coming from streetlights, vehicle headlights, and taillights. Cars are seen moving through the intersect",
+      "caption": "The video opens on a dark, nighttime scene of a street intersection, with the only illumination coming from streetlights, vehicle headlights, and taillights. Cars are seen moving through the intersection, their lights creating streaks and reflections on the wet road surface. The camera remains static throughout the clip. At approximately 00:09, a bright flash of lightning illuminates the sky in the distance, followed by a loud clap of thunder. The scene then returns to the dark, rainy night, with the wet road continuing to reflect the ambient lights.",
+      "reasoning_chars": 0,
+      "warnings": [
+        "GGUF frame count capped from 41 to 32 by GGUF maximum frames.",
+        "GGUF frame plan selected 32 of 41 frame(s) at 2 fps (fps); estimated 256 tokens/frame and 261 audio tokens.",
+        "Video used 32 chronological still frames plus separate audio; frame/audio tokens are not interleaved by timestamp."
+      ]
+    }
+  ]
+}

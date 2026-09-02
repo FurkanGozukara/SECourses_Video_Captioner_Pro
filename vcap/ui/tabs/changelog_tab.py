@@ -12,6 +12,22 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.4.0",
+        "2026-09-02",
+        """
+### Every parameter exposed, confirmed cancellation, leaner decode loop, user-requested features
+
+- Every backend value a user can reasonably tune is now a Gradio control with a description, saved in presets and run metadata: seed, maximum caption characters, context carry words and wrapper prompt, fade threshold, re-encode codec/CRF/preset/audio bitrate (now honored by trimming too), quality-analysis frame count with black-luma and silence-RMS thresholds, adaptive sampling sensitivity, total pixel cap, OOM retries and degrade factor, pinned RAM budget and planner slack, subtitle minimum cue length and line wrapping, summary token limit, caption join separator, a repetition guard (`no_repeat_ngram_size` plus repeated-sentence removal), and the complete llama.cpp option set (frames, JPEG quality, threads, batch sizes, flash attention, cache reuse, tier-context bypass, min-p, repeat window, presence/frequency penalties, fit headroom, startup and idle timeouts, extra arguments). Controls that llama.cpp cannot use are disabled with a hint when a GGUF variant is selected.
+- Every silent clamp now logs a warning (frame cap, per-frame pixel ceiling, maximum-new-tokens cap, GGUF context tier and frame budget, encoder fallback); `Maximum frames = 0` captions the audio track only on Qwen3-Omni; every extraction sample rate is resampled correctly for the model; the Generation slider follows the selected family's token cap; the 32 GB tier and the default preset select the fully resident INT4 Qwen3-Omni build.
+- Cancel asks for confirmation with explicit **Yes, cancel** / **Keep running** buttons (mouse and `Esc`) and stops the worker; deleting model files asks the same way.
+- New in the Caption tab: Unload model, Open in Caption Editor, Copy caption, Retry failed, Results ZIP, a Run history panel (open folder, open in editor, recover settings), ZIP upload for folder batches, batch media-kind and file-name filters, a personal prompt library, sampled-frame preview, long-video summary and chapters stage, and TimeChat flatten variants (motion+camera, audiovisual, speech SRT, chapters).
+- New elsewhere: chat prompt presets, seed and repetition penalty; editor thumbnail gallery, dataset statistics, trainer token-limit flags, regenerate-all-in-filter, ZIP export; System & Models model deletion with on-disk size, update check, logs folder button; Global Settings logs directory and FFmpeg path.
+- Decode loop: per-token console/UI work is throttled (bit-identical output), GGUF streaming reads whole HTTP chunks and starts `llama-server` with `--no-webui -np 1`, and ConvRot fuses gate/up projections and caches Hadamard matrices. Before/after tables and the static-cache/CUDA-graph investigation are in docs/QUANT_PERF.md.
+- Cloud installers follow the proven Upscaler Pro v8 flow (Python 3.12 via deadsnakes or uv, `uv pip install`), build llama.cpp with CUDA on Linux for the installed GPU architectures only, and never auto-start the app. `CUDA_DEVICE_ORDER=PCI_BUS_ID` is set everywhere so GPU indices match `nvidia-smi`.
+- Fixed from the live Chrome verification on an RTX 5090: the input mode now follows the selected input tab and inputs are resolved at Start; model and preset dropdowns reject unknown values and keep their labels; word replacements preserve capitalization; chat shows final token statistics for short replies; the first Start after a model change is no longer swallowed; editor regeneration receives every registered setting and always offers a compatible prompt preset; Retry failed covers unreadable items; status lines include unsupported and cancelled counts; Recover Settings opens on the newest run. See docs/QA_VERIFICATION_v1.4.0.md.
+""".strip(),
+    ),
+    (
         "v1.3.2",
         "2026-09-02",
         """

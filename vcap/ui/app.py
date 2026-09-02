@@ -170,7 +170,8 @@ def build_app() -> gr.Blocks:
                 )
 
         preset_bar(context)
-        with gr.Tabs(selected="caption", elem_id="vc-main-tabs"):
+        with gr.Tabs(selected="caption", elem_id="vc-main-tabs") as main_tabs:
+            context.states["main_tabs"] = main_tabs
             # Renders both "🎬 Caption" and its sibling "🎞️ Processing Pipeline".
             caption_tab.build(context)
             with gr.Tab("💬 Chat", id="chat"):
@@ -181,16 +182,29 @@ def build_app() -> gr.Blocks:
                 dataset_tab.build(context)
             with gr.Tab("⚙️ Global Settings", id="settings"):
                 settings_tab.build(context)
-            with gr.Tab("🔁 Recover Settings", id="recover"):
+            with gr.Tab("🔁 Recover Settings", id="recover") as recover_component:
+                context.states["recover_tab_component"] = recover_component
                 recover_tab.build(context)
             with gr.Tab("🩺 System & Models", id="health"):
                 health_tab.build(context)
             with gr.Tab("📜 Changelog", id="changelog", render_children=False):
                 changelog_tab.build(context)
 
+        editor_tab.wire(context)
+        recover_tab.wire(context)
         caption_tab.wire(context)
         chat_tab.wire(context)
         wire_preset_bar(context, demo)
+
+        history_binding = context.states.get("run_history_binding")
+        if isinstance(history_binding, dict):
+            demo.load(
+                history_binding["refresh_fn"],
+                outputs=history_binding["refresh_outputs"],
+                queue=False,
+                show_progress="hidden",
+                api_visibility="private",
+            )
 
         theme_component = context.states["theme_component"]
 

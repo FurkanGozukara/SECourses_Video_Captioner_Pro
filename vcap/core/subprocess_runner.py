@@ -71,6 +71,7 @@ def build_child_env(
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     if gpu_index is not None:
         env.update(cuda_visible_devices_env(gpu_index))

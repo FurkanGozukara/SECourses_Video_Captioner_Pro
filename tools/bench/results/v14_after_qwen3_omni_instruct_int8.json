@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:28:02.536188+03:00",
+  "summary": {
+    "variant": "qwen3_omni_instruct_int8",
+    "checkpoint_gb": 33.03135076,
+    "load_s": 33.725154599989764,
+    "peak_vram_gib": 23.569363594055176,
+    "prefill_tok_s_mean": 1920.8240239396275,
+    "decode_tok_s_mean": 1.346819578985131,
+    "generated_tokens_mean": 182,
+    "wall_clock_s_mean": 142.0882336999057,
+    "finish_reason": "eos",
+    "caption_preview": "The video opens on a dark, nighttime city street scene, viewed from an elevated perspective. Streetlights and building lights illuminate the wet asphalt, reflecting the ambient glow. Cars with headlig",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "qwen3_omni_instruct_int8",
+    "family": "qwen3_omni_instruct",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "unfused_gate_up_control": false,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 128,
+      "sampling_strategy": "fps",
+      "max_pixels": 262144,
+      "min_pixels": 4096,
+      "use_audio_in_video": true,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 33.725154599989764,
+    "peak_vram_gb": 22.039906978607178,
+    "checkpoint_bytes": 33031350760,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 18810,
+    "bf16_layers": 176,
+    "compile_mode": "eager",
+    "warnings": [],
+    "block_swap": {
+      "mode": "block_swap",
+      "layer_count": 48,
+      "resident_layers": 33,
+      "swapped_layers": 15,
+      "slots": 2,
+      "layer_mib": 596.3,
+      "non_layer_gib": 2.8,
+      "resident_weight_gib": 21.54,
+      "activation_estimate_gib": 3.78,
+      "allocator_slack_gib": 2.39,
+      "stage_towers": true,
+      "tower_gib": 1.64,
+      "reserve_gib": 2.0,
+      "free_vram_gib": 30.26,
+      "total_vram_gib": 31.84,
+      "expected_peak_gib": 27.71,
+      "pinned_gib": 8.73,
+      "notes": [
+        "Block swap: 33/48 decoder layers resident, 15 swapped (8.73 GiB pinned), 2 slots x 596 MiB; GPU weights 21.5 GiB; activation estimate 3.8 GiB; allocator slack 2.4 GiB; reserve 2.0 GiB; expected peak 27.7 of 30.3 GiB free; towers staged on CPU between prefills (1.6 GiB)"
+      ],
+      "layer_bytes": 625250816,
+      "slot_bytes": 625250816,
+      "slot_mib": 596.3,
+      "device": "cuda:0",
+      "pin_method": "cudaHostRegister",
+      "pinned_bytes": 9378762240,
+      "pageable_bytes": 0,
+      "pageable_gib": 0.0,
+      "installed": true
+    },
+    "resident_bytes": 23129639936,
+    "activation_estimate_bytes": 4058169946,
+    "vram_cap_bytes": 32227983360
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 5415,
+      "generated_tokens": 182,
+      "finish_reason": "eos",
+      "prefill_s": 2.819102599984035,
+      "decode_s": 134.39068070007488,
+      "prefill_tok_s": 1920.8240239396275,
+      "decode_tok_s": 1.346819578985131,
+      "generation_s": 137.20978330005892,
+      "wall_clock_s": 142.0882336999057,
+      "peak_vram_gib": 23.569363594055176,
+      "caption_chars": 845,
+      "caption_preview": "The video opens on a dark, nighttime city street scene, viewed from an elevated perspective. Streetlights and building lights illuminate the wet asphalt, reflecting the ambient glow. Cars with headlig",
+      "caption": "The video opens on a dark, nighttime city street scene, viewed from an elevated perspective. Streetlights and building lights illuminate the wet asphalt, reflecting the ambient glow. Cars with headlights and taillights move along the road, their lights streaking slightly due to the camera's exposure. In the distance, a faint, horizontal lightning flash briefly lights up the horizon. The scene is punctuated by a series of loud, deep, and resonant thunderclaps that echo across the landscape. The first thunderclap occurs around the 00:09 mark, followed by a second, more intense one at 00:12, and a third at 00:15. The sky remains dark, but the flashes of lightning and the thunder create a dramatic atmosphere. The camera remains static throughout, capturing the continuous flow of traffic and the intermittent, powerful sounds of the storm.",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

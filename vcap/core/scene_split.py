@@ -18,8 +18,11 @@ from .media import (
     extract_audio,
     extract_frames_to_files,
     find_ffprobe,
+    is_encoder_error,
     probe_media,
+    resolve_video_encoder,
     run_ffmpeg,
+    video_encode_args,
 )
 from .outputs import OutputWriter
 from .paths import normalize_path, sanitize_filename
@@ -39,6 +42,7 @@ class SceneDetectParams:
     merge_short_scenes: bool = True
     merge_below_s: float = 1.0
     fade_detection: bool = False
+    fade_threshold: float = 12.0
     detector: Literal["content", "adaptive", "threshold"] = "content"
     downscale: int = 0
     start_s: float | None = None
@@ -224,7 +228,7 @@ def detect_scenes(
         if params.fade_detection and detector_name != "threshold":
             manager.add_detector(
                 ThresholdDetector(
-                    threshold=12.0,
+                    threshold=max(1.0, min(100.0, float(params.fade_threshold))),
                     min_scene_len=min_scene_frames,
                     fade_bias=0.0,
                     add_final_scene=True,
@@ -806,6 +810,8 @@ def split_video(
     name_template: str = "clip_{index:04d}",
     encoder: str = "libx264",
     crf: int = 18,
+    preset: str = "veryfast",
+    audio_bitrate: str = "192k",
     progress_cb: ProgressCallback | None = None,
     cancel: CancelToken | None = None,
 ) -> list[ClipInfo]:
@@ -834,6 +840,14 @@ def split_video(
     if not planned:
         OutputWriter().write_json(directory / SPLIT_MANIFEST_NAME, {"source": str(source), "clips": []})
         return []
+
+    requested_encoder = str(encoder or "libx264").strip().casefold()
+    active_encoder = resolve_video_encoder(requested_encoder)
+    encode_preset = str(preset or "veryfast").strip().casefold()
+    selected_audio_bitrate = str(audio_bitrate or "192k").strip().casefold()
+    if selected_audio_bitrate not in {"96k", "128k", "192k", "256k", "320k"}:
+        selected_audio_bitrate = "192k"
+    encoder_fallback_logged = active_encoder != requested_encoder
 
     written: list[ClipInfo] = []
     manifest_clips: list[dict[str, Any]] = []
@@ -868,8 +882,12 @@ def split_video(
             except OSError:
                 pass
 
+        last_error: Exception | None = None
+
         def run(arguments: list[str]) -> bool:
+            nonlocal last_error
             clear_target()
+            last_error = None
             try:
                 run_ffmpeg(
                     arguments,
@@ -881,6 +899,7 @@ def split_video(
             except CancelledError:
                 raise
             except Exception as exc:
+                last_error = exc
                 get_log().warn(f"Clip {index} split attempt failed: {exc}", scope="split")
                 return False
 
@@ -905,7 +924,7 @@ def split_video(
                         "-c:a",
                         "aac",
                         "-b:a",
-                        "192k",
+                        selected_audio_bitrate,
                         "-avoid_negative_ts",
                         "make_zero",
                         "-movflags",
@@ -932,7 +951,7 @@ def split_video(
                 return True, "copy-video-only"
             return False, "copy-failed"
 
-        def attempt_precise() -> tuple[bool, str]:
+        def attempt_precise(selected_encoder: str) -> tuple[bool, str]:
             seek = max(0.0, segment.start_s - 1.0)
             read_limit = duration + 2.0
             absolute_start = segment.start_s + source_start
@@ -955,7 +974,11 @@ def split_video(
             ]
             if rational_fps:
                 video_args += ["-r", rational_fps]
-            video_args += ["-c:v", str(encoder), "-preset", "veryfast", "-crf", str(max(0, min(51, int(crf))))]
+            video_args += video_encode_args(
+                selected_encoder,
+                max(0, min(51, int(crf))),
+                encode_preset,
+            )
             if pix_fmt and pix_fmt in {"yuv420p", "yuv420p10le", "yuv422p", "yuv444p"}:
                 video_args += ["-pix_fmt", pix_fmt]
             else:
@@ -969,7 +992,7 @@ def split_video(
                     "-c:a",
                     "aac",
                     "-b:a",
-                    "192k",
+                    selected_audio_bitrate,
                 ]
                 if run(base + audio_args + video_args + ["-movflags", "+faststart", str(target)]) and _reasonable_av_timing(target):
                     return True, "precise+aac"
@@ -1004,11 +1027,25 @@ def split_video(
                     )
                     ok = False
             if not ok:
-                ok, used = attempt_precise()
+                ok, used = attempt_precise(active_encoder)
         else:
-            ok, used = attempt_precise()
-            if not ok:
-                ok, used = attempt_copy()
+            ok, used = attempt_precise(active_encoder)
+        if (
+            not ok
+            and active_encoder != "libx264"
+            and last_error is not None
+            and is_encoder_error(last_error)
+        ):
+            if not encoder_fallback_logged:
+                get_log().warn(
+                    f"FFmpeg encoder {active_encoder} failed; falling back to libx264.",
+                    scope="encode",
+                )
+                encoder_fallback_logged = True
+            active_encoder = "libx264"
+            ok, used = attempt_precise(active_encoder)
+        if mode == "precise" and not ok:
+            ok, used = attempt_copy()
         if not ok or not _is_decodable(target):
             raise MediaError(f"Could not split clip {index} ({segment.start_s:.3f}-{segment.end_s:.3f}s)")
 
@@ -1051,8 +1088,11 @@ def split_video(
         "source_is_cfr": source_is_cfr,
         "mode_requested": mode,
         "keep_audio": bool(keep_audio),
-        "encoder": str(encoder),
+        "encoder_requested": requested_encoder,
+        "encoder": active_encoder,
         "crf": int(crf),
+        "preset": encode_preset,
+        "audio_bitrate": selected_audio_bitrate,
         "clips": manifest_clips,
     }
     OutputWriter().write_json(directory / SPLIT_MANIFEST_NAME, manifest, pretty=True)

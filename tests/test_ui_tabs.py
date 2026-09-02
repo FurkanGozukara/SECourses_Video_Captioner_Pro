@@ -34,6 +34,22 @@ def test_cancelled_job_summary_reports_cancel_count() -> None:
     assert status_class == "vc-warn" and eta == "cancelled"
 
 
+def test_result_summary_reports_nonzero_unsupported_count() -> None:
+    result = JobResult(
+        items=[],
+        counts={"done": 0, "skipped": 3, "failed": 0, "unsupported": 1},
+        run_dir="run",
+        metadata_path="metadata.json",
+        elapsed=0.1,
+    )
+
+    label, message, status_class, eta = _result_summary(result)
+
+    assert label == "Complete"
+    assert message == "Complete: 0 done, 3 skipped, 0 failed, 1 unsupported in 0.1s"
+    assert status_class == "vc-ok" and eta == "done"
+
+
 def test_editor_scanner_pairs_sidecars_unicode_and_run_layout(tmp_path: Path) -> None:
     (tmp_path / "clip2.mp4").write_bytes(b"media")
     (tmp_path / "clip2.txt").write_text("preferred caption", encoding="utf-8")

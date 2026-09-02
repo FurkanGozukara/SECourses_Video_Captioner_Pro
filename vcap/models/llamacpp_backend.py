@@ -1,4 +1,8 @@
-"""llama.cpp server backend for multimodal Qwen3-Omni GGUF models."""
+"""llama.cpp server backend for multimodal Qwen3-Omni GGUF models.
+
+``use_cache`` is not applicable to llama-server: its KV cache is managed by the
+server, so the UI disables that Transformers-only control for GGUF variants.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,8 @@ import os
 from pathlib import Path
 import queue
 import re
+import secrets
+import shlex
 import socket
 import subprocess
 import threading
@@ -31,6 +37,7 @@ from vcap.core import console_progress
 from vcap.core.gpu import resource_snapshot, vram_tier_for_gb
 from vcap.core.logs import get_log
 from vcap.core.media import probe_media, read_audio, read_video_frames
+from vcap.core.progress import UiThrottle
 from vcap.core.subprocess_runner import CancelledError, build_child_env, kill_process_tree
 from vcap.prompts.postprocess import POST_PROCESSORS, PostResult, plain
 from vcap.prompts.presets import PromptPreset, get_preset, render_prompt
@@ -74,6 +81,131 @@ DEFAULT_STARTUP_TIMEOUT_S = 900.0
 
 
 @dataclass(frozen=True)
+class LlamaCppRuntimeOptions:
+    """Validated llama-server controls copied from ``JobSpec.runtime``."""
+
+    max_frames: int = 32
+    jpeg_quality: int = 90
+    threads: int = 0
+    batch_size: int = 2_048
+    ubatch_size: int = 512
+    flash_attn: str = "auto"
+    cache_reuse: int = 0
+    ignore_tier_context: bool = False
+    extra_args: str = ""
+    min_p: float = 0.05
+    repeat_last_n: int = 64
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    fit_headroom_mib: int = 1_536
+    startup_timeout_s: int = 900
+    stream_idle_timeout_s: int = 120
+
+    @classmethod
+    def from_spec(cls, spec: Any | None) -> "LlamaCppRuntimeOptions":
+        runtime = getattr(spec, "runtime", spec)
+
+        def integer(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(getattr(runtime, name, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(maximum, value))
+
+        def number(name: str, default: float, minimum: float, maximum: float) -> float:
+            try:
+                value = float(getattr(runtime, name, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(maximum, value))
+
+        flash_attn = str(getattr(runtime, "gguf_flash_attn", "auto") or "auto").casefold()
+        if flash_attn not in {"auto", "on", "off"}:
+            flash_attn = "auto"
+        return cls(
+            max_frames=integer("gguf_max_frames", 32, 1, 128),
+            jpeg_quality=integer("gguf_jpeg_quality", 90, 50, 100),
+            threads=integer("gguf_threads", 0, 0, 256),
+            batch_size=integer("gguf_batch_size", 2_048, 64, 8_192),
+            ubatch_size=integer("gguf_ubatch_size", 512, 32, 4_096),
+            flash_attn=flash_attn,
+            cache_reuse=integer("gguf_cache_reuse", 0, 0, 4_096),
+            ignore_tier_context=bool(
+                getattr(runtime, "gguf_ignore_tier_context", False)
+            ),
+            extra_args=str(getattr(runtime, "gguf_extra_args", "") or ""),
+            min_p=number("gguf_min_p", 0.05, 0.0, 1.0),
+            repeat_last_n=integer("gguf_repeat_last_n", 64, 0, 4_096),
+            presence_penalty=number("gguf_presence_penalty", 0.0, -2.0, 2.0),
+            frequency_penalty=number("gguf_frequency_penalty", 0.0, -2.0, 2.0),
+            fit_headroom_mib=integer("gguf_fit_headroom_mib", 1_536, 0, 8_192),
+            startup_timeout_s=integer("gguf_startup_timeout_s", 900, 60, 3_600),
+            stream_idle_timeout_s=integer("gguf_stream_idle_timeout_s", 120, 0, 3_600),
+        )
+
+
+@dataclass(frozen=True)
+class GgufFrameBudget:
+    """Resolved frame count and an audit trail of every reducing cap."""
+
+    requested_frames: int
+    selected_frames: int
+    per_frame_tokens: int
+    audio_tokens: int
+    context_frame_cap: int
+    messages: tuple[str, ...]
+
+
+def frame_budget_for_video(
+    *,
+    duration_s: float,
+    fps: float,
+    sampling_strategy: str,
+    max_frames: int,
+    gguf_max_frames: int,
+    context_size: int,
+    max_new_tokens: int,
+    max_pixels: int,
+    audio_tokens: int = 0,
+) -> GgufFrameBudget:
+    """Resolve the GGUF still-frame plan from user, runtime, and context caps."""
+
+    resolved_fps = max(0.01, float(fps))
+    requested = max(1, int(math.ceil(max(0.0, float(duration_s)) * resolved_fps)))
+    per_frame_tokens = max(1, int(math.ceil(max(1, int(max_pixels)) / float(32 * 32))))
+    audio = max(0, int(audio_tokens))
+    available = int(context_size) - max(0, int(max_new_tokens)) - audio - 512
+    context_cap = max(1, available // per_frame_tokens)
+    selected = requested
+    messages: list[str] = []
+
+    def apply_cap(limit: int, label: str) -> None:
+        nonlocal selected
+        cap = max(1, int(limit))
+        if selected > cap:
+            before = selected
+            selected = cap
+            messages.append(f"GGUF frame count capped from {before} to {selected} by {label}.")
+
+    apply_cap(max_frames, "Maximum frames")
+    apply_cap(gguf_max_frames, "GGUF maximum frames")
+    apply_cap(context_cap, f"the {int(context_size)}-token context budget")
+    messages.append(
+        f"GGUF frame plan selected {selected} of {requested} frame(s) at "
+        f"{resolved_fps:g} fps ({str(sampling_strategy or 'fps')}); estimated "
+        f"{per_frame_tokens} tokens/frame and {audio} audio tokens."
+    )
+    return GgufFrameBudget(
+        requested,
+        selected,
+        per_frame_tokens,
+        audio,
+        context_cap,
+        tuple(messages),
+    )
+
+
+@dataclass(frozen=True)
 class LlamaCppServerPlan:
     """Tier-aware llama-server context and device-memory fitting settings."""
 
@@ -83,6 +215,8 @@ class LlamaCppServerPlan:
     fit: bool
     fit_target_mib: int
     n_cpu_moe: int | None
+    context_tier_ignored: bool = False
+    context_was_clamped: bool = False
 
 
 # llama.cpp's fitter sizes weights, KV cache, and text compute buffers, but not the
@@ -98,6 +232,7 @@ def server_plan_for_vram(
     requested_context: int = DEFAULT_CONTEXT_SIZE,
     q8_weights: bool = False,
     fit_target_mib: int = 2_048 + MTMD_FIT_HEADROOM_MIB,
+    ignore_tier_context: bool = False,
 ) -> LlamaCppServerPlan:
     """Return a Qwen3-Omni server plan that lets llama.cpp fit device memory."""
 
@@ -106,14 +241,28 @@ def server_plan_for_vram(
     tier = vram_tier_for_gb(observed)
     requested = max(4_096, int(requested_context))
     target = max(0, int(fit_target_mib))
-    if tier <= 16:
-        context_size = min(requested, 8_192)
-    elif tier <= 24:
-        context_size = min(requested, 16_384)
-    else:
-        context_size = min(requested, 32_768)
+    tier_context = 8_192 if tier <= 16 else 16_384 if tier <= 24 else 32_768
+    ignored = bool(ignore_tier_context)
+    context_size = requested if ignored else min(requested, tier_context)
+    clamped = not ignored and context_size < requested
+    if ignored:
+        get_log().log("Context tier clamp bypassed", scope="llama.cpp")
+    elif clamped:
+        get_log().warn(
+            f"Context clamped to {context_size} by the {tier} GB VRAM tier",
+            scope="llama.cpp",
+        )
     # -ngl stays unset: llama.cpp aborts fitting when n_gpu_layers is user-set.
-    return LlamaCppServerPlan(tier, context_size, None, True, target, None)
+    return LlamaCppServerPlan(
+        tier,
+        context_size,
+        None,
+        True,
+        target,
+        None,
+        ignored,
+        clamped,
+    )
 
 
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
@@ -164,6 +313,8 @@ def _server_plan_from_env(plan: LlamaCppServerPlan) -> LlamaCppServerPlan:
         fit,
         _env_non_negative_int("VCAP_LLAMACPP_FIT_TARGET_MIB", plan.fit_target_mib),
         n_cpu_moe,
+        plan.context_tier_ignored,
+        plan.context_was_clamped,
     )
 
 
@@ -604,11 +755,16 @@ def _wav_base64(samples: np.ndarray) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _image_data_url(image: Image.Image | np.ndarray) -> str:
+def _image_data_url(image: Image.Image | np.ndarray, quality: int = 90) -> str:
     converted = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image, dtype=np.uint8), mode="RGB")
     converted = converted.convert("RGB")
     buffer = BytesIO()
-    converted.save(buffer, format="JPEG", quality=90, optimize=True)
+    converted.save(
+        buffer,
+        format="JPEG",
+        quality=max(50, min(100, int(quality))),
+        optimize=True,
+    )
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
@@ -644,6 +800,7 @@ class _StreamResult:
     peak_vram_gb: float
     cancelled: bool
     finish_reason: str
+    seed: int | None
 
 
 class LlamaCppCaptioner(BaseCaptioner):
@@ -663,6 +820,7 @@ class LlamaCppCaptioner(BaseCaptioner):
         gpu_index: int = 0,
         vram_total_gb: float | None = None,
         vram_reserve_gb: float = 2.0,
+        runtime: Any | None = None,
     ) -> None:
         super().__init__(family, loaded)
         if not family.startswith("qwen3_omni_"):
@@ -692,11 +850,16 @@ class LlamaCppCaptioner(BaseCaptioner):
         self.vram_reserve_gb = float(vram_reserve_gb)
         if not math.isfinite(self.vram_reserve_gb) or self.vram_reserve_gb < 0:
             raise ValueError("vram_reserve_gb must be a non-negative finite number")
+        self.runtime_options = LlamaCppRuntimeOptions.from_spec(runtime)
         self.server_plan = server_plan_for_vram(
             self.vram_total_gb,
             requested_context=self.requested_context_size,
             q8_weights=self.variant.key.endswith("_gguf_q8"),
-            fit_target_mib=int(round(self.vram_reserve_gb * 1_024)) + MTMD_FIT_HEADROOM_MIB,
+            fit_target_mib=(
+                int(round(self.vram_reserve_gb * 1_024))
+                + self.runtime_options.fit_headroom_mib
+            ),
+            ignore_tier_context=self.runtime_options.ignore_tier_context,
         )
         self._active_server_plan = self.server_plan
         self.context_size = self.server_plan.context_size
@@ -741,6 +904,40 @@ class LlamaCppCaptioner(BaseCaptioner):
         with self._log_lock:
             return "\n".join(self._log_tail)
 
+    def configure_runtime(self, spec: Any | None) -> None:
+        """Apply ``JobSpec.runtime`` fields before the next server request."""
+
+        generation = getattr(spec, "generation", getattr(spec, "gen", None))
+        if int(getattr(generation, "no_repeat_ngram_size", 0) or 0) > 0:
+            get_log().warn(
+                "no_repeat_ngram_size is ignored by llama.cpp",
+                scope="llama.cpp",
+            )
+        options = LlamaCppRuntimeOptions.from_spec(spec)
+        if options == self.runtime_options:
+            return
+        if self.is_running:
+            get_log().warn(
+                "GGUF server options changed; restarting llama-server before the next request.",
+                scope="llama.cpp",
+            )
+            self.stop()
+        self.runtime_options = options
+        self.server_plan = server_plan_for_vram(
+            self.vram_total_gb,
+            requested_context=self.requested_context_size,
+            q8_weights=self.variant.key.endswith("_gguf_q8"),
+            fit_target_mib=(
+                int(round(self.vram_reserve_gb * 1_024))
+                + options.fit_headroom_mib
+            ),
+            ignore_tier_context=options.ignore_tier_context,
+        )
+        self._active_server_plan = self.server_plan
+        self.context_size = self.server_plan.context_size
+        with self._fit_lock:
+            self.fit_report = self._fit_report_for_plan(self.server_plan)
+
     @staticmethod
     def _fit_report_for_plan(plan: LlamaCppServerPlan) -> dict[str, Any]:
         return {
@@ -751,6 +948,8 @@ class LlamaCppCaptioner(BaseCaptioner):
             "requested_gpu_layers": None if plan.gpu_layers is None else int(plan.gpu_layers),
             "requested_n_cpu_moe": plan.n_cpu_moe,
             "requested_context_size": int(plan.context_size),
+            "context_tier_ignored": bool(plan.context_tier_ignored),
+            "context_was_clamped": bool(plan.context_was_clamped),
             "n_gpu_layers": None,
             "n_cpu_moe": plan.n_cpu_moe,
             "n_ctx": int(plan.context_size),
@@ -792,7 +991,20 @@ class LlamaCppCaptioner(BaseCaptioner):
             "-c",
             str(plan.context_size),
             "--jinja",
+            "--no-webui",
+            "-np",
+            "1",
+            "-b",
+            str(self.runtime_options.batch_size),
+            "-ub",
+            str(self.runtime_options.ubatch_size),
+            "-fa",
+            self.runtime_options.flash_attn,
         ]
+        if self.runtime_options.threads > 0:
+            command.extend(["--threads", str(self.runtime_options.threads)])
+        if self.runtime_options.cache_reuse > 0:
+            command.extend(["--cache-reuse", str(self.runtime_options.cache_reuse)])
         if plan.gpu_layers is not None:
             command.extend(["-ngl", str(plan.gpu_layers)])
         command.extend(["--fit", "on" if plan.fit else "off", "--fit-target", str(plan.fit_target_mib)])
@@ -812,6 +1024,11 @@ class LlamaCppCaptioner(BaseCaptioner):
                 "127.0.0.1",
             ]
         )
+        if self.runtime_options.extra_args.strip():
+            try:
+                command.extend(shlex.split(self.runtime_options.extra_args))
+            except ValueError as exc:
+                raise ValueError(f"Invalid GGUF extra arguments: {exc}") from exc
         return command
 
     def _read_server_logs(self, process: subprocess.Popen[str]) -> None:
@@ -837,7 +1054,7 @@ class LlamaCppCaptioner(BaseCaptioner):
         progress_cb: ProgressCallback | None = None,
         cancel: object | None = None,
         *,
-        timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
+        timeout_s: float | None = None,
     ) -> "LlamaCppCaptioner":
         """Start llama-server and wait until ``GET /health`` reports ready."""
 
@@ -851,6 +1068,14 @@ class LlamaCppCaptioner(BaseCaptioner):
             self.server_path = server
             port = find_free_port()
             command = self._server_command(server, port)
+            if self._active_server_plan.context_tier_ignored:
+                _emit(progress_cb, "Context tier clamp bypassed")
+            elif self._active_server_plan.context_was_clamped:
+                _emit(
+                    progress_cb,
+                    f"Context clamped to {self._active_server_plan.context_size} by the "
+                    f"{self._active_server_plan.vram_tier_gb} GB VRAM tier",
+                )
             _emit(progress_cb, f"Starting llama-server for {self.variant.key} on 127.0.0.1:{port}")
             creationflags = 0
             popen_options: dict[str, Any] = {}
@@ -893,7 +1118,12 @@ class LlamaCppCaptioner(BaseCaptioner):
             )
             self._log_thread.start()
 
-            deadline = time.monotonic() + max(10.0, float(timeout_s))
+            resolved_timeout = (
+                float(self.runtime_options.startup_timeout_s)
+                if timeout_s is None
+                else float(timeout_s)
+            )
+            deadline = time.monotonic() + max(10.0, resolved_timeout)
             peak = baseline
             last_health_error = ""
             try:
@@ -937,7 +1167,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                 tail = self.server_log_tail or "(no server output)"
                 self.stop()
                 raise RuntimeError(
-                    f"llama-server did not become healthy within {timeout_s:.0f}s ({last_health_error}). "
+                    f"llama-server did not become healthy within {resolved_timeout:.0f}s ({last_health_error}). "
                     f"Log tail:\n{tail}"
                 )
             except Exception:
@@ -989,10 +1219,12 @@ class LlamaCppCaptioner(BaseCaptioner):
         parts: list[MediaPart],
         pre: PreprocessParams,
         cancel: object | None,
+        gen: GenParams | None = None,
     ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
         content: list[dict[str, Any]] = []
         warnings: list[str] = []
         text_parts: list[str] = []
+        generation = gen or _default_gen(self.spec.family)
         for part in parts:
             if _cancelled(cancel):
                 raise CancelledError("media preparation cancelled")
@@ -1004,14 +1236,41 @@ class LlamaCppCaptioner(BaseCaptioner):
                 info = probe_media(path)
                 if not info.has_video:
                     raise ValueError(f"No video stream found in {path}")
+                duration = max(
+                    0.0,
+                    float((end if end is not None else info.duration) or 0.0)
+                    - float(start or 0.0),
+                )
+                include_audio = bool(pre.use_audio_in_video and info.has_audio)
                 use_native = self.video_mode == "native" and start is None and end is None
                 if use_native:
                     content.append(_native_video_part(path))
                 else:
-                    duration = max(0.0, float((end if end is not None else info.duration) or 0.0) - float(start or 0.0))
-                    target_frames = int(math.ceil(duration * 0.75)) if duration > 0 else 12
-                    target_frames = max(8, min(16, target_frames))
-                    target_frames = max(1, min(target_frames, int(pre.max_frames)))
+                    audio_tokens = (
+                        int(
+                            math.ceil(
+                                duration
+                                * float(getattr(self.spec.limits, "audio_tokens_per_s", 13.0))
+                            )
+                        )
+                        if include_audio
+                        else 0
+                    )
+                    budget = frame_budget_for_video(
+                        duration_s=duration,
+                        fps=float(pre.fps),
+                        sampling_strategy=pre.sampling_strategy,
+                        max_frames=int(pre.max_frames),
+                        gguf_max_frames=self.runtime_options.max_frames,
+                        context_size=self.context_size,
+                        max_new_tokens=int(generation.max_new_tokens),
+                        max_pixels=int(pre.max_pixels),
+                        audio_tokens=audio_tokens,
+                    )
+                    target_frames = budget.selected_frames
+                    for message in budget.messages:
+                        get_log().log(message, scope="llama.cpp")
+                    warnings.extend(budget.messages)
                     decoded = read_video_frames(
                         path,
                         start=start,
@@ -1024,17 +1283,25 @@ class LlamaCppCaptioner(BaseCaptioner):
                         min_pixels=int(pre.min_pixels or self.spec.limits.min_pixels),
                         size_multiple=32,
                         sampling=pre.sampling_strategy,
+                        adaptive_threshold=float(pre.adaptive_threshold),
                         cancel_token=cancel,
                     )
                     content.extend(
-                        {"type": "image_url", "image_url": {"url": _image_data_url(frame)}}
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _image_data_url(
+                                    frame,
+                                    self.runtime_options.jpeg_quality,
+                                )
+                            },
+                        }
                         for frame in decoded.frames
                     )
                     warnings.append(
                         f"Video used {len(decoded.frames)} chronological still frames plus separate audio; "
                         "frame/audio tokens are not interleaved by timestamp."
                     )
-                include_audio = bool(pre.use_audio_in_video and info.has_audio)
                 if include_audio:
                     samples = _slice_audio(read_audio(path), start, end)
                     content.append(
@@ -1060,7 +1327,15 @@ class LlamaCppCaptioner(BaseCaptioner):
                 with Image.open(part.path) as image:
                     converted = ImageOps.exif_transpose(image).convert("RGB")
                     content.append(
-                        {"type": "image_url", "image_url": {"url": _image_data_url(converted)}}
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _image_data_url(
+                                    converted,
+                                    self.runtime_options.jpeg_quality,
+                                )
+                            },
+                        }
                     )
             elif part.type == "text":
                 text = _text_for_part(part).strip()
@@ -1111,13 +1386,14 @@ class LlamaCppCaptioner(BaseCaptioner):
         prompt: PromptSpec | str | None = None,
         pre: PreprocessParams | None = None,
         cancel: object | None = None,
+        gen: GenParams | None = None,
     ) -> _PreparedMessage:
         """Build typed OpenAI message parts without making an HTTP request."""
 
         parts = _parts(media)
         self._validate_parts(parts)
         pre = pre or _default_pre(self.spec.family)
-        content, warnings, text_parts = self._media_content(parts, pre, cancel)
+        content, warnings, text_parts = self._media_content(parts, pre, cancel, gen)
         media_types: list[str] = []
         for part in parts:
             if part.type in {"video", "video_audio"}:
@@ -1150,12 +1426,24 @@ class LlamaCppCaptioner(BaseCaptioner):
             "top_k": int(gen.top_k if sampled else 0),
             "max_tokens": min(int(gen.max_new_tokens), self.spec.limits.max_new_tokens_cap),
             "repeat_penalty": float(gen.repetition_penalty),
+            "repeat_last_n": int(self.runtime_options.repeat_last_n),
             "reasoning_format": "none",
         }
+        if sampled:
+            payload["min_p"] = float(self.runtime_options.min_p)
+        if self.runtime_options.presence_penalty != 0:
+            payload["presence_penalty"] = float(self.runtime_options.presence_penalty)
+        if self.runtime_options.frequency_penalty != 0:
+            payload["frequency_penalty"] = float(self.runtime_options.frequency_penalty)
         if self.spec.family == "qwen3_omni_thinking":
             payload["chat_template_kwargs"] = {"enable_thinking": bool(gen.enable_thinking)}
             if not gen.enable_thinking:
                 payload["reasoning_effort"] = "none"
+        if sampled:
+            requested_seed = int(getattr(gen, "seed", -1))
+            payload["seed"] = (
+                secrets.randbits(32) if requested_seed < 0 else requested_seed
+            )
         return payload
 
     def _stream_request(
@@ -1179,15 +1467,25 @@ class LlamaCppCaptioner(BaseCaptioner):
                     json=payload,
                     headers={"Content-Type": "application/json", "Authorization": "Bearer no-key"},
                     stream=True,
-                    timeout=(30, None),
+                    timeout=(30, self.runtime_options.stream_idle_timeout_s or None),
                 )
                 shared["response"] = response
                 if response.status_code >= 400:
                     detail = response.text[-5000:]
                     raise RuntimeError(f"llama-server HTTP {response.status_code}: {detail}")
-                for line in response.iter_lines(chunk_size=1):
+                for line in response.iter_lines(chunk_size=None):
                     events.put(("line", line))
                 events.put(("done", None))
+            except requests.Timeout as exc:
+                idle = self.runtime_options.stream_idle_timeout_s
+                events.put(
+                    (
+                        "error",
+                        RuntimeError(
+                            f"llama-server produced no data for {idle} second(s); generation timed out"
+                        ),
+                    )
+                )
             except Exception as exc:
                 events.put(("error", exc))
             finally:
@@ -1229,6 +1527,7 @@ class LlamaCppCaptioner(BaseCaptioner):
         )
         vram_monitor.start()
         progress_key = f"llamacpp-caption-{id(events)}"
+        progress_throttle = UiThrottle(0.1)
         try:
             complete = False
             while not complete:
@@ -1260,7 +1559,8 @@ class LlamaCppCaptioner(BaseCaptioner):
                     if not isinstance(choices, list) or not choices:
                         continue
                     choice = choices[0] if isinstance(choices[0], dict) else {}
-                    if choice.get("finish_reason") is not None:
+                    terminal_chunk = choice.get("finish_reason") is not None
+                    if terminal_chunk:
                         server_finish_reason = str(choice["finish_reason"])
                     delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
                     text = delta.get("content")
@@ -1274,15 +1574,55 @@ class LlamaCppCaptioner(BaseCaptioner):
                         text if isinstance(text, str) else "",
                         reasoning if isinstance(reasoning, str) else "",
                     )
-                    if (isinstance(text, str) and text) or (isinstance(reasoning, str) and reasoning):
+                    has_delta = (isinstance(text, str) and bool(text)) or (
+                        isinstance(reasoning, str) and bool(reasoning)
+                    )
+                    if has_delta:
                         now = time.perf_counter()
                         if first_token_at is None:
                             first_token_at = now
                         chunks += 1
-                        speed = max(0, chunks - 1) / max(now - first_token_at, 1e-9)
-                        message = f"Generating: {chunks} streamed chunks | {speed:.2f} tok/s"
-                        console_progress.show_progress_line(message, key=progress_key)
-                        _callback(callbacks.progress, message, new_tokens=chunks, tok_per_s=speed)
+                    if has_delta or terminal_chunk:
+                        now = time.perf_counter()
+                        if progress_throttle.should_emit(
+                            force=chunks == 1 or terminal_chunk
+                        ):
+                            reported_tokens = (
+                                int(
+                                    usage.get("completion_tokens")
+                                    or timings.get("predicted_n")
+                                    or chunks
+                                )
+                                if terminal_chunk
+                                else chunks
+                            )
+                            speed = (
+                                float(timings.get("predicted_per_second") or 0.0)
+                                if terminal_chunk
+                                else max(0, chunks - 1)
+                                / max(now - (first_token_at or now), 1e-9)
+                            )
+                            message = (
+                                f"Generation finished: {reported_tokens} tokens | {speed:.2f} tok/s"
+                                if terminal_chunk
+                                else f"Generating: {chunks} streamed chunks | {speed:.2f} tok/s"
+                            )
+                            console_progress.show_progress_line(message, key=progress_key)
+                            progress_data: dict[str, Any] = {
+                                "new_tokens": reported_tokens,
+                                "tok_per_s": speed,
+                            }
+                            if terminal_chunk:
+                                progress_data.update(
+                                    finish_reason=server_finish_reason,
+                                    prompt_tokens=int(
+                                        usage.get("prompt_tokens")
+                                        or timings.get("prompt_n")
+                                        or 0
+                                    ),
+                                    context_limit=self.context_size,
+                                )
+                            _callback(callbacks.progress, message, **progress_data)
         finally:
             console_progress.finalize_progress_line(key=progress_key)
             worker.join(timeout=5.0)
@@ -1330,6 +1670,7 @@ class LlamaCppCaptioner(BaseCaptioner):
             peak_state["value"],
             cancelled,
             finish_reason,
+            int(payload["seed"]) if "seed" in payload else None,
         )
 
     def _postprocess(self, raw: str, preset: PromptPreset | None) -> tuple[PostResult, str]:
@@ -1368,6 +1709,8 @@ class LlamaCppCaptioner(BaseCaptioner):
             do_sample=generation.do_sample,
             use_cache=generation.use_cache,
             enable_thinking=generation.enable_thinking,
+            seed=getattr(generation, "seed", -1),
+            context_tokens=getattr(generation, "context_tokens", None),
         )
         preprocessing = pre or _default_pre(self.spec.family)
         normalized = normalize_chat_history(history)
@@ -1392,6 +1735,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                     legacy_parts,
                     preprocessing,
                     callbacks.cancel,
+                    generation,
                 )
             if text_parts:
                 merged = list(normalized)
@@ -1446,6 +1790,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                         [part_by_path[raw] for raw in item.media],
                         preprocessing,
                         callbacks.cancel,
+                        generation,
                     )
                     warnings.extend(item_warnings)
                 turn_content.append(content)
@@ -1495,7 +1840,12 @@ class LlamaCppCaptioner(BaseCaptioner):
             text=answer,
             raw_text=raw,
             reasoning=reasoning,
-            usage=TokenUsage(stream.prompt_tokens, stream.completion_tokens, stream.finish_reason),
+            usage=TokenUsage(
+                stream.prompt_tokens,
+                stream.completion_tokens,
+                stream.finish_reason,
+                stream.seed,
+            ),
             timing=CaptionTiming(
                 stream.prefill_s,
                 stream.decode_s,
@@ -1530,7 +1880,13 @@ class LlamaCppCaptioner(BaseCaptioner):
                 if not self.is_running:
                     self.start(callbacks.progress, callbacks.cancel)
                 _emit(callbacks.progress, "Preparing llama.cpp multimodal message")
-                prepared = self.build_messages(media, prompt, preprocessing, callbacks.cancel)
+                prepared = self.build_messages(
+                    media,
+                    prompt,
+                    preprocessing,
+                    callbacks.cancel,
+                    generation,
+                )
                 for warning in prepared.warnings:
                     _emit(callbacks.progress, warning)
                 stream = self._stream_request(self._payload(prepared.messages, generation), callbacks)
@@ -1566,7 +1922,12 @@ class LlamaCppCaptioner(BaseCaptioner):
             reasoning=reasoning,
             structured=post.structured,
             segments=list(post.segments),
-            usage=TokenUsage(stream.prompt_tokens, stream.completion_tokens, stream.finish_reason),
+            usage=TokenUsage(
+                stream.prompt_tokens,
+                stream.completion_tokens,
+                stream.finish_reason,
+                stream.seed,
+            ),
             timing=CaptionTiming(
                 stream.prefill_s,
                 stream.decode_s,
@@ -1582,11 +1943,14 @@ class LlamaCppCaptioner(BaseCaptioner):
 
 __all__ = [
     "DEFAULT_CONTEXT_SIZE",
+    "GgufFrameBudget",
     "LlamaCppServerPlan",
     "LlamaCppCaptioner",
+    "LlamaCppRuntimeOptions",
     "build_llamacpp_chat_messages",
     "ensure_gguf",
     "find_free_port",
+    "frame_budget_for_video",
     "parse_sse_events",
     "server_plan_for_vram",
 ]

@@ -19,13 +19,19 @@ from vcap import TEMP_DIR, VERSION
 from vcap.core import console_progress, gpu
 from vcap.core.captions_post import (
     Segment,
-    apply_replacements,
     clamp_segments_to_window,
+    dedupe_repeated_sentences,
     finalize_caption,
     write_caption_outputs,
 )
 from vcap.core.logs import get_log
-from vcap.core.media import MediaInfo, extract_audio, probe_media, trim_media
+from vcap.core.media import (
+    MediaInfo,
+    extract_audio,
+    filter_media_paths,
+    probe_media,
+    trim_media,
+)
 from vcap.core.outputs import MetadataBuilder, OutputWriter, RunLog, allocate_run_dir, model_short_name
 from vcap.core.paths import list_media_files, normalize_path, sanitize_filename
 from vcap.core.preprocess import (
@@ -158,7 +164,22 @@ class _Emitter:
         else:
             console_progress.show_progress_line(line, key=self._console_key)
 
-    def _emit_running_item(self, message: str, event_index: int | None, payload: dict[str, Any]) -> None:
+    def _emit_running_item(
+        self,
+        message: str,
+        event_index: int | None,
+        payload: dict[str, Any],
+        *,
+        prethrottled: bool = False,
+    ) -> None:
+        if "new_tokens" in payload and not prethrottled:
+            throttle = getattr(self, "_generate_item_throttle", None)
+            if throttle is None:
+                throttle = UiThrottle(0.1)
+                self._generate_item_throttle = throttle
+            terminal = "finish_reason" in payload or bool(payload.get("cancelled"))
+            if not throttle.should_emit(force=terminal):
+                return
         _call_sink(
             self.sink.on_item,
             ProgressEvent(
@@ -183,6 +204,16 @@ class _Emitter:
         data: Mapping[str, Any] | None = None,
     ) -> None:
         del tracker_index
+        progress_data = dict(data or {})
+        high_frequency = "new_tokens" in progress_data
+        if high_frequency:
+            throttle = getattr(self, "_generate_progress_throttle", None)
+            if throttle is None:
+                throttle = UiThrottle(0.1)
+                self._generate_progress_throttle = throttle
+            terminal = "finish_reason" in progress_data or bool(progress_data.get("cancelled"))
+            if not throttle.should_emit(force=terminal):
+                return
         self._current_event_index = event_index
         self.tracker.set_step(
             message,
@@ -190,7 +221,7 @@ class _Emitter:
             total_steps=_TOTAL_STEPS,
             step_index=step_index,
         )
-        payload = self._payload(event_index, data=data)
+        payload = self._payload(event_index, data=progress_data)
         _call_sink(
             self.sink.on_progress,
             ProgressEvent(
@@ -201,7 +232,12 @@ class _Emitter:
                 data=payload,
             ),
         )
-        self._emit_running_item(message, event_index, payload)
+        self._emit_running_item(
+            message,
+            event_index,
+            payload,
+            prethrottled=high_frequency,
+        )
         self._console_status(message, payload)
 
     def start_segment(self, total_segments: int) -> None:
@@ -401,7 +437,7 @@ def _inside_root(path: Path, root: Path | None) -> bool:
         return False
 
 
-def _resolve_inputs(spec: JobSpec) -> list[_ResolvedInput]:
+def _resolve_inputs(spec: JobSpec, log_cb: Any | None = None) -> list[_ResolvedInput]:
     expanded: list[tuple[InputItem, Path | None]] = []
     configured_root: Path | None = None
     if spec.output.source_root:
@@ -421,8 +457,28 @@ def _resolve_inputs(spec: JobSpec) -> list[_ResolvedInput]:
             files = list_media_files(
                 path,
                 recursive=spec.output.recursive,
-                kinds=("video", "audio", "image"),
+                kinds=("video", "audio", "image", "text"),
             )
+            media_stems = {
+                (file.parent, file.stem.casefold())
+                for file in files
+                if file.suffix.casefold() not in {".txt", ".md"}
+            }
+            files = [
+                file
+                for file in files
+                if file.suffix.casefold() not in {".txt", ".md"}
+                or (file.parent, file.stem.casefold()) not in media_stems
+            ]
+            before_filters = len(files)
+            files = filter_media_paths(
+                files,
+                spec.output.include_kinds,
+                spec.output.name_filter,
+            )
+            skipped = before_filters - len(files)
+            if skipped and callable(log_cb):
+                log_cb(f"Batch filters skipped {skipped} file(s).")
             source_root = configured_root if _inside_root(path, configured_root) else path
             expanded.extend((InputItem(file, item.kind), source_root) for file in files)
         else:
@@ -448,6 +504,8 @@ def _required_capability(info: MediaInfo | None, item: InputItem, spec: JobSpec,
         return "text", "text"
     if info is None:
         return "", "unknown"
+    if info.has_video and spec.preprocess.max_frames == 0 and "audio" in model.capabilities:
+        return "audio", "video"
     explicit = item.kind.casefold()
     if explicit not in {"", "auto"}:
         if explicit in {"video_audio", "video", "audio", "image", "text"}:
@@ -559,6 +617,10 @@ def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: Mo
                 continue
         capability, kind = _required_capability(entry.info, entry.item, spec, model)
         entry.capability, entry.kind = capability, kind
+        if capability == "audio" and kind == "video" and entry.info is not None and not entry.info.has_audio:
+            entry.status = "unsupported"
+            entry.message = "Visual frames are disabled, but the video has no audio track."
+            continue
         if not capability or (
             capability not in model.capabilities
             and not (fake_captioner and entry.item.text_prompt_only)
@@ -791,13 +853,16 @@ def _media_budget_hint(spec: JobSpec, resolved: Sequence["_ResolvedInput"]) -> A
     frames_needed = 0
     saw_visual = False
     fps = max(0.25, float(spec.preprocess.fps or 0.25))
-    max_frames = max(2, int(spec.preprocess.max_frames or 2))
+    max_frames = max(0, int(spec.preprocess.max_frames))
     strategy = str(getattr(spec.preprocess, "sampling_strategy", "fps") or "fps").casefold()
     for entry in resolved:
         if entry.status not in {"pending", "done"}:
             continue
         info = entry.info
         kind = str(entry.kind or (info.kind if info is not None else "unknown")).casefold()
+        if entry.capability == "audio":
+            kinds.add("audio")
+            continue
         if kind in {"video", "video_no_audio", "video_audio"}:
             kinds.add("video")
             saw_visual = True
@@ -944,9 +1009,11 @@ class _ModelSession:
             pin_cpu=self.spec.model.offload.pin_cpu,
             vram_reserve_gb=self.spec.model.offload.vram_reserve_gb,
             swap_slots=self.spec.model.offload.swap_slots,
+            pinned_ram_budget_gb=self.spec.model.offload.pinned_ram_budget_gb,
+            plan_slack_mib=self.spec.model.offload.plan_slack_mib,
         )
         model_spec = MODEL_SPECS[variant_to_family(self.spec.model.variant_key)]
-        hint_frames = self.spec.preprocess.max_frames
+        hint_frames = _effective_max_frames(self.spec, model_spec)
         hint_kinds: tuple[str, ...] = ()
         if self.media_hint is not None:
             if getattr(self.media_hint, "max_frames", None) is not None:
@@ -985,6 +1052,12 @@ class _ModelSession:
             accepts_budget_hint = False
         if accepts_budget_hint:
             load_kwargs["budget_hint"] = budget_hint
+        try:
+            accepts_runtime = "runtime" in inspect.signature(loader.load_model).parameters
+        except (TypeError, ValueError):
+            accepts_runtime = False
+        if accepts_runtime:
+            load_kwargs["runtime"] = self.spec.runtime
         self.loaded = (
             load_function(self.spec.model.variant_key, **load_kwargs)
             if loader_is_patched
@@ -998,6 +1071,9 @@ class _ModelSession:
             if callable(getattr(self.loaded, "caption", None))
             else captioner_for_loaded(self.loaded)
         )
+        configure_runtime = getattr(self.captioner, "configure_runtime", None)
+        if callable(configure_runtime):
+            configure_runtime(self.spec)
         return self.captioner
 
     def sample_shared_gpu_memory(self) -> None:
@@ -1119,14 +1195,121 @@ def _context_limit(spec: JobSpec, model: ModelSpec) -> int:
     return min(cap, int(requested)) if requested else cap
 
 
-def _effective_model_limit(spec: JobSpec, model: ModelSpec, include_audio: bool) -> float | None:
-    registry_limit = model.limits.compute_max_duration(
-        spec.preprocess.fps,
-        spec.preprocess.max_pixels,
-        context=_context_limit(spec, model),
-        reserve_tokens=spec.generation.max_new_tokens,
-        include_audio=include_audio,
+def _family_frame_cap(model: ModelSpec) -> int | None:
+    if model.limits.max_frames is not None:
+        return int(model.limits.max_frames)
+    parameter = next(
+        (item for item in model.param_schema if item.name == "max_frames"),
+        None,
     )
+    return int(parameter.max) if parameter is not None and parameter.max is not None else None
+
+
+def _effective_max_frames(spec: JobSpec, model: ModelSpec) -> int:
+    selected = max(0, int(spec.preprocess.max_frames))
+    if selected == 0 and "audio" not in model.capabilities:
+        selected = 4
+    cap = _family_frame_cap(model)
+    if cap is not None:
+        selected = min(selected, int(cap))
+    return selected
+
+
+def _original_max_frames(spec: JobSpec) -> int:
+    value: Any = spec.settings.get("max_frames", spec.preprocess.max_frames)
+    nested = spec.settings.get("preprocess")
+    if isinstance(nested, Mapping) and "max_frames" in nested:
+        value = nested["max_frames"]
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(spec.preprocess.max_frames))
+
+
+def _log_job_generation_contracts(
+    spec: JobSpec,
+    model: ModelSpec,
+    resolved: Sequence[_ResolvedInput],
+    emitter: _Emitter,
+) -> None:
+    requested = _original_max_frames(spec)
+    cap = _family_frame_cap(model)
+    if cap is not None and requested > int(cap):
+        emitter.log(
+            f"Maximum frames {requested} exceeds the {model.label} cap {int(cap)}; using {int(cap)}.",
+            "warning",
+            "preprocess",
+        )
+    if requested == 0:
+        if "audio" in model.capabilities:
+            if any(
+                entry.status == "pending"
+                and entry.capability == "audio"
+                and entry.info is not None
+                and entry.info.has_video
+                and entry.info.has_audio
+                for entry in resolved
+            ):
+                emitter.log(
+                    "Visual frames disabled (Maximum frames = 0): captioning the audio track only.",
+                    scope="preprocess",
+                )
+        else:
+            emitter.log(
+                f"Maximum frames 0 is below the {model.label} minimum 4; using 4.",
+                "warning",
+                "preprocess",
+            )
+    if spec.generation.do_sample and spec.generation.temperature <= 0:
+        emitter.log(
+            "Sampling is enabled but temperature is 0; greedy decoding is used.",
+            "warning",
+            "generation",
+        )
+    token_cap = int(model.limits.max_new_tokens_cap)
+    if int(spec.generation.max_new_tokens) > token_cap:
+        emitter.log(
+            f"Maximum new tokens {int(spec.generation.max_new_tokens)} exceeds the "
+            f"{model.label} cap {token_cap}; using {token_cap}.",
+            "warning",
+            "generation",
+        )
+    if int(model.limits.size_multiple) == 28 and int(spec.preprocess.max_pixels) > 602_112:
+        emitter.log(
+            f"Maximum pixels {int(spec.preprocess.max_pixels):,} exceeds the {model.label} "
+            "per-frame ceiling 602,112; using 602,112.",
+            "warning",
+            "preprocess",
+        )
+    if spec.summarize_segments and model.family not in {
+        "qwen3_omni_instruct",
+        "qwen3_omni_thinking",
+    }:
+        emitter.log(
+            f"Summary skipped: {model.label} cannot take text-only input",
+            "warning",
+            "summary",
+        )
+
+
+def _effective_model_limit(spec: JobSpec, model: ModelSpec, include_audio: bool) -> float | None:
+    if spec.preprocess.max_frames == 0 and "audio" in model.capabilities:
+        if model.limits.max_duration_s is not None:
+            registry_limit = float(model.limits.max_duration_s)
+        else:
+            available = max(
+                1,
+                _context_limit(spec, model) - spec.generation.max_new_tokens,
+            )
+            registry_limit = available / max(1.0, model.limits.audio_tokens_per_s)
+    else:
+        registry_limit = model.limits.compute_max_duration(
+            spec.preprocess.fps,
+            spec.preprocess.max_pixels,
+            context=_context_limit(spec, model),
+            reserve_tokens=spec.generation.max_new_tokens,
+            include_audio=include_audio,
+        )
     explicit = spec.split.model_max_duration_s
     values = [value for value in (registry_limit, explicit) if value is not None and value > 0]
     return min(values) if values else None
@@ -1140,6 +1323,7 @@ def _scene_params(spec: JobSpec) -> SceneDetectParams:
         merge_short_scenes=spec.split.merge_short_scenes,
         merge_below_s=spec.split.merge_below_s,
         fade_detection=spec.split.fade_detection,
+        fade_threshold=spec.split.fade_threshold,
         detector=spec.split.scene_detector,
         downscale=spec.split.scene_downscale,
     )
@@ -1177,7 +1361,18 @@ def _trim_source(
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"trimmed{source.suffix or '.mp4'}"
     emitter.log(f"Trimming {source.name}: {start:.3f}s to {end:.3f}s")
-    trim_media(source, target, start, end, mode=spec.split.cut_mode, keep_audio=True)
+    trim_media(
+        source,
+        target,
+        start,
+        end,
+        mode=spec.split.cut_mode,
+        keep_audio=True,
+        encode_codec=spec.split.encode_codec,
+        encode_crf=spec.split.encode_crf,
+        encode_preset=spec.split.encode_preset,
+        encode_audio_bitrate=spec.split.encode_audio_bitrate,
+    )
     trimmed_info = probe_media(target)
     if trimmed_info.kind == "unknown":
         raise RuntimeError(f"Trimmed media could not be probed: {trimmed_info.error}")
@@ -1230,7 +1425,8 @@ def _materialize_segments(
     if source is None or info is None or info.kind in {"image", "text"}:
         return [_SegmentSource(1, source, 0.0, 0.0, None, None)]
     persist = _is_dataset_job(spec)
-    physical = len(segments) > 1 or persist
+    audio_only_video = bool(info.has_video and entry.capability == "audio")
+    physical = len(segments) > 1 or persist or audio_only_video
     if not physical:
         segment = segments[0]
         return [
@@ -1259,13 +1455,17 @@ def _materialize_segments(
     else:
         clip_dir = work_dir / "clips"
     clip_dir.mkdir(parents=True, exist_ok=True)
-    if info.has_video:
+    if info.has_video and not audio_only_video:
         clips = split_video(
             source,
             segments,
             clip_dir,
             mode=spec.split.cut_mode,
             keep_audio=True,
+            encoder=spec.split.encode_codec,
+            crf=spec.split.encode_crf,
+            preset=spec.split.encode_preset,
+            audio_bitrate=spec.split.encode_audio_bitrate,
             progress_cb=lambda fraction, message: emitter.log(
                 f"{message} ({fraction * 100:.1f}%)", scope="split"
             ),
@@ -1340,6 +1540,10 @@ def _normalize_segment(
         size_multiple=model.limits.size_multiple,
         keep_audio=spec.preprocess.use_audio_in_video,
         audio_sr=spec.preprocess.audio_sample_rate,
+        encoder=spec.split.encode_codec,
+        crf=spec.split.encode_crf,
+        preset=spec.split.encode_preset,
+        audio_bitrate=spec.split.encode_audio_bitrate,
         cancel=cancel,
     )
     return replace(segment, path=normalized)
@@ -1369,7 +1573,14 @@ def _model_prompt(
             selected = get_preset(preset_id)
             compatible = (
                 model_family in selected.applies_to_models
-                and modality in selected.modalities
+                and (
+                    modality in selected.modalities
+                    or (
+                        model_family == "timechat"
+                        and modality == "video_audio"
+                        and "video" in selected.modalities
+                    )
+                )
             )
             if not compatible:
                 replacement = default_preset_for(model_family, modality)
@@ -1414,9 +1625,11 @@ def _model_pre(spec: JobSpec, model: ModelSpec, override: Mapping[str, Any] | No
 
     values = {
         "fps": spec.preprocess.fps,
-        "max_frames": spec.preprocess.max_frames,
+        "max_frames": _effective_max_frames(spec, model),
         "max_pixels": spec.preprocess.max_pixels,
         "min_pixels": spec.preprocess.min_pixels or model.limits.min_pixels,
+        "total_pixel_cap": spec.preprocess.total_pixel_cap,
+        "adaptive_threshold": spec.preprocess.adaptive_threshold,
         "use_audio_in_video": spec.preprocess.use_audio_in_video,
         "sampling_strategy": spec.preprocess.sampling_strategy,
     }
@@ -1434,7 +1647,7 @@ def _media_input(entry: _ResolvedInput, segment: _SegmentSource, spec: JobSpec, 
     if entry.kind == "text" and segment.path is not None:
         return MediaInput(path=segment.path, kind="text")
     kind = entry.capability
-    if entry.kind == "video":
+    if entry.kind == "video" and entry.capability != "audio":
         segment_info = probe_media(segment.path) if segment.path is not None else entry.info
         if model.limits.requires_audio_track:
             kind = "video_audio"
@@ -1469,18 +1682,23 @@ def _caption_progress(emitter: _Emitter, tracker_index: int, event_index: int, s
     return callback
 
 
-def _degrade_pre(current: dict[str, Any], model: ModelSpec) -> tuple[dict[str, Any], str] | None:
+def _degrade_pre(
+    current: dict[str, Any],
+    model: ModelSpec,
+    factor: float = 0.75,
+) -> tuple[dict[str, Any], str] | None:
+    scale = max(0.5, min(0.95, float(factor)))
     minimum_pixels = int(current.get("min_pixels") or model.limits.min_pixels)
     pixels = int(current["max_pixels"])
     if pixels > minimum_pixels:
-        lowered = max(minimum_pixels, int(math.floor(pixels * 0.75)))
+        lowered = max(minimum_pixels, int(math.floor(pixels * scale)))
         if lowered < pixels:
             updated = dict(current)
             updated["max_pixels"] = lowered
             return updated, f"max_pixels {pixels} -> {lowered}"
     frames = int(current["max_frames"])
     if frames > 4:
-        lowered_frames = max(4, int(math.floor(frames * 0.75)))
+        lowered_frames = max(4, int(math.floor(frames * scale)))
         if lowered_frames < frames:
             updated = dict(current)
             updated["max_frames"] = lowered_frames
@@ -1509,9 +1727,11 @@ def _caption_with_oom_recovery(
     gen = _model_gen(spec)
     pre_values = {
         "fps": spec.preprocess.fps,
-        "max_frames": spec.preprocess.max_frames,
+        "max_frames": _effective_max_frames(spec, model),
         "max_pixels": spec.preprocess.max_pixels,
         "min_pixels": spec.preprocess.min_pixels or model.limits.min_pixels,
+        "total_pixel_cap": spec.preprocess.total_pixel_cap,
+        "adaptive_threshold": spec.preprocess.adaptive_threshold,
         "use_audio_in_video": spec.preprocess.use_audio_in_video,
         "sampling_strategy": spec.preprocess.sampling_strategy,
     }
@@ -1558,17 +1778,17 @@ def _caption_with_oom_recovery(
                             "compile",
                         )
                         continue
-            if not gpu.is_oom_error(exc) or retries >= 2:
+            if not gpu.is_oom_error(exc) or retries >= spec.runtime.oom_retries:
                 raise
             _empty_cuda_cache()
-            degraded = _degrade_pre(pre_values, model)
+            degraded = _degrade_pre(pre_values, model, spec.runtime.oom_degrade_factor)
             if degraded is None:
                 raise
             pre_values, description = degraded
             retries += 1
             emitter.log(
                 f"CUDA OOM during caption generation; cleared cache and reduced {description}. "
-                f"Retry {retries}/2.",
+                f"Retry {retries}/{spec.runtime.oom_retries}.",
                 "warning",
                 "oom",
             )
@@ -1588,21 +1808,70 @@ def _finalize_text(spec: JobSpec, text: str) -> str:
             "whole_words": spec.post.replace_whole_words,
         },
         collapse_whitespace=spec.post.collapse_whitespace,
+        max_length=spec.post.max_caption_chars,
+        dedupe_repeated_sentences=spec.post.dedupe_repeated_sentences,
+        join_separator=spec.post.join_separator,
     )
 
 
-def _finalize_cue_text(spec: JobSpec, text: str) -> str:
+def _finalize_cue_text(spec: JobSpec, text: str, *, dedupe: bool | None = None) -> str:
     """Apply find/replace to a cue without caption-level text injection."""
 
-    if not spec.post.replace_pairs:
-        return str(text)
-    return apply_replacements(
+    return finalize_caption(
         str(text),
-        spec.post.replace_pairs,
-        regex=spec.post.replace_regex,
-        case_insensitive=spec.post.replace_case_insensitive,
-        whole_words=spec.post.replace_whole_words,
+        replace_pairs=spec.post.replace_pairs,
+        replace_opts={
+            "regex": spec.post.replace_regex,
+            "case_insensitive": spec.post.replace_case_insensitive,
+            "whole_words": spec.post.replace_whole_words,
+        },
+        collapse_whitespace=spec.post.collapse_whitespace,
+        trigger_mode="none",
+        max_length=spec.post.max_caption_chars,
+        dedupe_repeated_sentences=(
+            spec.post.dedupe_repeated_sentences if dedupe is None else bool(dedupe)
+        ),
+        join_separator=spec.post.join_separator,
     )
+
+
+_STRUCTURED_CAPTION_KEYS = frozenset(
+    {
+        "text",
+        "caption",
+        "description",
+        "answer",
+        "summary",
+        "segment_detail_caption",
+        "camera_state",
+        "video_background",
+        "storyline",
+        "shooting_style",
+        "speech_content",
+        "acoustics_content",
+    }
+)
+
+
+def _finalize_structured(spec: JobSpec, value: Any, field_name: str | None = None) -> Any:
+    """Apply caption cleanup to textual leaves written as JSON or JSONL."""
+
+    if isinstance(value, str):
+        return (
+            _finalize_cue_text(spec, value, dedupe=False)
+            if field_name is None or field_name.casefold() in _STRUCTURED_CAPTION_KEYS
+            else value
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): _finalize_structured(spec, item, str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_finalize_structured(spec, item, field_name) for item in value]
+    if isinstance(value, tuple):
+        return [_finalize_structured(spec, item, field_name) for item in value]
+    return value
 
 
 def _context_excerpt(text: str, word_limit: int = 60) -> str:
@@ -1610,8 +1879,14 @@ def _context_excerpt(text: str, word_limit: int = 60) -> str:
     return " ".join(words[-max(1, int(word_limit)) :])
 
 
-def _prompt_with_context(prompt: Any, previous_text: str, model: ModelSpec) -> Any:
-    excerpt = _context_excerpt(previous_text)
+def _prompt_with_context(
+    prompt: Any,
+    previous_text: str,
+    model: ModelSpec,
+    word_limit: int = 60,
+    context_prompt: str = "Context from the previous segment (do not repeat it): {{CONTEXT}}",
+) -> Any:
+    excerpt = _context_excerpt(previous_text, word_limit)
     if not excerpt:
         return prompt
     base_user = getattr(prompt, "user_prompt", None)
@@ -1624,7 +1899,8 @@ def _prompt_with_context(prompt: Any, previous_text: str, model: ModelSpec) -> A
                 _, base_user = render_prompt(get_preset(preset_id), dict(getattr(prompt, "variables", {}) or {}))
             except KeyError:
                 base_user = ""
-    context = f"Context from the previous segment (do not repeat it): {json.dumps(excerpt, ensure_ascii=False)}"
+    rendered_excerpt = json.dumps(excerpt, ensure_ascii=False)
+    context = str(context_prompt).replace("{{CONTEXT}}", rendered_excerpt)
     user_prompt = f"{str(base_user or '').rstrip()}\n\n{context}".lstrip()
     return replace(prompt, user_prompt=user_prompt)
 
@@ -1647,6 +1923,118 @@ def _time_label(seconds: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     secs, millis = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _summary_time_label(seconds: float, include_hours: bool = False) -> str:
+    total = max(0, int(round(float(seconds))))
+    if include_hours:
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    minutes, secs = divmod(total, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _summary_input(
+    spec: JobSpec,
+    model: ModelSpec,
+    records: Sequence[Mapping[str, Any]],
+    emitter: _Emitter,
+) -> str:
+    from vcap.prompts.presets import _render_template
+
+    heading = str(_render_template(spec.summary_prompt, dict(spec.prompt.variables)) or "").strip()
+    include_hours = any(float(record.get("end_s") or 0.0) >= 3600.0 for record in records)
+    lines = [
+        f"{_summary_time_label(float(record['start_s']), include_hours)}-"
+        f"{_summary_time_label(float(record['end_s']), include_hours)} "
+        f"{str(record.get('caption') or '').strip()}"
+        for record in records
+    ]
+    input_token_budget = max(1, _context_limit(spec, model) - spec.summary_max_new_tokens)
+    character_budget = max(1, input_token_budget * 4)
+    removed = 0
+    while len(lines) > 1 and len(heading) + 2 + sum(len(line) + 1 for line in lines) > character_budget:
+        lines.pop(0)
+        removed += 1
+    prompt = heading + ("\n\n" if heading and lines else "") + "\n".join(lines)
+    if len(prompt) > character_budget:
+        if len(heading) >= character_budget:
+            heading = heading[:character_budget].rstrip()
+        available = max(0, character_budget - len(heading) - (2 if heading else 0))
+        newest = lines[-1][-available:] if available else ""
+        prompt = heading + ("\n\n" if heading and newest else "") + newest
+        removed += 1
+    if removed:
+        emitter.log(
+            f"Summary prompt exceeded the context window; truncated {removed} oldest caption(s).",
+            "warning",
+            "summary",
+        )
+    return prompt
+
+
+def _summarize_item(
+    spec: JobSpec,
+    entry: _ResolvedInput,
+    model: ModelSpec,
+    session: _ModelSession,
+    records: Sequence[Mapping[str, Any]],
+    emitter: _Emitter,
+    cancel: CancelToken,
+) -> tuple[str, dict[str, Any], dict[str, Any], Path | None]:
+    if (
+        not spec.summarize_segments
+        or len(records) < 2
+        or model.family not in {"qwen3_omni_instruct", "qwen3_omni_thinking"}
+    ):
+        return "", {}, {}, None
+    from vcap.models.base import MediaInput, PromptSpec as ModelPromptSpec
+
+    _check_cancel(cancel)
+    emitter.progress(
+        entry.tracker_index,
+        entry.result_index,
+        f"Summarizing {len(records)} segments",
+        0.91,
+        step_index=7,
+    )
+    summary_input = _summary_input(spec, model, records, emitter)
+    summary_spec = replace(
+        spec,
+        generation=replace(
+            spec.generation,
+            max_new_tokens=spec.summary_max_new_tokens,
+        ),
+    )
+    result = _caption_with_oom_recovery(
+        summary_spec,
+        model,
+        session,
+        ModelPromptSpec(),
+        MediaInput(kind="text", text=summary_input),
+        _caption_progress(
+            emitter,
+            entry.tracker_index,
+            entry.result_index,
+            len(records),
+            len(records),
+        ),
+        cancel,
+        emitter,
+    )
+    summary = _finalize_cue_text(spec, str(result.text))
+    assert entry.out_dir is not None
+    path = OutputWriter().write_text(
+        entry.out_dir / f"{entry.stem}_summary.txt",
+        summary + ("\n" if summary and not summary.endswith("\n") else ""),
+    )
+    return (
+        summary,
+        _record_value(getattr(result, "usage", None)),
+        _record_value(getattr(result, "timing", None)),
+        path,
+    )
 
 
 def _process_item(
@@ -1721,8 +2109,11 @@ def _process_item(
                 try:
                     quality = analyze_clip_quality(
                         segment.path,
+                        sample_frames=spec.split.quality_frames,
                         start_s=segment.media_start,
                         end_s=segment.media_end,
+                        black_luma=spec.split.reject_black_luma,
+                        silence_rms=spec.split.reject_silence_rms,
                     )
                     reject, reasons = should_reject(quality, _reject_rules(spec))
                     record["quality"] = asdict(quality)
@@ -1770,7 +2161,13 @@ def _process_item(
             media = _media_input(entry, model_segment, spec, model)
             segment_prompt = item_prompt
             if context_enabled and source_position > 0 and previous_final_text:
-                segment_prompt = _prompt_with_context(item_prompt, previous_final_text, model)
+                segment_prompt = _prompt_with_context(
+                    item_prompt,
+                    previous_final_text,
+                    model,
+                    spec.context_carry_words,
+                    spec.context_carry_prompt,
+                )
                 emitter.log(
                     f"Applied previous-segment context to clip {segment.index}/{total_sources}.",
                     scope="prompts",
@@ -1792,7 +2189,19 @@ def _process_item(
                 emitter,
             )
             raw_caption_text = str(caption_result.text)
+            removed_repetitions = 0
+            if spec.post.dedupe_repeated_sentences:
+                _, removed_repetitions = dedupe_repeated_sentences(raw_caption_text)
             final_text = _finalize_text(spec, raw_caption_text)
+            if removed_repetitions > 0:
+                emitter.log(
+                    f"Removed {removed_repetitions} repeated sentence(s)",
+                    scope="postprocess",
+                )
+            final_structured = _finalize_structured(
+                spec,
+                getattr(caption_result, "structured", None),
+            )
             local_cues = [
                 Segment(float(start), float(end), _finalize_cue_text(spec, str(text)))
                 for start, end, text in list(getattr(caption_result, "segments", []) or [])
@@ -1804,6 +2213,7 @@ def _process_item(
                     local_cues,
                     0.0,
                     segment.duration_s,
+                    min_duration_s=spec.post.subtitle_min_cue_s,
                 )
             else:
                 local_cues = []
@@ -1830,9 +2240,10 @@ def _process_item(
                     segment_stem,
                     formats,
                     text=final_text,
-                    structured=getattr(caption_result, "structured", None),
+                    structured=final_structured,
                     segments=local_cues,
                     reasoning=reasoning,
+                    max_line_chars=spec.post.subtitle_max_line_chars,
                 )
             peak = max(peak, float(getattr(caption_result, "peak_vram_gb", 0.0) or 0.0))
             timing = getattr(caption_result, "timing", None)
@@ -1845,7 +2256,7 @@ def _process_item(
             record.update(
                 status="done",
                 caption=final_text,
-                structured=getattr(caption_result, "structured", None),
+                structured=final_structured,
                 outputs={key: str(path) for key, path in paths.items()},
                 reasoning_saved=bool(reasoning and spec.post.save_reasoning),
                 usage=usage,
@@ -1897,6 +2308,33 @@ def _process_item(
                 }
                 for record in done_records
             ]
+        summary = ""
+        summary_usage: dict[str, Any] = {}
+        summary_timing: dict[str, Any] = {}
+        summary_path: Path | None = None
+        try:
+            summary, summary_usage, summary_timing, summary_path = _summarize_item(
+                spec,
+                entry,
+                model,
+                session,
+                done_records,
+                emitter,
+                cancel,
+            )
+        except CancelledError:
+            raise
+        except Exception as exc:
+            emitter.log(
+                f"Summary generation failed; keeping segment captions: {type(exc).__name__}: {exc}",
+                "warning",
+                "summary",
+            )
+        if summary:
+            if isinstance(combined_structured, Mapping):
+                combined_structured = {**dict(combined_structured), "summary": summary}
+            else:
+                combined_structured = {"segments": combined_structured, "summary": summary}
         emitter.progress(entry.tracker_index, entry.result_index, "Writing combined outputs", 0.94, step_index=7)
         formats = list(spec.post.formats)
         if spec.post.save_reasoning and combined_reasoning and "reasoning" not in formats:
@@ -1909,7 +2347,10 @@ def _process_item(
             structured=combined_structured,
             segments=combined_cues,
             reasoning="\n\n".join(combined_reasoning),
+            max_line_chars=spec.post.subtitle_max_line_chars,
         )
+        if summary_path is not None:
+            combined_paths["summary"] = summary_path
         elapsed = time.perf_counter() - started
         emitter.progress(entry.tracker_index, entry.result_index, "Item complete", 1.0, step_index=8)
         return ItemResult(
@@ -1923,6 +2364,9 @@ def _process_item(
             elapsed=elapsed,
             peak_vram_gb=max(peak, session.peak_vram_gb),
             gpu_index=spec.runtime.gpu_index,
+            summary=summary,
+            summary_usage=summary_usage,
+            summary_timing=summary_timing,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1936,7 +2380,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     except KeyError as exc:
         model = next(iter(MODEL_SPECS.values()))
         model_error = str(exc)
-    resolved = _resolve_inputs(spec)
+    filter_messages: list[str] = []
+    resolved = _resolve_inputs(spec, filter_messages.append)
     preassigned_outputs = _apply_preassigned_outputs(spec, resolved)
     if spec.output.kind == "batch" and not preassigned_outputs:
         _assign_batch_outputs(spec, resolved)
@@ -1955,6 +2400,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             f"Starting {spec.output.kind} job with {len(resolved)} resolved input(s) using "
             f"{spec.model.variant_key}."
         )
+        for message in filter_messages:
+            emitter.log(message, scope="inputs")
         if spec.output.kind == "batch" and (
             spec.preprocess.trim_start_s > 1e-9 or spec.preprocess.trim_end_s is not None
         ):
@@ -1966,6 +2413,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                 entry.message = f"Unknown model variant: {spec.model.variant_key}"
         else:
             _probe_and_classify(spec, resolved, model)
+            if not spec.internal.get("suppress_job_contract_logs"):
+                _log_job_generation_contracts(spec, model, resolved, emitter)
             _apply_batch_skip(spec, resolved)
             _apply_batch_limit(spec, resolved)
             # The VRAM plan is made once at the first load; size it from the media
@@ -2173,7 +2622,8 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     from vcap.core.subprocess_runner import WorkerProcess, build_child_env
 
     started = time.perf_counter()
-    expanded = _resolve_inputs(spec)
+    filter_messages: list[str] = []
+    expanded = _resolve_inputs(spec, filter_messages.append)
     if not expanded:
         local_spec = replace(
             spec,
@@ -2181,12 +2631,57 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         )
         return _run_job_local(local_spec, sinks, cancel)
     run_dir = _allocate_job_dir(spec)
+    contract_model: ModelSpec | None = None
+    contract_entries: list[_ResolvedInput] = []
+    try:
+        contract_model = MODEL_SPECS[variant_to_family(spec.model.variant_key)]
+        for entry in expanded:
+            candidate = replace(entry)
+            if candidate.path is not None:
+                candidate.info = probe_media(candidate.path)
+            candidate.capability, candidate.kind = _required_capability(
+                candidate.info,
+                candidate.item,
+                spec,
+                contract_model,
+            )
+            contract_entries.append(candidate)
+    except (KeyError, OSError):
+        contract_model = None
+
     with RunLog(run_dir):
+        for message in filter_messages:
+            get_log().log(message, scope="inputs")
+            if sinks is not None:
+                _call_sink(sinks.on_log, message, level="info", scope="inputs")
         get_log().log(
             f"Starting multi-GPU job on devices {', '.join(map(str, spec.runtime.gpu_indices))}.",
             scope="pipeline",
             console=os.environ.get("VCAP_WORKER", "") != "1",
         )
+        if contract_model is not None:
+            class _ContractEmitter:
+                @staticmethod
+                def log(
+                    message: object,
+                    level: str = "info",
+                    scope: str = "pipeline",
+                ) -> None:
+                    get_log().log(str(message), level=level, scope=scope)
+                    if sinks is not None:
+                        _call_sink(
+                            sinks.on_log,
+                            str(message),
+                            level=level,
+                            scope=scope,
+                        )
+
+            _log_job_generation_contracts(
+                spec,
+                contract_model,
+                contract_entries,
+                _ContractEmitter(),  # type: ignore[arg-type]
+            )
     if spec.output.kind == "single":
         _assign_single_outputs(run_dir, expanded)
     else:
@@ -2219,6 +2714,11 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     workers: dict[int, WorkerProcess] = {}
     threads: list[threading.Thread] = []
 
+    active_partitions = [
+        (gpu_index, part)
+        for gpu_index, part in zip(gpu_indices, partitions)
+        if part
+    ]
     def pump(gpu_index: int, partition: list[_ResolvedInput]) -> None:
         worker = WorkerProcess()
         workers[gpu_index] = worker
@@ -2258,6 +2758,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     "index_map": index_map,
                     "output_stems": [entry.stem for entry in partition],
                     "output_dirs": [str(entry.out_dir) for entry in partition],
+                    "suppress_job_contract_logs": True,
                 },
             )
             worker.send({"cmd": "run_job", "job": child_spec.to_dict()})
@@ -2270,7 +2771,6 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         finally:
             messages.put((gpu_index, "done", None))
 
-    active_partitions = [(gpu_index, part) for gpu_index, part in zip(gpu_indices, partitions) if part]
     for gpu_index, partition in active_partitions:
         thread = threading.Thread(
             target=pump,

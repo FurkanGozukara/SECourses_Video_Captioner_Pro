@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T04:33:33.727002+03:00",
+  "summary": {
+    "variant": "timechat_int4",
+    "checkpoint_gb": 6.45161176,
+    "load_s": 21.50117840000894,
+    "peak_vram_gib": 7.832724571228027,
+    "prefill_tok_s_mean": 2522.8369125639892,
+    "decode_tok_s_mean": 26.123333029175136,
+    "generated_tokens_mean": 256,
+    "wall_clock_s_mean": 17.56583919993136,
+    "finish_reason": "length",
+    "caption_preview": "[ { \"timestamp\": \"00:00-00:04\", \"segment_detail_caption\": \"A dark, blurry, high-angle shot shows a city street at night. The scene is almost completely black, with only a few distant streetlights and ",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "timechat_int4",
+    "family": "timechat",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 160,
+      "sampling_strategy": "fps",
+      "max_pixels": 297920,
+      "min_pixels": 100352,
+      "use_audio_in_video": true,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 21.50117840000894,
+    "peak_vram_gb": 6.23411226272583,
+    "checkpoint_bytes": 6451611760,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 569,
+    "bf16_layers": 49,
+    "compile_mode": "eager",
+    "warnings": [],
+    "block_swap": {
+      "mode": "resident",
+      "layer_count": 28,
+      "resident_layers": 28,
+      "swapped_layers": 0,
+      "slots": 0,
+      "layer_mib": 111.3,
+      "non_layer_gib": 2.96,
+      "resident_weight_gib": 6.01,
+      "activation_estimate_gib": 4.76,
+      "allocator_slack_gib": 2.88,
+      "stage_towers": false,
+      "tower_gib": 0.93,
+      "reserve_gib": 2.0,
+      "free_vram_gib": 30.26,
+      "total_vram_gib": 31.84,
+      "expected_peak_gib": 13.65,
+      "pinned_gib": 0.0,
+      "notes": [
+        "Resident: 28/28 decoder layers resident; GPU weights 6.0 GiB; activation estimate 4.8 GiB; allocator slack 2.9 GiB; reserve 2.0 GiB; expected peak 13.7 of 30.3 GiB free"
+      ]
+    },
+    "resident_bytes": 6461841920,
+    "activation_estimate_bytes": 5115474912,
+    "vram_cap_bytes": 32227983360
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 7561,
+      "generated_tokens": 256,
+      "finish_reason": "length",
+      "prefill_s": 2.9970229000318795,
+      "decode_s": 9.761388399987482,
+      "prefill_tok_s": 2522.8369125639892,
+      "decode_tok_s": 26.123333029175136,
+      "generation_s": 12.758411300019361,
+      "wall_clock_s": 17.56583919993136,
+      "peak_vram_gib": 7.832724571228027,
+      "caption_chars": 1116,
+      "caption_preview": "[ { \"timestamp\": \"00:00-00:04\", \"segment_detail_caption\": \"A dark, blurry, high-angle shot shows a city street at night. The scene is almost completely black, with only a few distant streetlights and ",
+      "caption": "[\n  {\n    \"timestamp\": \"00:00-00:04\",\n    \"segment_detail_caption\": \"A dark, blurry, high-angle shot shows a city street at night. The scene is almost completely black, with only a few distant streetlights and building lights providing minimal illumination. The silhouettes of buildings and trees are visible in the foreground, while the road below has the faint motion blur of passing cars.\",\n    \"camera_state\": \"The camera is positioned at a high angle, looking down on the street. The shot is static and out of focus, creating a blurry, abstract view of the scene.\",\n    \"video_background\": \"The setting is a dark, urban environment at night. The background consists of silhouetted buildings, distant streetlights, and a dark sky.\",\n    \"storyline\": \"This opening shot establishes a dark, moody, and urban setting, setting a somber tone for the video.\",\n    \"shooting_style\": \"This is a single, static shot with a heavy blur effect.\",\n    \"speech_content\": \"\",\n    \"acoustics_content\": \"1) Tone of speech: N/A. 2) Background sounds or music: Faint, ambient sounds of rain and distant traffic can be heard.\"\n  }\n]",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

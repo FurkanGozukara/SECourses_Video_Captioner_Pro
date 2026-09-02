@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:28:59.988279+03:00",
+  "summary": {
+    "variant": "qwen3_omni_instruct_int4",
+    "checkpoint_gb": 17.780288064,
+    "load_s": 25.232398199965246,
+    "peak_vram_gib": 17.88195276260376,
+    "prefill_tok_s_mean": 3370.951449825289,
+    "decode_tok_s_mean": 12.1100571738724,
+    "generated_tokens_mean": 180,
+    "wall_clock_s_mean": 21.141648199991323,
+    "finish_reason": "eos",
+    "caption_preview": "The video opens on a dark, rainy night, capturing a city street intersection from an elevated, stationary viewpoint. The sky is black, with only a few distant lights and a faint glow on the horizon. S",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "qwen3_omni_instruct_int4",
+    "family": "qwen3_omni_instruct",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\lightning_storm_20s.mp4",
+    "runs": 1,
+    "unfused_gate_up_control": false,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "flash_attention_2",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 128,
+      "sampling_strategy": "fps",
+      "max_pixels": 262144,
+      "min_pixels": 4096,
+      "use_audio_in_video": true,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 25.232398199965246,
+    "peak_vram_gb": 16.569599628448486,
+    "checkpoint_bytes": 17780288064,
+    "attention": "flash_attention_2",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 18810,
+    "bf16_layers": 176,
+    "compile_mode": "eager",
+    "warnings": [],
+    "block_swap": {
+      "mode": "resident",
+      "layer_count": 48,
+      "resident_layers": 48,
+      "swapped_layers": 0,
+      "slots": 0,
+      "layer_mib": 299.3,
+      "non_layer_gib": 2.52,
+      "resident_weight_gib": 16.55,
+      "activation_estimate_gib": 3.59,
+      "allocator_slack_gib": 2.29,
+      "stage_towers": false,
+      "tower_gib": 1.36,
+      "reserve_gib": 2.0,
+      "free_vram_gib": 30.26,
+      "total_vram_gib": 31.84,
+      "expected_peak_gib": 22.43,
+      "pinned_gib": 0.0,
+      "notes": [
+        "Resident: 48/48 decoder layers resident; GPU weights 16.5 GiB; activation estimate 3.6 GiB; allocator slack 2.3 GiB; reserve 2.0 GiB; expected peak 22.4 of 30.3 GiB free"
+      ]
+    },
+    "resident_bytes": 17791472128,
+    "activation_estimate_bytes": 3850926783,
+    "vram_cap_bytes": 32227983360
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 5415,
+      "generated_tokens": 180,
+      "finish_reason": "eos",
+      "prefill_s": 1.6063714000629261,
+      "decode_s": 14.781102799926884,
+      "prefill_tok_s": 3370.951449825289,
+      "decode_tok_s": 12.1100571738724,
+      "generation_s": 16.38747419998981,
+      "wall_clock_s": 21.141648199991323,
+      "peak_vram_gib": 17.88195276260376,
+      "caption_chars": 914,
+      "caption_preview": "The video opens on a dark, rainy night, capturing a city street intersection from an elevated, stationary viewpoint. The sky is black, with only a few distant lights and a faint glow on the horizon. S",
+      "caption": "The video opens on a dark, rainy night, capturing a city street intersection from an elevated, stationary viewpoint. The sky is black, with only a few distant lights and a faint glow on the horizon. Streetlights and building lights cast a yellowish glow, reflecting off the wet pavement. Cars with headlights and taillights move through the intersection, their lights creating streaks due to the long exposure of the camera. At approximately 00:03, a bright flash of lightning illuminates the sky, followed by a loud, low-frequency rumble of thunder that quickly fades. The rain continues to fall steadily, creating a constant, soft patter audible throughout. The scene remains consistent, with vehicles continuing to navigate the slick roads under the dim, artificial lighting. The camera maintains its fixed position, offering a continuous, unchanging view of the nocturnal urban landscape as the storm persists.",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

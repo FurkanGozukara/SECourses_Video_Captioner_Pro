@@ -196,7 +196,107 @@ def selected_model_action_key(value: Any) -> str:
 
 
 def _selected_status(key: str, message: str) -> str:
-    return f"Selected: {html.escape(key)}  \n{message}"
+    size_bytes = _variant_disk_usage_bytes(key)
+    return (
+        f"Selected: {html.escape(key)} · On disk: {size_bytes / (1024 ** 3):.2f} GB "
+        f"({size_bytes:,} bytes)  \n{message}"
+    )
+
+
+def _variant_disk_usage_bytes(key: str, usage_fn: Any = None) -> int:
+    """Read one variant's on-disk usage, with a pre-F1 compatibility fallback."""
+
+    if usage_fn is None:
+        try:
+            from vcap.models.downloads import variant_disk_usage
+        except ImportError:
+            return _local_bytes(resolve_model_dir(key))
+        usage_fn = variant_disk_usage
+    try:
+        return max(0, int(usage_fn(key) or 0))
+    except Exception:
+        return _local_bytes(resolve_model_dir(key))
+
+
+def request_model_delete(
+    variant_key: str,
+    pong: Mapping[str, Any] | None = None,
+    usage_fn: Any = None,
+) -> dict[str, Any]:
+    """Return the inline delete-confirmation state or a plain blocked reason."""
+
+    key = selected_model_action_key(variant_key)
+    worker = dict(pong or {})
+    if worker.get("busy"):
+        return {
+            "state": "blocked",
+            "variant_key": key,
+            "message": "A caption job is running; model files cannot be deleted yet.",
+        }
+    if str(worker.get("loaded_variant") or "") == key:
+        return {
+            "state": "blocked",
+            "variant_key": key,
+            "message": f"{key} is resident in the worker; unload it before deleting its files.",
+        }
+    size_bytes = _variant_disk_usage_bytes(key, usage_fn)
+    if size_bytes <= 0:
+        return {
+            "state": "blocked",
+            "variant_key": key,
+            "message": f"No on-disk files were found for {key}.",
+        }
+    label = str(get_variant(key).label)
+    return {
+        "state": "confirm",
+        "variant_key": key,
+        "size_bytes": size_bytes,
+        "question": f"Delete {label} ({size_bytes / (1024 ** 3):.2f} GB) from disk?",
+    }
+
+
+def delete_model_files_report(variant_key: str, delete_fn: Any = None) -> str:
+    """Delete a variant through F1's helper and render its complete report."""
+
+    key = selected_model_action_key(variant_key)
+    if delete_fn is None:
+        try:
+            from vcap.models.downloads import delete_variant_files
+        except ImportError:
+            return "<span class='vc-warn'>Delete model files becomes available after the backend update.</span>"
+        delete_fn = delete_variant_files
+    try:
+        report = delete_fn(key)
+        value = dict(report) if isinstance(report, Mapping) else {
+            name: getattr(report, name)
+            for name in ("variant_key", "folder", "files_removed", "bytes_freed", "errors")
+            if hasattr(report, name)
+        }
+        files = int(value.get("files_removed", 0) or 0)
+        freed = int(value.get("bytes_freed", 0) or 0)
+        errors = [str(item) for item in (value.get("errors") or [])]
+        message = f"Removed {files} file(s) and freed {freed:,} bytes ({freed / (1024 ** 3):.2f} GB) for {key}."
+        if errors:
+            message += " Errors: " + " | ".join(errors[:6])
+        css = "vc-ok" if not errors else ("vc-warn" if files else "vc-err")
+        return f"<span class='{css}'>{html.escape(message)}</span>"
+    except Exception as exc:
+        return f"<span class='vc-err'>Could not delete {html.escape(key)}: {html.escape(str(exc))}</span>"
+
+
+def render_update_status(status: Any) -> str:
+    """Color an UpdateStatus message by success and behind/ahead state."""
+
+    if isinstance(status, Mapping):
+        ok = bool(status.get("ok"))
+        behind = int(status.get("behind", 0) or 0)
+        message = str(status.get("message") or "Update check returned no message.")
+    else:
+        ok = bool(getattr(status, "ok", False))
+        behind = int(getattr(status, "behind", 0) or 0)
+        message = str(getattr(status, "message", "Update check returned no message."))
+    css = "vc-err" if not ok else ("vc-warn" if behind > 0 else "vc-ok")
+    return f"<span class='{css}'>{html.escape(message)}</span>"
 
 
 def _cancelled(token: object | None) -> bool:
@@ -474,7 +574,19 @@ def build(ctx: "UiContext") -> None:
                 value=report_text, language=None, lines=15, max_lines=22,
                 label="Environment report", buttons=["copy"], interactive=False,
             )
-            copy_report = action_button("Copy environment report", "cyan", size="md")
+            with gr.Row(elem_classes=["vc-compact-row"]):
+                copy_report = action_button("Copy environment report", "cyan", size="md")
+                check_updates = action_button(
+                    "🔎 Check for updates",
+                    "cobalt",
+                    size="md",
+                    elem_id="vc_check_for_updates",
+                )
+            update_status = gr.Markdown(
+                "<span class='vc-help'>Update status has not been checked.</span>",
+                elem_classes=["vc-status"],
+                elem_id="vc_update_status",
+            )
 
         with gr.Column(scale=5, min_width=480):
             gr.Markdown("### GPUs")
@@ -510,7 +622,16 @@ def build(ctx: "UiContext") -> None:
             model_health_status = gr.Markdown(
                 _model_health_report(ctx), elem_classes=["vc-status"]
             )
-            refresh_model_health = action_button("Refresh model status", "cyan", size="md")
+            with gr.Row(elem_classes=["vc-compact-row"]):
+                refresh_model_health = action_button("Refresh model status", "cyan", size="md")
+                unload_model = action_button(
+                    "⏏ Unload model", "plum", size="md",
+                    elem_id="vc_health_unload_model",
+                )
+                open_logs = action_button(
+                    "📂 Open logs folder", "berry", size="md",
+                    elem_id="vc_open_logs_folder_health",
+                )
 
     gr.Markdown("### Models")
     initial_rows, initial_keys = model_inventory()
@@ -524,16 +645,61 @@ def build(ctx: "UiContext") -> None:
         label="Model variants",
     )
     variant_choices = all_variant_choices()
+    initial_variant_key = variant_choices[0][1] if variant_choices else ""
+    initial_delete_check = (
+        request_model_delete(initial_variant_key, _pipeline_ping(ctx))
+        if initial_variant_key
+        else {"state": "blocked"}
+    )
+    initial_model_message = "Ready for Download or Verify."
+    if initial_delete_check.get("state") == "blocked":
+        initial_model_message += (
+            " <span class='vc-warn'>"
+            f"{html.escape(str(initial_delete_check.get('message') or 'Delete unavailable.'))}"
+            "</span>"
+        )
     with gr.Row(elem_classes=["vc-compact-row"]):
         variant = gr.Dropdown(
-            choices=variant_choices, value=variant_choices[0][1] if variant_choices else None,
+            choices=variant_choices, value=initial_variant_key or None,
             label="Model action", info="Pick a variant to download or verify.", scale=5,
         )
         download = action_button("📥 Download", "sky", size="md")
         cancel = action_button("Cancel", "red", size="md")
         verify = action_button("🔍 Verify", "violet", size="md")
+        delete_model = action_button(
+            "🗑 Delete model files",
+            "olive",
+            size="md",
+            elem_id="vc_health_delete_model_files",
+            interactive=initial_delete_check.get("state") == "confirm",
+        )
         open_models = action_button("Open models folder", "teal", size="md")
-    model_status = gr.Markdown("Ready.", elem_classes=["vc-status"])
+    delete_confirmation_state = gr.State({})
+    with gr.Row(
+        visible=False,
+        elem_id="vc_health_delete_model_confirmation",
+        elem_classes=["vc-confirm-bar", "vc-compact-row"],
+    ) as delete_confirmation:
+        delete_question = gr.Markdown("Delete the selected model files from disk?")
+        delete_yes = action_button(
+            "✔ Yes, delete",
+            "berry",
+            size="sm",
+            variant="stop",
+            elem_id="vc_health_delete_model_yes",
+        )
+        delete_keep = action_button(
+            "✖ Keep files",
+            "slate",
+            size="sm",
+            elem_id="vc_health_delete_model_keep",
+        )
+    model_status = gr.Markdown(
+        _selected_status(initial_variant_key, initial_model_message)
+        if initial_variant_key
+        else "Ready.",
+        elem_classes=["vc-status"],
+    )
     model_progress = gr.HTML(render_progress_html(0.0, "Ready", "Choose a model action."))
     download_log = gr.Textbox(
         value="", label="Model action log", lines=14, max_lines=18,
@@ -560,15 +726,95 @@ def build(ctx: "UiContext") -> None:
         js="(text) => { navigator.clipboard.writeText(text || ''); return []; }",
         queue=False, show_progress="hidden", api_visibility="private",
     )
+
+    def check_updates_handler() -> str:
+        try:
+            from vcap.core.updates import check_for_updates
+        except ImportError:
+            return "<span class='vc-warn'>Update check becomes available after the backend update.</span>"
+        try:
+            return render_update_status(check_for_updates(ctx.app_dir))
+        except Exception as exc:
+            return f"<span class='vc-err'>Update check failed: {html.escape(str(exc))}</span>"
+
+    check_updates.click(
+        check_updates_handler,
+        outputs=update_status,
+        concurrency_id="vc-update-check",
+        concurrency_limit=1,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def refresh_model_card(
+        selected_key: str,
+        confirmation: Mapping[str, Any] | None,
+    ) -> tuple[str, Any, Any]:
+        pong = _pipeline_ping(ctx)
+        busy = bool(pong.get("busy")) or ctx.get_active_cancel() is not None
+        if busy:
+            pong = {**pong, "busy": True}
+        delete_check = request_model_delete(selected_key, pong) if selected_key else {"state": "blocked"}
+        delete_enabled = delete_check.get("state") == "confirm" and not bool(confirmation)
+        detail = render_model_health(pong)
+        if delete_check.get("state") == "blocked":
+            detail += f"  \n<span class='vc-warn'>{html.escape(str(delete_check.get('message') or 'Delete unavailable.'))}</span>"
+        return detail, gr.update(interactive=not busy), gr.update(interactive=delete_enabled)
+
     refresh_model_health.click(
-        lambda: _model_health_report(ctx),
-        outputs=model_health_status,
+        refresh_model_card,
+        inputs=[variant, delete_confirmation_state],
+        outputs=[model_health_status, unload_model, delete_model],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     model_health_timer.tick(
-        lambda: _model_health_report(ctx),
+        refresh_model_card,
+        inputs=[variant, delete_confirmation_state],
+        outputs=[model_health_status, unload_model, delete_model],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def unload_health(selected_gpu: Any, selected_key: str) -> tuple[str, Any, Any]:
+        from vcap.ui.tabs.caption_tab import unload_model_report
+
+        message = unload_model_report(ctx.pipeline_client, int(selected_gpu or 0))
+        check = request_model_delete(str(selected_key), _pipeline_ping(ctx))
+        return (
+            f"{message}\n\n{_model_health_report(ctx)}",
+            gr.update(interactive=True),
+            gr.update(interactive=check.get("state") == "confirm"),
+        )
+
+    if gpu_index_state is not None:
+        unload_model.click(
+            unload_health,
+            inputs=[gpu_index_state, variant],
+            outputs=[model_health_status, unload_model, delete_model],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    else:
+        unload_model.click(
+            lambda selected_key: unload_health(gpu_default, selected_key),
+            inputs=variant,
+            outputs=[model_health_status, unload_model, delete_model],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+
+    def open_logs_handler() -> str:
+        ctx.logs_dir.mkdir(parents=True, exist_ok=True)
+        ok, message = open_in_file_manager(ctx.logs_dir)
+        return f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"
+
+    open_logs.click(
+        open_logs_handler,
         outputs=model_health_status,
         queue=False,
         show_progress="hidden",
@@ -661,11 +907,144 @@ def build(ctx: "UiContext") -> None:
         select_model, outputs=variant,
         queue=False, show_progress="hidden", api_visibility="private",
     )
+    def selected_model_status(value: str) -> tuple[str, Any, dict[str, Any], Any]:
+        key = str(value or "")
+        try:
+            pong = _pipeline_ping(ctx)
+            if ctx.get_active_cancel() is not None:
+                pong = {**pong, "busy": True}
+            check = request_model_delete(key, pong)
+            message = "Ready for Download or Verify."
+            if check.get("state") == "blocked":
+                message += f" <span class='vc-warn'>{html.escape(str(check.get('message') or 'Delete unavailable.'))}</span>"
+            return (
+                _selected_status(key, message),
+                gr.update(interactive=check.get("state") == "confirm"),
+                {},
+                gr.update(visible=False),
+            )
+        except Exception as exc:
+            return (
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+                gr.update(interactive=False),
+                {},
+                gr.update(visible=False),
+            )
+
     variant.change(
-        lambda value: _selected_status(str(value or ""), "Ready for Download or Verify."),
+        selected_model_status,
         inputs=variant,
-        outputs=model_status,
+        outputs=[model_status, delete_model, delete_confirmation_state, delete_confirmation],
         queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def request_delete_handler(key: str) -> tuple[Any, ...]:
+        try:
+            pong = _pipeline_ping(ctx)
+            if ctx.get_active_cancel() is not None:
+                pong = {**pong, "busy": True}
+            check = request_model_delete(key, pong)
+            if check.get("state") != "confirm":
+                reason = str(check.get("message") or "Model files cannot be deleted right now.")
+                return (
+                    {},
+                    gr.update(visible=False),
+                    gr.skip(),
+                    gr.update(interactive=False),
+                    _selected_status(str(key), f"<span class='vc-warn'>{html.escape(reason)}</span>"),
+                )
+            return (
+                check,
+                gr.update(visible=True),
+                f"⚠ {html.escape(str(check['question']))}",
+                gr.update(interactive=False),
+                _selected_status(str(key), "Waiting for delete confirmation."),
+            )
+        except Exception as exc:
+            return (
+                {},
+                gr.update(visible=False),
+                gr.skip(),
+                gr.update(interactive=False),
+                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+            )
+
+    def keep_model_files(key: str) -> tuple[Any, ...]:
+        try:
+            check = request_model_delete(key, _pipeline_ping(ctx))
+            enabled = check.get("state") == "confirm" and ctx.get_active_cancel() is None
+        except Exception:
+            enabled = False
+        return (
+            {},
+            gr.update(visible=False),
+            gr.update(interactive=enabled),
+            _selected_status(str(key), "Kept the selected model files."),
+        )
+
+    def confirm_delete_handler(state: Mapping[str, Any] | None) -> tuple[Any, ...]:
+        key = str((state or {}).get("variant_key") or "")
+        if not key:
+            return (
+                "<span class='vc-warn'>No model deletion is awaiting confirmation.</span>",
+                gr.skip(),
+                gr.update(visible=False),
+                gr.update(interactive=False),
+                {},
+            )
+        pong = _pipeline_ping(ctx)
+        if ctx.get_active_cancel() is not None:
+            pong = {**pong, "busy": True}
+        check = request_model_delete(key, pong)
+        if check.get("state") != "confirm":
+            reason = str(check.get("message") or "Model files cannot be deleted right now.")
+            return (
+                _selected_status(key, f"<span class='vc-warn'>{html.escape(reason)}</span>"),
+                gr.skip(),
+                gr.update(visible=False),
+                gr.update(interactive=False),
+                {},
+            )
+        message = delete_model_files_report(key)
+        post_check = request_model_delete(key, _pipeline_ping(ctx))
+        return (
+            _selected_status(key, message),
+            model_inventory()[0],
+            gr.update(visible=False),
+            gr.update(interactive=post_check.get("state") == "confirm"),
+            {},
+        )
+
+    delete_model.click(
+        request_delete_handler,
+        inputs=variant,
+        outputs=[
+            delete_confirmation_state,
+            delete_confirmation,
+            delete_question,
+            delete_model,
+            model_status,
+        ],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    delete_keep.click(
+        keep_model_files,
+        inputs=variant,
+        outputs=[delete_confirmation_state, delete_confirmation, delete_model, model_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    delete_yes.click(
+        confirm_delete_handler,
+        inputs=delete_confirmation_state,
+        outputs=[model_status, model_table, delete_confirmation, delete_model, delete_confirmation_state],
+        concurrency_id="model_delete",
+        concurrency_limit=1,
         show_progress="hidden",
         api_visibility="private",
     )
@@ -913,8 +1292,11 @@ def build(ctx: "UiContext") -> None:
 __all__ = [
     "build",
     "environment_report",
+    "delete_model_files_report",
     "model_inventory",
+    "render_update_status",
     "render_model_health",
+    "request_model_delete",
     "selected_model_action_key",
     "verify_local_files",
     "verify_local_gguf",

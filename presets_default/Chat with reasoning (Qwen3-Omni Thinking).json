@@ -3,10 +3,10 @@
     "format": "secourses_vcap_preset",
     "version": 1,
     "name": "Chat with reasoning (Qwen3-Omni Thinking)",
-    "description": "Multi-turn multimodal chat with the INT8 Qwen3-Omni Thinking model: reasoning shown in the collapsed Reasoning panel, the model's recommended sampling, and a 30-minute idle unload. Slower than Instruct; use it for questions that need step-by-step analysis."
+    "description": "Multi-turn multimodal chat with the INT4 Qwen3-Omni Thinking model: reasoning shown in the collapsed Reasoning panel, the model's recommended sampling, and a 30-minute idle unload. Slower than Instruct; use it for questions that need step-by-step analysis."
   },
   "settings": {
-    "model_key": "qwen3_omni_thinking_int8",
+    "model_key": "qwen3_omni_thinking_int4",
     "prompt_preset_id": "qwen3_thinking_dense",
     "system_prompt": null,
     "user_prompt": "Analyze the provided video and audio carefully, then write one {{CAPTION_LENGTH}} {{LANGUAGE}} caption grounded only in perceptible evidence. Reason through temporal order, subject and object continuity, physical action, camera changes, speech, music, sound effects, and cross-modal alignment before composing the answer. In the final answer, use one objective chronological paragraph, quote only intelligible speech, identify uncertainty briefly, and omit the reasoning, headings, and lists. {{AVOID}} {{EXTRA_INSTRUCTIONS}}",
@@ -41,7 +41,10 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": false,
     "save_reasoning": true,
     "overwrite_existing": false,

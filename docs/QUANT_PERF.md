@@ -173,3 +173,91 @@ Both variants used Flash Attention 2 and the profile's 42 GPU layers. INT8 paged
 under WDDM at a 33.07 GiB allocator high-water mark; INT4 avoided that pressure and
 completed a real clip 2.63x faster. Raw per-run results are in
 `tools/bench/results/c6_qwen3_thinking_{int8,int4}.json`.
+
+## v1.4.0 host-overhead removal (2026-09-02)
+
+Goal: remove fixed per-token host work from every backend without changing outputs or VRAM. Measured on physical
+GPU 0 (RTX 5090, `CUDA_VISIBLE_DEVICES=0`), greedy decoding, `max_new_tokens=256`, the 20 s
+`lightning_storm_20s.mp4` (video families) and the 18 s `demon_singer_audio_18_sec.mp3` (Captioner), through
+`tools/bench/benchmark.py` with the production 32 GB profile. Raw results: `tools/bench/results/v14_{baseline,after,control}_<variant>.json`.
+
+Changes:
+
+- Transformers path: the per-token `StoppingCriteria` now updates its counters every token but emits the console
+  line and the UI progress callback through a 0.1 s `UiThrottle` (first and last token always emitted), and reuses a
+  preallocated cancellation tensor instead of allocating one per token. `runner._Emitter` throttles only the
+  high-frequency token events (payloads carrying `new_tokens`); item, segment, download, and load events are untouched.
+  `console_progress.show_progress_line` gained a per-key minimum interval so any other caller is protected too.
+- GGUF path: the SSE response is read per HTTP chunk instead of `iter_lines(chunk_size=1)`; progress emission is
+  throttled the same way with exact token counts; `llama-server` is started with `--no-webui -np 1`; the new runtime
+  options (`gguf_threads`, `gguf_batch_size`, `gguf_ubatch_size`, `gguf_flash_attn`, `gguf_cache_reuse`,
+  `gguf_ignore_tier_context`, `gguf_extra_args`, `gguf_jpeg_quality`, `gguf_max_frames`) reach the server command line
+  and the frame budget, sampling runs send `seed`, and every clamp (tier context, frame cap) is logged.
+- ConvRot INT8/INT4: dense `gate_proj`/`up_proj` pairs are fused into one row-concatenated quantized linear (exactly
+  as Q/K/V already were), the Hadamard matrix is cached on each module at load time (no lock or string formatting on
+  the hot path), and the decode dispatch cache key no longer formats the device string. The separate modules are
+  dropped after fusion, so VRAM does not grow.
+
+| Variant | Stage | Load s | Prefill tok/s | Decode tok/s | Peak GiB | Tokens | Finish | Wall s |
+|---|---|---:|---:|---:|---:|---:|---|---:|
+| timechat_int4 | before | 21.50 | 2,522.8 | 26.12 | 7.833 | 256 | length | 17.57 |
+| timechat_int4 | after | 24.89 | 2,784.2 | 24.83 | 7.833 | 256 | length | 18.42 |
+| timechat_int8 | before | 21.31 | 2,784.7 | 23.50 | 11.318 | 256 | length | 19.17 |
+| timechat_int8 | after | 20.29 | 3,402.2 | 27.58 | 11.326 | 256 | length | 16.76 |
+| timechat_bf16 | before | 25.04 | 4,582.8 | 32.17 | 18.263 | 256 | length | 14.61 |
+| timechat_bf16 | after | 26.95 | 4,688.5 | 33.26 | 18.263 | 256 | length | 14.45 |
+| avocado_int4 | before | 19.19 | 2,315.3 | 23.40 | 8.286 | 249 | eos | 20.46 |
+| avocado_int4 | after | 22.60 | 3,283.6 | 25.32 | 8.286 | 256 | length | 18.97 |
+| qwen3_omni_instruct_int4 | before | 32.48 | 2,400.7 | 11.29 | 17.882 | 165 | eos | 21.99 |
+| qwen3_omni_instruct_int4 | after | 25.23 | 3,371.0 | 12.11 | 17.882 | 180 | eos | 21.14 |
+| qwen3_omni_instruct_int8 | before | 49.57 | 1,376.2 | 1.35 | 23.570 | 166 | eos | 131.14 |
+| qwen3_omni_instruct_int8 | after | 33.73 | 1,920.8 | 1.35 | 23.569 | 182 | eos | 142.09 |
+| qwen3_omni_instruct_gguf_q4 | before | 15.17 | 2,575.6 | 247.73 | 24.353 | 171 | eos | 6.28 |
+| qwen3_omni_instruct_gguf_q4 | after | 15.41 | 2,913.8 | 237.74 | 24.940 | 113 | eos | 7.72 |
+| qwen3_omni_captioner_gguf_q4 | before | 14.48 | 836.7 | 299.26 | 24.222 | 256 | length | 1.31 |
+| qwen3_omni_captioner_gguf_q4 | after | 13.13 | 933.9 | 301.10 | 24.222 | 256 | length | 1.26 |
+
+Reading the table:
+
+- Output identity: for every Transformers variant the "after" caption is byte-identical to a control run of the same
+  code with the throttling disabled (`v14_control_*`), so the changes are output-neutral. The "before" captions differ
+  from "after" only because the v1.4 backend round changed prompt defaults concurrently (the baseline was captured
+  before those landed), not because of the performance work.
+- Peak VRAM is unchanged for every variant (the INT8 TimeChat +8 MiB is allocator noise; the GGUF Q4 Instruct
+  +0.6 GiB is the larger frame budget that the new `gguf_max_frames` default sends).
+- Prefill improved 3-40 %; decode improved only 0-17 % (TimeChat INT8 +17 %, AVoCaDO INT4 +8 %, Qwen3 INT4 +7 %,
+  BF16 +3 %; TimeChat INT4 is within run-to-run noise). The host-side per-token work was therefore not the dominant
+  cost: the eager Transformers decode loop and its kernel-launch gaps set a ceiling near 25-35 tok/s for the 7B
+  families on this GPU regardless of precision. Removing that ceiling needs CUDA-graph replay of the decode step
+  with a static KV cache; the measurements for that follow-up are in the next section.
+- The 33 GB INT8 Qwen3-Omni checkpoint cannot stay resident on 32 GB and decodes at 1.35 tok/s through block swap,
+  which is why the 32 GB tier now selects INT4 (12 tok/s resident) and INT8 becomes automatic only from 48 GB.
+- GGUF decode is unchanged within noise (240-300 tok/s); the SSE fix mainly reduces CPU use on the Python side.
+
+## v1.4.0 static cache / CUDA graph probe (2026-09-02)
+
+To test whether the eager ceiling above could be lifted, `tools/bench/static_cache_probe.py` loaded six resident
+variants through the application loader (production 32 GB profile, greedy, 256 new tokens, 20 s storm video or 18 s
+MP3) and compared four decode paths on the same prepared inputs. Full report: `temp/codex_v14/REPORT_S.md`; raw
+results: `tools/bench/results/v14_probe_<variant>.json`.
+
+| Variant | Eager dynamic (production) | Eager static cache | Inductor default | Reduce-overhead + static |
+|---|---:|---:|---:|---:|
+| timechat_bf16 | **32.97** tok/s, identical | 23.77, identical | 36.79, output changed at token 116 | 19.47, identical |
+| timechat_int4 | **26.91**, identical | 20.55, identical | 27.33, changed at 62 | 15.37, changed at 155 |
+| timechat_int8 | **27.50**, identical | 20.24, identical | 27.87, changed at 40 | 15.57, changed at 40 |
+| avocado_int4 | **27.22**, identical | 20.23, identical | 27.90, changed at 31 | 15.42, changed at 31 |
+| qwen3_omni_instruct_int4 | **12.09**, identical | 9.82, identical | 11.74, changed at 18 | 6.45, changed at 18 |
+| qwen3_omni_captioner_int4 | **12.34**, identical | 9.54, changed at 21 | 11.64, changed at 7 | 6.53, changed at 13 |
+
+Conclusions:
+
+- No static or compiled path is both faster and output-identical. The static cache alone costs 19-28 % because
+  attention scans the preallocated window; Inductor's fused kernels change greedy tokens on every variant (a compiled
+  decode is at best +12 % on BF16); `reduce-overhead` never produced one reusable decode graph. Dynamo recorded
+  402-1026 non-static-input captures per model: the flash-attention unpad path (`Tensor.item()`), 42 `aten.nonzero`
+  breaks, per-layer cache guards, and the ConvRot / grouped-MoE Triton modules that must stay outside the graph.
+- Peak VRAM stayed within +642 MiB allocated for every path, so memory was not the blocker.
+- Eager dynamic decoding therefore remains the default and the only verified path; `torch.compile` stays an opt-in
+  control with the existing "output may differ" caveat, and block-swapped models keep opting out. For Qwen3-Omni the
+  fast path is the GGUF backend (240-300 tok/s on this GPU), which the VRAM tiers already offer from 24 GB.

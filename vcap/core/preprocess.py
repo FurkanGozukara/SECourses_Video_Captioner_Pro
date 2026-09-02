@@ -11,7 +11,16 @@ from typing import Any, Literal
 import cv2
 import numpy as np
 
-from .media import MediaError, probe_media, read_audio, read_video_frames, run_ffmpeg
+from .media import (
+    MediaError,
+    is_encoder_error,
+    probe_media,
+    read_audio,
+    read_video_frames,
+    resolve_video_encoder,
+    run_ffmpeg,
+    video_encode_args,
+)
 from .paths import normalize_path
 from .subprocess_runner import CancelToken
 
@@ -222,7 +231,11 @@ def fits_context(
     return input_tokens + max(0, int(reserve_output_tokens)) <= max(0, int(context_tokens))
 
 
-def _silence_ratio(samples: np.ndarray, sample_rate: int = 16000) -> float:
+def _silence_ratio(
+    samples: np.ndarray,
+    sample_rate: int = 16000,
+    threshold: float = 0.001,
+) -> float:
     if samples.size == 0:
         return 1.0
     window = max(1, int(round(sample_rate * 0.02)))
@@ -231,7 +244,7 @@ def _silence_ratio(samples: np.ndarray, sample_rate: int = 16000) -> float:
         samples = np.pad(samples, (0, pad))
     windows = samples.reshape(-1, window).astype(np.float64, copy=False)
     rms = np.sqrt(np.mean(np.square(windows), axis=1))
-    return float(np.mean(rms < 0.001))
+    return float(np.mean(rms < max(0.0, float(threshold))))
 
 
 def analyze_clip_quality(
@@ -240,6 +253,8 @@ def analyze_clip_quality(
     sample_frames: int = 8,
     start_s: float | None = None,
     end_s: float | None = None,
+    black_luma: int = 16,
+    silence_rms: float = 0.001,
 ) -> ClipQuality:
     """Measure visual/audio quality for a whole source or a planned time range."""
 
@@ -278,7 +293,7 @@ def analyze_clip_quality(
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             gray_frames.append(gray)
             luma_values.append(float(np.mean(gray)))
-            black_values.append(float(np.mean(gray <= 16)))
+            black_values.append(float(np.mean(gray <= max(0, min(255, int(black_luma))))))
             sharpness_values.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
     differences = [
         float(np.mean(cv2.absdiff(previous, current)))
@@ -291,7 +306,11 @@ def analyze_clip_quality(
             samples = read_audio(source, sample_rate=16000)
             start_sample = min(samples.size, max(0, int(round(beginning * 16000))))
             end_sample = samples.size if ending is None else min(samples.size, max(0, int(round(ending * 16000))))
-            silence = _silence_ratio(samples[start_sample:end_sample], 16000)
+            silence = _silence_ratio(
+                samples[start_sample:end_sample],
+                16000,
+                max(0.0, float(silence_rms)),
+            )
         except Exception:
             silence = 1.0
     return ClipQuality(
@@ -347,9 +366,13 @@ def normalize_clip_for_model(
     size_multiple: int,
     keep_audio: bool,
     audio_sr: int = 16000,
+    encoder: str = "libx264",
+    crf: int = 18,
+    preset: str = "veryfast",
+    audio_bitrate: str = "192k",
     cancel: CancelToken | None = None,
 ) -> Path:
-    """Create a deterministic H.264 MP4 at exact FPS, geometry, and audio format."""
+    """Create a deterministic encoded MP4 at exact FPS, geometry, and audio format."""
 
     source = normalize_path(src, must_exist=True)
     target = normalize_path(dst)
@@ -367,9 +390,15 @@ def normalize_clip_for_model(
         and info.audio_channels == 1
         and info.audio_sample_rate == int(audio_sr)
     )
+    requested_encoder = str(encoder or "libx264").strip().casefold()
+    active_encoder = resolve_video_encoder(requested_encoder)
+    requested_codec = "hevc" if active_encoder in {"libx265", "hevc_nvenc"} else "h264"
+    selected_bitrate = str(audio_bitrate or "192k").strip().casefold()
+    if selected_bitrate not in {"96k", "128k", "192k", "256k", "320k"}:
+        selected_bitrate = "192k"
     video_ready = (
         source.suffix.casefold() == ".mp4"
-        and info.video_codec == "h264"
+        and info.video_codec in ({"hevc", "h265"} if requested_codec == "hevc" else {"h264", "avc1"})
         and info.width == out_w
         and info.height == out_h
         and info.fps is not None
@@ -382,43 +411,61 @@ def normalize_clip_for_model(
         raise ValueError("dst must differ from src when normalization is required")
     target.parent.mkdir(parents=True, exist_ok=True)
     duration = float(info.duration or 0.0)
-    arguments: list[str] = ["-y", "-i", str(source)]
     silent_input = keep_audio and not info.has_audio
-    if silent_input:
-        arguments += ["-f", "lavfi", "-i", f"anullsrc=r={max(1, int(audio_sr))}:cl=mono"]
-    arguments += [
-        "-map",
-        "0:v:0",
-        "-vf",
-        f"fps={rate:.12g},scale={out_w}:{out_h}:flags=lanczos",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-    ]
-    if keep_audio:
+
+    def arguments_for(selected_encoder: str) -> list[str]:
+        arguments: list[str] = ["-y", "-i", str(source)]
+        if silent_input:
+            arguments += ["-f", "lavfi", "-i", f"anullsrc=r={max(1, int(audio_sr))}:cl=mono"]
         arguments += [
             "-map",
-            "1:a:0" if silent_input else "0:a:0",
-            "-c:a",
-            "aac",
-            "-ac",
-            "1",
-            "-ar",
-            str(max(1, int(audio_sr))),
-            "-b:a",
-            "128k",
+            "0:v:0",
+            "-vf",
+            f"fps={rate:.12g},scale={out_w}:{out_h}:flags=lanczos",
+            *video_encode_args(selected_encoder, crf, preset),
+            "-pix_fmt",
+            "yuv420p",
         ]
-        if silent_input:
-            arguments += ["-shortest"]
-    else:
-        arguments += ["-an"]
-    arguments += ["-movflags", "+faststart", str(target)]
-    run_ffmpeg(arguments, total_duration=duration or None, cancel_token=cancel)
+        if keep_audio:
+            arguments += [
+                "-map",
+                "1:a:0" if silent_input else "0:a:0",
+                "-c:a",
+                "aac",
+                "-ac",
+                "1",
+                "-ar",
+                str(max(1, int(audio_sr))),
+                "-b:a",
+                selected_bitrate,
+            ]
+            if silent_input:
+                arguments += ["-shortest"]
+        else:
+            arguments += ["-an"]
+        arguments += ["-movflags", "+faststart", str(target)]
+        return arguments
+
+    try:
+        run_ffmpeg(
+            arguments_for(active_encoder),
+            total_duration=duration or None,
+            cancel_token=cancel,
+        )
+    except Exception as exc:
+        if active_encoder == "libx264" or not is_encoder_error(exc):
+            raise
+        from .logs import get_log
+
+        get_log().warn(
+            f"FFmpeg encoder {active_encoder} failed; falling back to libx264.",
+            scope="encode",
+        )
+        run_ffmpeg(
+            arguments_for("libx264"),
+            total_duration=duration or None,
+            cancel_token=cancel,
+        )
     return target
 
 

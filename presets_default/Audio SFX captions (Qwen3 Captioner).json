@@ -6,7 +6,7 @@
     "description": "Prompt-free, maximum-detail audio captions from the dedicated Qwen3-Omni Captioner model."
   },
   "settings": {
-    "model_key": "qwen3_omni_captioner_int8",
+    "model_key": "qwen3_omni_captioner_int4",
     "prompt_preset_id": "qwen3_captioner_promptfree",
     "system_prompt": null,
     "user_prompt": "",
@@ -40,7 +40,10 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": false,
     "save_reasoning": true,
     "overwrite_existing": false,

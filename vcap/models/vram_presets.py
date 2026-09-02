@@ -102,9 +102,13 @@ def _qwen3_preset(family: str, tier: int) -> VramPreset:
                           default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
                           "INT4 with automatic block swap; keeps 2 GB VRAM free at the recommended frame budget.")
     if tier <= 32:
-        return VramPreset("int8_convrot", "auto", 2.0, 96, 256 * 32 * 32,
+        # The 33 GB INT8 checkpoint cannot stay resident on a 32 GB card, and the
+        # resulting block swap measured 1.35 tok/s against 11-18 tok/s for the
+        # fully resident 17.8 GB INT4 build (RTX 5090, v1.4.0 baseline).
+        return VramPreset("int4_convrot_w4a8", "auto", 2.0, 128, 256 * 32 * 32,
                           default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),
-                          "INT8 with automatic block swap; keeps 2 GB VRAM free. Fewer resident layers cost decode speed.")
+                          "INT4 with automatic block swap (fully resident on 32 GB); keeps 2 GB VRAM free. "
+                          "INT8 would need block swap here and decodes about 8x slower, so it is automatic only from 48 GB.")
     if tier <= 48:
         return VramPreset("int8_convrot", "auto", 2.0, 128, 256 * 32 * 32,
                           default_tokens, OffloadPlan("auto", False, None, True, 2.0, 2),

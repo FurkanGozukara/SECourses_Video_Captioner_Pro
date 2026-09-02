@@ -7,12 +7,13 @@ import os
 import re
 import tempfile
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .logs import AppLog, get_log
-from .paths import sanitize_filename
+from .paths import natural_sort_key, normalize_path, sanitize_filename
 
 _RUN_PATTERN = re.compile(r"^(?:batch_)?(\d{4,})_.+$", re.IGNORECASE)
 _OUTPUT_SUFFIXES = {
@@ -23,6 +24,177 @@ _OUTPUT_SUFFIXES = {
     "jsonl": ".jsonl",
     "reasoning": "",
 }
+_MAX_HISTORY_METADATA_BYTES = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """One lightweight, failure-tolerant entry in the output run history."""
+
+    run_dir: str
+    name: str
+    kind: str
+    model_key: str
+    created: float
+    items: int
+    counts: dict[str, int]
+    preview: str
+    metadata_path: str | None
+
+
+def _history_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.stat().st_size > _MAX_HISTORY_METADATA_BYTES:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _history_preview(folder: Path) -> str:
+    try:
+        top_level = [
+            path
+            for path in folder.glob("*.txt")
+            if path.name.casefold() != "run_log.txt"
+        ]
+        nested = [
+            path
+            for path in folder.glob("*/*.txt")
+            if path.name.casefold() != "run_log.txt"
+        ]
+    except OSError:
+        return ""
+    candidates = sorted(top_level, key=lambda item: natural_sort_key(item.name))
+    candidates.extend(
+        sorted(nested, key=lambda item: natural_sort_key(str(item.relative_to(folder))))
+    )
+    for path in candidates:
+        try:
+            return path.read_text(encoding="utf-8").strip()[:160]
+        except (OSError, UnicodeError):
+            continue
+    return ""
+
+
+def _history_model_key(payload: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return ""
+    model_info = payload.get("model_info")
+    if isinstance(model_info, Mapping):
+        value = model_info.get("variant_key") or model_info.get("model_key")
+        if value:
+            return str(value)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("model_key"):
+        return str(metadata["model_key"])
+    settings = payload.get("settings")
+    if isinstance(settings, Mapping):
+        value = settings.get("model_key") or settings.get("variant_key")
+        if value:
+            return str(value)
+    return str(payload.get("model_key") or payload.get("variant_key") or "")
+
+
+def _history_items_and_counts(payload: Mapping[str, Any] | None) -> tuple[int, dict[str, int]]:
+    if not isinstance(payload, Mapping):
+        return 0, {}
+    values = payload.get("items_results")
+    if isinstance(values, list):
+        counts: dict[str, int] = {}
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            status = str(item.get("status") or "").strip().casefold()
+            if status:
+                counts[status] = counts.get(status, 0) + 1
+        return len(values), counts
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        return len(messages), {}
+    extra = payload.get("extra")
+    raw_counts = extra.get("counts") if isinstance(extra, Mapping) else payload.get("counts")
+    counts = {}
+    if isinstance(raw_counts, Mapping):
+        for key, value in raw_counts.items():
+            if str(key).casefold() == "total":
+                continue
+            try:
+                counts[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    try:
+        items = int(payload.get("items") or sum(counts.values()))
+    except (TypeError, ValueError):
+        items = 0
+    return max(0, items), counts
+
+
+def _history_kind(folder: Path, payload: Mapping[str, Any] | None, chat_marker: bool) -> str:
+    if chat_marker or "_chat_" in f"_{folder.name.casefold()}_":
+        return "chat"
+    if folder.name.casefold().startswith("batch_"):
+        return "batch"
+    settings = payload.get("settings") if isinstance(payload, Mapping) else None
+    if isinstance(settings, Mapping):
+        typed = settings.get("typed_job")
+        output = typed.get("output") if isinstance(typed, Mapping) else None
+        selected = output.get("kind") if isinstance(output, Mapping) else settings.get("output_kind")
+        if str(selected).casefold() in {"single", "batch"}:
+            return str(selected).casefold()
+    return "single" if payload is not None else "other"
+
+
+def list_recent_runs(
+    outputs_root: str | os.PathLike[str],
+    limit: int = 30,
+) -> list[RunSummary]:
+    """Return newest output runs first without failing on damaged run folders."""
+
+    maximum = max(0, int(limit))
+    if maximum == 0:
+        return []
+    try:
+        root = normalize_path(outputs_root)
+        folders = [path for path in root.iterdir() if path.is_dir()]
+    except (OSError, TypeError, ValueError):
+        return []
+    summaries: list[RunSummary] = []
+    for folder in folders:
+        metadata = folder / "metadata.json"
+        chat = folder / "chat.json"
+        run_log = folder / "run_log.txt"
+        try:
+            markers = [path for path in (metadata, chat, run_log) if path.is_file()]
+        except OSError:
+            continue
+        if not markers:
+            continue
+        data_path = metadata if metadata in markers else chat if chat in markers else None
+        payload = _history_json(data_path) if data_path is not None else None
+        items, counts = _history_items_and_counts(payload)
+        try:
+            created = float(folder.stat().st_mtime)
+        except OSError:
+            continue
+        summaries.append(
+            RunSummary(
+                run_dir=str(folder.resolve(strict=False)),
+                name=folder.name,
+                kind=_history_kind(folder, payload, chat in markers),
+                model_key=_history_model_key(payload),
+                created=created,
+                items=items,
+                counts=counts,
+                preview=_history_preview(folder),
+                metadata_path=(
+                    str(data_path.resolve(strict=False)) if data_path is not None else None
+                ),
+            )
+        )
+    summaries.sort(key=lambda item: (-item.created, natural_sort_key(item.name)))
+    return summaries[:maximum]
 
 
 def _json_safe(value: Any) -> Any:
@@ -259,7 +431,9 @@ __all__ = [
     "MetadataBuilder",
     "OutputWriter",
     "RunLog",
+    "RunSummary",
     "allocate_run_dir",
+    "list_recent_runs",
     "load_metadata",
     "model_short_name",
 ]

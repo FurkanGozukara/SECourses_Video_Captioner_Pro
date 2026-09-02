@@ -28,6 +28,7 @@ from .offload import (
     estimate_activation_bytes,
     observed_activation_bytes,
     observed_activation_ratio,
+    pinned_ram_budget_bytes,
     plan_block_swap,
 )
 from .registry import MODEL_SPECS, ModelSpec, VariantSpec, get_variant, resolve_model_dir, variant_is_ready, variant_to_family
@@ -367,6 +368,7 @@ def _load_llamacpp_model(
     progress_cb: ProgressCallback | None,
     model_dir: str | os.PathLike[str] | None,
     context_size: int | None = None,
+    runtime: Any | None = None,
 ) -> LoadedModel:
     """Start a local llama-server and wrap it in the common load contract."""
 
@@ -400,6 +402,7 @@ def _load_llamacpp_model(
         # The UI's "VRAM to keep free" sets llama.cpp's fit target; the backend's
         # own default must never stand in for the value the user configured.
         vram_reserve_gb=float(plan.vram_reserve_gb),
+        runtime=runtime,
         # The requested window; the tier plan and llama.cpp's fitter may shrink it.
         **({"context_size": int(context_size)} if context_size else {}),
     )
@@ -627,13 +630,16 @@ def _plain_sharded_load(
     return model_class.from_pretrained(folder, **kwargs)
 
 
-def _pin_cpu_tensors(model: Any, max_fraction: float = 0.40) -> int:
-    try:
-        import psutil
+def _pin_cpu_tensors(model: Any, max_bytes: int | None = None) -> int:
+    if max_bytes is None:
+        try:
+            import psutil
 
-        budget = int(psutil.virtual_memory().total * max(0.0, min(1.0, max_fraction)))
-    except Exception:
-        budget = 8 * 1024**3
+            budget = max(0, int(psutil.virtual_memory().total) - 6 * _GIB)
+        except Exception:
+            budget = 8 * _GIB
+    else:
+        budget = max(0, int(max_bytes))
     pinned = 0
     tensors = chain(model.parameters(), model.buffers())
     for tensor in tensors:
@@ -702,6 +708,7 @@ def load_model(
     compile_mode: str = DEFAULT_COMPILE_MODE,
     budget_hint: BudgetHint | None = None,
     last_token_logits: bool = True,
+    runtime: Any | None = None,
 ) -> LoadedModel:
     """Load one local thinker checkpoint through its registered backend."""
 
@@ -720,6 +727,7 @@ def load_model(
             progress_cb=progress_cb,
             model_dir=hf_dir,
             context_size=int(getattr(budget_hint, "context_tokens", 0) or 0) or None,
+            runtime=runtime,
         )
     import torch
 
@@ -776,6 +784,15 @@ def load_model(
     planned_config = None
     activation_estimate = 0
     ram_available_bytes: int | None = None
+    ram_total_bytes: int | None = None
+    try:
+        import psutil
+
+        host_memory = psutil.virtual_memory()
+        ram_available_bytes = int(host_memory.available)
+        ram_total_bytes = int(host_memory.total)
+    except Exception:
+        pass
     budget = None
     if not plan.uses_legacy_offload:
         planned_config = _thinker_config(
@@ -793,10 +810,7 @@ def load_model(
             )
         )
         if single_file:
-            import psutil
-
             layout = checkpoint_layout(checkpoint)
-            ram_available_bytes = int(psutil.virtual_memory().available)
             budget = plan_block_swap(
                 plan,
                 layout,
@@ -804,6 +818,7 @@ def load_model(
                 total_vram_bytes=total_vram_bytes,
                 activation_bytes=activation_estimate,
                 ram_available_bytes=ram_available_bytes,
+                ram_total_bytes=ram_total_bytes,
             )
             if budget.notes:
                 _emit(progress_cb, budget.notes[0])
@@ -865,11 +880,14 @@ def load_model(
                 )
             elif budget is not None and budget.swapped_layers > 0:
                 layers = _block_swap_layers(loaded_model, family, budget.layer_count)
-                pin_budget = (
-                    max(0, ram_available_bytes - 6 * _GIB)
-                    if ram_available_bytes is not None
-                    else None
-                )
+                if ram_total_bytes is not None:
+                    pin_budget = pinned_ram_budget_bytes(plan, ram_total_bytes)
+                elif plan.pinned_ram_budget_gb > 0:
+                    pin_budget = int(plan.pinned_ram_budget_gb * _GIB)
+                elif ram_available_bytes is not None:
+                    pin_budget = pinned_ram_budget_bytes(plan, ram_available_bytes)
+                else:
+                    pin_budget = None
                 manager = BlockSwapManager.install(
                     loaded_model,
                     layers,
@@ -938,7 +956,12 @@ def load_model(
 
     model.eval()
     if plan.pin_cpu and isinstance(device_map, dict) and any(str(value) == "cpu" for value in device_map.values()):
-        pinned = _pin_cpu_tensors(model)
+        pin_limit = (
+            pinned_ram_budget_bytes(plan, ram_total_bytes)
+            if ram_total_bytes is not None
+            else None
+        )
+        pinned = _pin_cpu_tensors(model, pin_limit)
         _emit(progress_cb, f"Pinned {pinned / 1024**3:.2f} GiB of CPU-resident weights")
     vram_cap_bytes = 0
     resident_bytes = int(torch.cuda.memory_allocated(torch_device)) if cuda_load else 0
@@ -1325,9 +1348,11 @@ class ModelCache:
         # A llama-server is started with a fixed context, so a different requested
         # window needs a restart; Transformers apply the window per call instead.
         context_key = 0
+        runtime_key = ""
         try:
             if get_variant(variant_key).scheme == "gguf":
                 context_key = int(getattr(kwargs.get("budget_hint"), "context_tokens", 0) or 0)
+                runtime_key = repr(kwargs.get("runtime"))
         except KeyError:
             context_key = 0
         key = (
@@ -1342,6 +1367,7 @@ class ModelCache:
             str(kwargs.get("compile_mode", DEFAULT_COMPILE_MODE)),
             repr(kwargs.get("last_token_logits", True)),
             context_key,
+            runtime_key,
         )
         with self._lock:
             if self._loaded is not None and self._key == key and self._loaded.model is not None:

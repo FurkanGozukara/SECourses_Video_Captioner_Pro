@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-02T05:17:41.703152+03:00",
+  "summary": {
+    "variant": "qwen3_omni_captioner_gguf_q4",
+    "checkpoint_gb": 19.882074272,
+    "load_s": 13.130254399962723,
+    "peak_vram_gib": 24.222309112548828,
+    "prefill_tok_s_mean": 933.8628856726538,
+    "decode_tok_s_mean": 301.1041666912667,
+    "generated_tokens_mean": 256,
+    "wall_clock_s_mean": 1.2581020999932662,
+    "finish_reason": "length",
+    "caption_preview": "The audio clip is a 19-second, high-fidelity, professionally produced segment that opens with a brief, energetic spoken introduction by a male voice, who says, \u201cYeah. C courses, let\u2019s go.\u201d This is imm",
+    "runs": 1
+  },
+  "configuration": {
+    "variant": "qwen3_omni_captioner_gguf_q4",
+    "family": "qwen3_omni_captioner",
+    "input": "F:\\SECourses_Video_Captioner_Pro_TEMP\\test_media\\demon_singer_audio_18_sec.mp3",
+    "runs": 1,
+    "unfused_gate_up_control": false,
+    "profile_tier_gb": 32,
+    "attention_requested": "auto",
+    "attention_resolved": "llamacpp",
+    "offload": {
+      "gpu_layers": "auto",
+      "offload_experts": false,
+      "max_memory": null,
+      "pin_cpu": true,
+      "vram_reserve_gb": 2.0,
+      "swap_slots": 2,
+      "pinned_ram_budget_gb": 0.0
+    },
+    "generation": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256,
+      "do_sample": false,
+      "use_cache": true,
+      "enable_thinking": true,
+      "seed": -1,
+      "context_tokens": null
+    },
+    "preprocessing": {
+      "fps": 2.0,
+      "max_frames": 128,
+      "sampling_strategy": "fps",
+      "max_pixels": 262144,
+      "min_pixels": 4096,
+      "use_audio_in_video": false,
+      "total_pixel_cap": 0,
+      "start": null,
+      "end": null
+    }
+  },
+  "environment": {
+    "python": "3.12.10",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cuda_visible_devices": "0"
+  },
+  "load": {
+    "seconds": 13.130254399962723,
+    "peak_vram_gb": 23.57463836669922,
+    "checkpoint_bytes": 19882074272,
+    "attention": "llamacpp",
+    "device_map": {
+      "": "cuda:0"
+    },
+    "quantized_layers": 0,
+    "bf16_layers": 0,
+    "compile_mode": "llama.cpp",
+    "warnings": [],
+    "block_swap": {
+      "backend": "llamacpp",
+      "mode": "fit",
+      "fit": true,
+      "fit_target_mib": 3584,
+      "requested_gpu_layers": null,
+      "requested_n_cpu_moe": null,
+      "requested_context_size": 32768,
+      "context_tier_ignored": false,
+      "context_was_clamped": false,
+      "n_gpu_layers": null,
+      "n_cpu_moe": null,
+      "n_ctx": 32768
+    },
+    "resident_bytes": 0,
+    "activation_estimate_bytes": 0,
+    "vram_cap_bytes": 0
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "seed": 1234,
+      "prompt_tokens": 257,
+      "generated_tokens": 256,
+      "finish_reason": "length",
+      "prefill_s": 0.27520100000000003,
+      "decode_s": 0.846883,
+      "prefill_tok_s": 933.8628856726538,
+      "decode_tok_s": 301.1041666912667,
+      "generation_s": 1.163261399953626,
+      "wall_clock_s": 1.2581020999932662,
+      "peak_vram_gib": 24.222309112548828,
+      "caption_chars": 1209,
+      "caption_preview": "The audio clip is a 19-second, high-fidelity, professionally produced segment that opens with a brief, energetic spoken introduction by a male voice, who says, \u201cYeah. C courses, let\u2019s go.\u201d This is imm",
+      "caption": "The audio clip is a 19-second, high-fidelity, professionally produced segment that opens with a brief, energetic spoken introduction by a male voice, who says, \u201cYeah. C courses, let\u2019s go.\u201d This is immediately followed by a short, catchy electric guitar riff, which sets a modern, upbeat tone. The music then transitions into a full band arrangement featuring a driving drum beat, a melodic bassline, and a clean, slightly overdriven electric guitar, all mixed with clarity and punch typical of contemporary pop-rock or indie-pop production.\n\nA second male vocalist enters, delivering lyrics in a clear, confident, and motivational style. The lyrics\u2014\u201cLate night screen glow, ideas on fire. Turning what if into something higher. From zero to flow, we learn it fast. Build it, ship it, make the future last. New ways to\u2014\u201d\u2014are delivered with a rhythmic, almost rap-like cadence, especially in the first half, before shifting to a more melodic, sung delivery. The vocal performance is energetic and positive, with a tone that is both encouraging and aspirational.\n\nThe lyrics themselves are thematically focused on innovation, learning, and progress, referencing concepts such as \u201cC courses,\u201d \u201cbuild it, ship it,\u201d",
+      "reasoning_chars": 0,
+      "warnings": []
+    }
+  ]
+}

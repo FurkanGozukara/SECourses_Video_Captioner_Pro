@@ -19,6 +19,7 @@ from vcap.core.paths import normalize_path
 from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
 from vcap.pipeline.chat import ChatRequest, ChatResponse, save_conversation
+from vcap.prompts.presets import default_preset_for, get_preset, list_presets, render_prompt
 from vcap.ui.components import action_button, context_usage_text
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class ChatTabHandles:
     save: gr.Button
     stop_timer: gr.Timer
     conversation_state: gr.State
+    prompt_preset: gr.Dropdown
     prompt_helper: gr.Dropdown
     controls: dict[str, Any]
 
@@ -182,12 +184,45 @@ def _last_answer(history: Sequence[Mapping[str, Any]] | None) -> str:
     return ""
 
 
+def chat_prompt_modality(paths: Sequence[str] | None) -> str:
+    """Return the preset modality represented by the first chat attachment."""
+
+    if not paths:
+        return "text"
+    info = probe_media(paths[0])
+    if info.kind in {"video", "video_no_audio"}:
+        return "video_audio" if info.has_audio else "video"
+    return str(info.kind)
+
+
+def chat_prompt_choices(
+    variant_key: str,
+    paths: Sequence[str] | None,
+    current: str | None = None,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Filter chat task presets by selected family and attached media kind."""
+
+    family = variant_to_family(str(variant_key))
+    modality = chat_prompt_modality(paths)
+    presets = list_presets(family, modality)
+    choices = [(preset.label, preset.id) for preset in presets]
+    ids = {preset.id for preset in presets}
+    selected = str(current or "")
+    if selected not in ids:
+        try:
+            selected = default_preset_for(family, modality).id
+        except Exception:
+            selected = presets[0].id if presets else ""
+    return choices, selected or None
+
+
 def build(ctx: "UiContext") -> ChatTabHandles:
     """Render chat controls and register preset-owned generation parameters."""
 
     controls: dict[str, Any] = {}
-    initial_variant = str(getattr(ctx.caption_handles.controls["model_key"], "value", "qwen3_omni_instruct_int8"))
+    initial_variant = str(getattr(ctx.caption_handles.controls["model_key"], "value", "qwen3_omni_instruct_int4"))
     _, initial_note = model_chat_support(initial_variant)
+    initial_prompt_choices, initial_prompt_id = chat_prompt_choices(initial_variant, [])
     with gr.Row(equal_height=False):
         with gr.Column(scale=6, min_width=560):
             chatbot_kwargs: dict[str, Any] = {
@@ -257,6 +292,14 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                     elem_classes=["vc-help"],
                 )
             model_note = gr.Markdown(initial_note, elem_classes=["vc-status"])
+            prompt_preset = gr.Dropdown(
+                choices=initial_prompt_choices,
+                value=initial_prompt_id,
+                allow_custom_value=True,
+                label="Task / prompt preset",
+                info="Filtered to the chat model family and the first attached media kind.",
+                elem_id="vc_chat_prompt_preset",
+            )
             system_prompt = gr.Textbox(
                 value="",
                 label="System prompt",
@@ -369,11 +412,55 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                     in_preset=True,
                     in_metadata=False,
                 )
-                enable_thinking = gr.Checkbox(
-                    value=False,
-                    label="Enable thinking",
-                    info="Streams Qwen3-Omni Thinking reasoning live as a thought block above the answer and keeps a copy in the Reasoning panel.",
-                    interactive=False,
+                repetition_penalty = gr.Slider(
+                    0.5,
+                    2.0,
+                    value=1.0,
+                    step=0.01,
+                    label="Repetition penalty",
+                    info="Repetition penalty for chat replies (1.0 = off).",
+                    elem_id="vc_chat_repetition_penalty",
+                )
+                controls["chat_repetition_penalty"] = ctx.reg(
+                    "chat_repetition_penalty",
+                    repetition_penalty,
+                    1.0,
+                    section="chat",
+                    description="Repetition penalty for chat replies; 1.0 disables the penalty.",
+                    kind="float",
+                    minimum=0.5,
+                    maximum=2.0,
+                    in_preset=True,
+                    in_metadata=False,
+                )
+                with gr.Row(elem_classes=["vc-compact-row"]):
+                    seed = gr.Number(
+                        value=-1,
+                        minimum=-1,
+                        maximum=2147483647,
+                        step=1,
+                        precision=0,
+                        label="Seed",
+                        info=(
+                            "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
+                            "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
+                        ),
+                        elem_id="vc_chat_seed",
+                    )
+                    enable_thinking = gr.Checkbox(
+                        value=False,
+                        label="Enable thinking",
+                        info="Streams Qwen3-Omni Thinking reasoning live as a thought block above the answer and keeps a copy in the Reasoning panel.",
+                        interactive=False,
+                    )
+                controls["chat_seed"] = ctx.reg(
+                    "chat_seed", seed, -1, section="chat",
+                    description=(
+                        "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
+                        "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
+                    ),
+                    kind="int", minimum=-1, maximum=2147483647,
+                    in_preset=True, in_metadata=False,
                 )
                 controls["chat_enable_thinking"] = ctx.reg(
                     "chat_enable_thinking",
@@ -411,6 +498,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
         save=save,
         stop_timer=stop_timer,
         conversation_state=conversation_state,
+        prompt_preset=prompt_preset,
         prompt_helper=prompt_helper,
         controls=controls,
     )
@@ -428,7 +516,84 @@ def build(ctx: "UiContext") -> ChatTabHandles:
 
     caption_model = ctx.caption_handles.controls["model_key"]
 
+    def update_prompt_presets(
+        file_value: Any,
+        path_text: str,
+        variant_key: str,
+        current: str,
+    ) -> Any:
+        try:
+            paths = resolve_chat_attachments(file_value, path_text)
+        except Exception:
+            paths = []
+        try:
+            choices, selected = chat_prompt_choices(str(variant_key), paths, current)
+        except KeyError:
+            return gr.skip()
+        return gr.update(choices=choices, value=selected)
+
+    for event in (files.change, path.change, caption_model.change):
+        event(
+            update_prompt_presets,
+            inputs=[files, path, caption_model, prompt_preset],
+            outputs=prompt_preset,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+
+    caption_variable_keys = [
+        "trigger_word",
+        "language",
+        "source_language",
+        "target_language",
+        "caption_length",
+        "avoid_list",
+        "subject_class",
+        "extra_instructions",
+    ]
+    caption_variable_components = [
+        ctx.caption_handles.controls[key] for key in caption_variable_keys
+    ]
+
+    def apply_chat_prompt_preset(preset_id: str, *values: Any) -> tuple[str, str]:
+        try:
+            preset = get_preset(str(preset_id))
+            variables = dict(
+                zip(
+                    (
+                        "TRIGGER",
+                        "LANGUAGE",
+                        "SOURCE_LANGUAGE",
+                        "TARGET_LANGUAGE",
+                        "CAPTION_LENGTH",
+                        "AVOID",
+                        "SUBJECT_CLASS",
+                        "EXTRA_INSTRUCTIONS",
+                    ),
+                    values,
+                )
+            )
+            rendered_system, rendered_user = render_prompt(preset, variables)
+            return rendered_system or "", rendered_user
+        except Exception as exc:
+            gr.Warning(f"Could not render chat prompt preset: {exc}")
+            return gr.skip(), gr.skip()
+
+    prompt_preset.select(
+        apply_chat_prompt_preset,
+        inputs=[prompt_preset, *caption_variable_components],
+        outputs=[system_prompt, message],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
     def change_model(variant_key: str) -> tuple[Any, ...]:
+        try:
+            get_variant(str(variant_key))
+        except KeyError:
+            return tuple(gr.skip() for _ in range(8))
         mode, note = model_chat_support(variant_key)
         family = variant_to_family(str(variant_key))
         thinking = family == "qwen3_omni_thinking"
@@ -547,7 +712,7 @@ def wire(ctx: "UiContext") -> None:
         files = args[value_count + 1]
         path_text = str(args[value_count + 2] or "")
         message = str(args[value_count + 3] or "").strip()
-        model_key = str(settings.get("model_key") or "qwen3_omni_instruct_int8")
+        model_key = str(settings.get("model_key") or "qwen3_omni_instruct_int4")
         mode, model_note = model_chat_support(model_key)
         keep_composer = (gr.skip(), gr.skip(), gr.skip())
 
@@ -604,7 +769,9 @@ def wire(ctx: "UiContext") -> None:
             "top_p": float(settings.get("chat_top_p", 0.95)),
             "top_k": int(settings.get("chat_top_k", 20)),
             "max_new_tokens": int(settings.get("chat_max_new_tokens", 1024)),
+            "repetition_penalty": float(settings.get("chat_repetition_penalty", 1.0)),
             "enable_thinking": bool(settings.get("chat_enable_thinking", False)),
+            "seed": int(settings.get("chat_seed", -1)),
         }
         request = ChatRequest.from_dict(
             {
@@ -754,18 +921,25 @@ def wire(ctx: "UiContext") -> None:
                 f"{'Stopped' if result.cancelled else 'Complete'}: {result.new_tokens} tokens, "
                 f"{result.tokens_per_s:.2f} tok/s, finish={result.finish_reason}.{trim_note} {warning}"
             ).strip()
+            # Stream throttling is deliberately lossy; overwrite every live
+            # statistic with the authoritative terminal response before the
+            # generator closes, even when the whole reply fit inside one tick.
+            current_status = final_status
+            context_used = result.context_tokens or result.prompt_tokens
+            context_limit = result.context_limit or settings.get("context_tokens")
+            token_line = _tokens_line(
+                result.new_tokens,
+                f"{result.tokens_per_s:.2f} tok/s",
+                context_used,
+                context_limit,
+            )
             # The turn (and its attachments) is now part of the conversation, so
             # the composer starts clean for the next one.
             yield (
                 live_display(done=True),
                 "",
-                f"<span class='{status_class}'>{html.escape(final_status)}</span>",
-                _tokens_line(
-                    result.new_tokens,
-                    f"{result.tokens_per_s:.2f} tok/s",
-                    result.context_tokens or result.prompt_tokens,
-                    getattr(result, "context_limit", 0),
-                ),
+                live_status(status_class),
+                token_line,
                 current_reasoning,
                 gr.update(visible=bool(current_reasoning)),
                 new_state,

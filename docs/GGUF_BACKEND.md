@@ -27,17 +27,44 @@ and are retained under `llamacpp/downloads/b10621/`. Run a forced refresh with:
 venv\Scripts\python.exe -m vcap.models.llamacpp_install --force
 ```
 
-The b10621 release has no Ubuntu x64 CUDA binary. On Linux, build the two tools
-from the pinned tag and point the application at the server executable:
+The b10621 release has no Ubuntu x64 CUDA binary. On Linux, the Massed Compute
+and RunPod/SimplePod installers therefore install the build prerequisites and
+run:
 
 ```bash
-git clone --branch b10621 --depth 1 https://github.com/ggml-org/llama.cpp.git
-cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build llama.cpp/build --config Release -j --target llama-server llama-mtmd-cli
-export VCAP_LLAMACPP_SERVER="$PWD/llama.cpp/build/bin/llama-server"
+python -m vcap.models.llamacpp_install --build-if-needed
 ```
 
-The sibling `llama-mtmd-cli` must also exist. A self-built runtime can use
+The command reuses a runnable pinned server when one is already present.
+Otherwise it clones the pinned tag into `llamacpp/src/b10621`, configures a
+CUDA-only build under `llamacpp/build/b10621`, builds `llama-server` and
+`llama-mtmd-cli`, and installs both tools plus their `lib*.so*` dependencies in
+`llamacpp/b10621/`. Console output is mirrored to
+`llamacpp/downloads/b10621/build.log`. The build requires the CUDA toolkit's
+`nvcc` compiler, not only an NVIDIA driver; `/usr/local/cuda/bin/nvcc` is used
+when `nvcc` is not already on `PATH`.
+
+The installer's build is best effort so a Transformers-only installation can
+still finish. **System & Models -> Install / repair llama.cpp** calls the same
+`ensure_llamacpp` function and is the normal retry path. A forced rebuild is
+also available from a terminal:
+
+```bash
+python -m vcap.models.llamacpp_install --force
+```
+
+For manual recovery, the equivalent pinned Linux build commands are below. If
+`nvcc` is not on `PATH`, first run
+`export CUDACXX=/usr/local/cuda/bin/nvcc`.
+
+```bash
+git clone --branch b10621 --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp-b10621
+cmake -S llama.cpp-b10621 -B llama.cpp-b10621/build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build llama.cpp-b10621/build --config Release -j "$(nproc)" --target llama-server llama-mtmd-cli
+export VCAP_LLAMACPP_SERVER="$PWD/llama.cpp-b10621/build/bin/llama-server"
+```
+
+The sibling `llama-mtmd-cli` must also exist. A manually built runtime can use
 `-hf <repo>:Q4_K_M` for an independent command-line check, while the app uses
 its explicitly downloaded local `--model` and `--mmproj` files.
 

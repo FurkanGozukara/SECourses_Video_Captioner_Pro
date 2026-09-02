@@ -26,6 +26,18 @@ _SEC_BTN_HUES: dict[str, tuple[str, str, str]] = {
     "orange": ("#9a3412", "#ea580c", "#fb923c"),
     "bronze": ("#78350f", "#b45309", "#d6a05a"),
     "slate": ("#334155", "#475569", "#94a3b8"),
+    "aqua": ("#164e63", "#0e7490", "#67e8f9"),
+    "mint": ("#064e3b", "#047857", "#6ee7b7"),
+    "jade": ("#14532d", "#15803d", "#86efac"),
+    "navy": ("#172554", "#1e3a8a", "#93c5fd"),
+    "cobalt": ("#1e3a8a", "#1d4ed8", "#7dd3fc"),
+    "steel": ("#1f2937", "#4b5563", "#cbd5e1"),
+    "plum": ("#4a044e", "#a21caf", "#f0abfc"),
+    "berry": ("#500724", "#be185d", "#f9a8d4"),
+    "coral": ("#7f1d1d", "#dc4b3e", "#fca5a5"),
+    "copper": ("#713f12", "#a16207", "#fde68a"),
+    "olive": ("#365314", "#4d7c0f", "#bef264"),
+    "maroon": ("#450a0a", "#b91c1c", "#fecaca"),
 }
 
 
@@ -191,6 +203,19 @@ _BASE_CSS = r"""
 .vc-err { color: var(--vc-err) !important; font-weight: 700; }
 .vc-status { min-height: 24px; }
 .vc-help { color: var(--vc-muted); font-size: 12px; }
+.vc-confirm-bar {
+  padding: 8px 10px !important;
+  border: 1px solid rgba(248,113,113,.50) !important;
+  border-radius: 7px !important;
+  background: rgba(127,29,29,.22) !important;
+  align-items: center !important;
+}
+.vc-confirm-bar p { margin: 0 !important; font-weight: 750; }
+body:not(.dark) .vc-confirm-bar {
+  background: rgba(254,226,226,.92) !important;
+  border-color: rgba(185,28,28,.42) !important;
+}
+.vc-editor-gallery img { aspect-ratio: 16 / 10 !important; object-fit: cover !important; }
 
 .vcap-replace-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; align-items: center; }
 .vcap-replace-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid rgba(56,189,248,.30); border-radius: 6px; background: rgba(8,145,178,.12); font-size: 12px; }

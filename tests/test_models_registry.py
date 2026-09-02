@@ -137,7 +137,7 @@ def test_vram_presets_use_automatic_block_swap_and_new_scheme_thresholds() -> No
         12: "int4_convrot_w4a8",
         16: "int4_convrot_w4a8",
         24: "int4_convrot_w4a8",
-        32: "int8_convrot",
+        32: "int4_convrot_w4a8",
         48: "int8_convrot",
         80: "bf16",
     }

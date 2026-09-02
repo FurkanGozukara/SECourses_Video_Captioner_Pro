@@ -447,6 +447,66 @@ PRESETS: tuple[PromptPreset, ...] = (
         tags=("native", "timechat", "wan", "flatten", "default"),
     ),
     PromptPreset(
+        id="timechat_flatten_motion_camera",
+        label="TimeChat → motion + camera",
+        group="Model-native",
+        description="Keeps each segment's detailed motion and camera state in chronological order for I2V and motion datasets.",
+        system_prompt=None,
+        user_prompt=TIMECHAT_OFFICIAL_PROMPT,
+        applies_to_models=("timechat",),
+        modalities=("video",),
+        output_format="text",
+        post_processor="timechat_flatten_motion_camera",
+        generation_overrides={"do_sample": False, "max_new_tokens": 9216, "repetition_penalty": 1.0},
+        recommended_media={"max_duration_s": 60, "fps": 2.0, "max_pixels": 297920, "max_frames": 160},
+        tags=("native", "timechat", "motion", "camera", "i2v"),
+    ),
+    PromptPreset(
+        id="timechat_flatten_av",
+        label="TimeChat → audiovisual",
+        group="Model-native",
+        description="Keeps motion, camera state, speech, and acoustics for each segment while dropping unrelated native fields.",
+        system_prompt=None,
+        user_prompt=TIMECHAT_OFFICIAL_PROMPT,
+        applies_to_models=("timechat",),
+        modalities=("video",),
+        output_format="text",
+        post_processor="timechat_flatten_av",
+        generation_overrides={"do_sample": False, "max_new_tokens": 9216, "repetition_penalty": 1.0},
+        recommended_media={"max_duration_s": 60, "fps": 2.0, "max_pixels": 297920, "max_frames": 160},
+        tags=("native", "timechat", "audiovisual", "flatten"),
+    ),
+    PromptPreset(
+        id="timechat_speech_only",
+        label="TimeChat → speech transcript (SRT)",
+        group="Model-native",
+        description="Extracts non-empty speech fields as timestamped subtitle cues and a plain-text transcript.",
+        system_prompt=None,
+        user_prompt=TIMECHAT_OFFICIAL_PROMPT,
+        applies_to_models=("timechat",),
+        modalities=("video",),
+        output_format="srt_segments",
+        post_processor="timechat_speech_only",
+        generation_overrides={"do_sample": False, "max_new_tokens": 9216, "repetition_penalty": 1.0},
+        recommended_media={"max_duration_s": 60, "fps": 2.0, "max_pixels": 297920, "max_frames": 160},
+        tags=("native", "timechat", "speech", "transcript", "srt"),
+    ),
+    PromptPreset(
+        id="timechat_chapters",
+        label="TimeChat → chapters",
+        group="Model-native",
+        description="Writes one concise MM:SS-MM:SS storyline chapter line for every native segment.",
+        system_prompt=None,
+        user_prompt=TIMECHAT_OFFICIAL_PROMPT,
+        applies_to_models=("timechat",),
+        modalities=("video",),
+        output_format="text",
+        post_processor="timechat_chapters",
+        generation_overrides={"do_sample": False, "max_new_tokens": 9216, "repetition_penalty": 1.0},
+        recommended_media={"max_duration_s": 60, "fps": 2.0, "max_pixels": 297920, "max_frames": 160},
+        tags=("native", "timechat", "chapters", "storyline"),
+    ),
+    PromptPreset(
         id="timechat_to_srt",
         label="TimeChat — detailed events to SRT",
         group="Model-native",
@@ -1039,7 +1099,15 @@ def list_presets(model_family: str | None = None, modality: str | None = None) -
         preset
         for preset in PRESETS
         if (model_family is None or "*" in preset.applies_to_models or model_family in preset.applies_to_models)
-        and (modality is None or modality in preset.modalities)
+        and (
+            modality is None
+            or modality in preset.modalities
+            or (
+                model_family == "timechat"
+                and modality == "video_audio"
+                and "video" in preset.modalities
+            )
+        )
     ]
     order = {preset.id: index for index, preset in enumerate(PRESETS)}
     return sorted(selected, key=lambda preset: (_GROUP_INDEX[preset.group], order[preset.id]))

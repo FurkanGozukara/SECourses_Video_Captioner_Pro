@@ -73,6 +73,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, default=0, help="Physical CUDA GPU index (default: 0)")
     parser.add_argument("--seed", type=int, default=1234, help="Base sampling seed (default: 1234)")
     parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Force deterministic greedy decoding regardless of the family default",
+    )
+    parser.add_argument(
+        "--unfused-gate-up-control",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Raw JSON output path (default: tools/bench/results/<variant>_<timestamp>.json)",
@@ -101,6 +111,35 @@ def _progress(*args: object) -> None:
 
 def _caption_preview(text: str, limit: int = 200) -> str:
     return " ".join(str(text).split())[:limit]
+
+
+def _install_unfused_gate_up_control() -> None:
+    """Keep legacy dense MLP projections separate for an A/B benchmark run."""
+
+    from torch import nn
+    from vcap.models.quant import convrot
+
+    original = convrot._fuse_quantized_qkv
+
+    def qkv_only(model: nn.Module) -> int:
+        hidden: list[tuple[nn.Module, nn.Module, nn.Module]] = []
+        for module in list(model.modules()):
+            gate = module._modules.get("gate_proj")
+            up = module._modules.get("up_proj")
+            if isinstance(gate, convrot._ConvRotLinearBase) and isinstance(
+                up, convrot._ConvRotLinearBase
+            ):
+                hidden.append((module, gate, up))
+                module._modules["gate_proj"] = nn.Identity()
+                module._modules["up_proj"] = nn.Identity()
+        try:
+            return original(model)
+        finally:
+            for module, gate, up in hidden:
+                module._modules["gate_proj"] = gate
+                module._modules["up_proj"] = up
+
+    convrot._fuse_quantized_qkv = qkv_only
 
 
 def summarize(
@@ -193,6 +232,9 @@ def run(args: argparse.Namespace) -> int:
     from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
     from vcap.models.vram_presets import preset_for
 
+    if args.unfused_gate_up_control:
+        _install_unfused_gate_up_control()
+
     registered_variant = get_variant(variant_key)
     family = variant_to_family(registered_variant.key)
     spec = MODEL_SPECS[family]
@@ -218,7 +260,7 @@ def run(args: argparse.Namespace) -> int:
         top_k=int(defaults.get("top_k", 0)),
         repetition_penalty=float(defaults.get("repetition_penalty", 1.0)),
         max_new_tokens=max_new_tokens,
-        do_sample=bool(defaults.get("do_sample", False)),
+        do_sample=False if args.greedy else bool(defaults.get("do_sample", False)),
         enable_thinking=bool(defaults.get("enable_thinking", True)),
     )
     preprocessing = PreprocessParams(
@@ -317,6 +359,7 @@ def run(args: argparse.Namespace) -> int:
                 "family": family,
                 "input": str(source),
                 "runs": int(args.runs),
+                "unfused_gate_up_control": bool(args.unfused_gate_up_control),
                 "profile_tier_gb": int(args.profile_tier),
                 "attention_requested": attention,
                 "attention_resolved": loaded.load_report.attention,

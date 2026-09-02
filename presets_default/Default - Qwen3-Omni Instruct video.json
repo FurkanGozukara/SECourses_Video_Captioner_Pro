@@ -3,10 +3,10 @@
     "format": "secourses_vcap_preset",
     "version": 1,
     "name": "Default - Qwen3-Omni Instruct video",
-    "description": "Balanced dense audiovisual captioning with the INT8 Qwen3-Omni Instruct model."
+    "description": "Balanced dense audiovisual captioning with the fully resident INT4 Qwen3-Omni Instruct model (fits 24 GB+ GPUs; block-swaps on smaller cards)."
   },
   "settings": {
-    "model_key": "qwen3_omni_instruct_int8",
+    "model_key": "qwen3_omni_instruct_int4",
     "prompt_preset_id": "qwen3_video_dense",
     "system_prompt": null,
     "user_prompt": "Describe the video in one {{CAPTION_LENGTH}} {{LANGUAGE}} paragraph, integrating visible and audible events in chronological order. Ground the caption in subjects, clothing, objects, setting, physical action, interactions, camera framing and movement, lighting, readable screen text, speech with speaker cues, music, sound effects, and environmental sound. Align each sound with the event or interval it accompanies, quote only clearly intelligible speech, and mark uncertain details rather than guessing. Use objective present tense with no heading, bullet list, analysis, or unsupported intent. {{AVOID}} {{EXTRA_INSTRUCTIONS}}",
@@ -40,7 +40,10 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": false,
     "save_reasoning": true,
     "overwrite_existing": false,

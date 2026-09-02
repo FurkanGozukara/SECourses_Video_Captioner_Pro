@@ -10,16 +10,136 @@ import re
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from vcap import APP_DIR
 from vcap.core.logs import get_log
 from vcap.core.subprocess_runner import build_child_env, kill_process_tree
 
-from .registry import get_variant, variant_is_ready
+from .registry import MODELS_DIR, get_variant, resolve_model_dir, variant_is_ready
 
 
 ProgressCallback = Callable[..., None]
+
+
+@dataclass(frozen=True)
+class DeleteReport:
+    """Outcome of deleting one model variant's local artifacts."""
+
+    variant_key: str
+    folder: str
+    files_removed: int
+    bytes_freed: int
+    errors: list[str]
+
+
+def _variant_folder(variant_key: str, *, require_inside: bool) -> Path:
+    folder = resolve_model_dir(str(variant_key)).resolve(strict=False)
+    root = Path(MODELS_DIR).resolve(strict=False)
+    inside = folder != root
+    if inside:
+        try:
+            folder.relative_to(root)
+        except ValueError:
+            inside = False
+    if require_inside and not inside:
+        raise ValueError(f"Refusing to delete model files outside MODELS_DIR: {folder}")
+    return folder
+
+
+def variant_disk_usage(variant_key: str) -> int:
+    """Return bytes used by a variant folder, including partial downloads."""
+
+    folder = _variant_folder(variant_key, require_inside=False)
+    try:
+        if not folder.exists() or not folder.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    pending = [folder]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                else:
+                    total += max(0, int(entry.stat(follow_symlinks=False).st_size))
+            except OSError:
+                continue
+    return total
+
+
+def delete_variant_files(variant_key: str) -> DeleteReport:
+    """Delete one variant folder without following links or leaving partial files."""
+
+    key = str(variant_key)
+    folder = _variant_folder(key, require_inside=True)
+    errors: list[str] = []
+    files_removed = 0
+    bytes_freed = 0
+    try:
+        exists = folder.exists() or folder.is_symlink()
+    except OSError as exc:
+        return DeleteReport(key, str(folder), 0, 0, [f"{folder}: {exc}"])
+    if not exists:
+        return DeleteReport(key, str(folder), 0, 0, [])
+
+    def remove_directory(directory: Path) -> None:
+        nonlocal files_removed, bytes_freed
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            errors.append(f"{directory}: {exc}")
+            return
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+                continue
+            if is_directory:
+                remove_directory(path)
+                try:
+                    path.rmdir()
+                except OSError as exc:
+                    errors.append(f"{path}: {exc}")
+                continue
+            try:
+                size = max(0, int(entry.stat(follow_symlinks=False).st_size))
+            except OSError:
+                size = 0
+            try:
+                path.unlink()
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+            else:
+                files_removed += 1
+                bytes_freed += size
+
+    if folder.is_symlink():
+        try:
+            size = max(0, int(folder.lstat().st_size))
+            folder.unlink()
+        except OSError as exc:
+            errors.append(f"{folder}: {exc}")
+        else:
+            files_removed = 1
+            bytes_freed = size
+    else:
+        remove_directory(folder)
+        try:
+            folder.rmdir()
+        except OSError as exc:
+            errors.append(f"{folder}: {exc}")
+    return DeleteReport(key, str(folder), files_removed, bytes_freed, errors)
 
 
 def _cancelled(token: object | None) -> bool:
@@ -265,4 +385,10 @@ def ensure_model(
     return ready, message
 
 
-__all__ = ["ensure_model", "format_status_line"]
+__all__ = [
+    "DeleteReport",
+    "delete_variant_files",
+    "ensure_model",
+    "format_status_line",
+    "variant_disk_usage",
+]

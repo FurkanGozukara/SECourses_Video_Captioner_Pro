@@ -195,9 +195,30 @@ def test_universal_preset_dropdown_applies_selection_immediately(tmp_path: Path)
         saved = demo.fns[save[0]["id"]].fn("Mine", 4.0, 0.5)
         assert saved[0]["value"] == "Mine" and saved[-1] == {"name": "Mine", "settings": {}}
         delete = _dependencies_for(config, handles.delete._id, "click")
-        deleted = demo.fns[delete[0]["id"]].fn("Mine")
-        # Deleting leaves nothing selected so the next pick is a real change.
-        assert deleted[0]["value"] is None and deleted[-1] == {"name": "", "settings": {}}
+        pending = demo.fns[delete[0]["id"]].fn("Mine")
+        assert pending[0] == {"name": "Mine"}
+        assert pending[1]["visible"] is True
+        assert '⚠ Delete preset "Mine"?' in pending[2]
+        assert ctx.preset_store.load("Mine")["fps"] == 4.0
+
+        keep = _dependencies_for(config, handles.delete_keep._id, "click")
+        kept = demo.fns[keep[0]["id"]].fn(pending[0])
+        assert kept[0] == {} and kept[1]["visible"] is False
+        assert ctx.preset_store.load("Mine")["fps"] == 4.0
+
+        pending = demo.fns[delete[0]["id"]].fn("Mine")
+        confirm = _dependencies_for(config, handles.delete_yes._id, "click")
+        deleted = demo.fns[confirm[0]["id"]].fn(pending[0])
+        assert deleted[0:2] == (3.0, 0.9)
+        assert deleted[2]["value"] == "Balanced"
+        assert "Deleted Mine; loaded Balanced." in deleted[3]
+        assert deleted[4]["name"] == "Balanced"
+        assert deleted[5]["visible"] is False and deleted[6] == {}
+        assert not ctx.preset_store.exists("Mine")
+
+        protected = demo.fns[delete[0]["id"]].fn("Balanced")
+        assert protected[0] == {} and protected[1]["visible"] is False
+        assert "protected default" in protected[3]
     finally:
         ctx.pipeline_client.shutdown()
 
@@ -226,6 +247,18 @@ def test_preset_value_adapters_ship_bounds_with_values(tmp_path: Path) -> None:
         assert adapter({"model_key": "qwen3_omni_captioner_int4", "max_frames": 0})["value"] == 0
         context = ctx.states["preset_value_adapters"]["context_tokens"]
         assert context({"model_key": "timechat_int8", "context_tokens": 99_999})["value"] == 32768
+        prompt = ctx.states["preset_value_adapters"]["prompt_preset_id"]
+        prompt_update = prompt(
+            {
+                "model_key": "qwen3_omni_instruct_int4",
+                "prompt_preset_id": "qwen3_video_dense",
+            }
+        )
+        assert prompt_update["value"] == "qwen3_video_dense"
+        assert any(
+            value == "qwen3_video_dense" and "Qwen3-Omni" in label
+            for label, value in prompt_update["choices"]
+        )
         binding = ctx.states["caption_auto_vram_binding"]
         assert binding["input_keys"] == ["model_key", "vram_preset", None, "show_all_variants"]
         assert len(binding["input_keys"]) == len(binding["inputs"])

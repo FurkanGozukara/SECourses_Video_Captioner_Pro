@@ -48,11 +48,15 @@ def test_folder_scan_counts_mirrored_output_sidecars(tmp_path: Path) -> None:
     (source / "nested" / "clip.txt").write_text("input sidecar", encoding="utf-8")
     (output / "nested" / "clip.txt").write_text("output sidecar", encoding="utf-8")
 
-    selected, summary = _folder_scan(str(source), True, str(output), False)
+    selected, summary = _folder_scan(
+        str(source), True, str(output), False, include_kinds=["video"]
+    )
     assert selected == [str(source / "nested" / "clip.mp4")]
     assert "1 already captioned in output folder" in summary
     assert "will be skipped" in summary
-    _, limited_summary = _folder_scan(str(source), True, str(output), False, 2)
+    _, limited_summary = _folder_scan(
+        str(source), True, str(output), False, 2, ["video"]
+    )
     assert "limiting to first 2" in limited_summary
 
 
@@ -285,6 +289,13 @@ def test_caption_tab_action_button_hues_are_distinct() -> None:
         ]
         assert len(cancel_components) == 1
         assert cancel_components[0]["props"]["interactive"] is False
+        by_elem_id = {
+            component.get("props", {}).get("elem_id"): component
+            for component in config["components"]
+        }
+        assert by_elem_id["vc_caption_cancel_confirmation"]["props"]["visible"] is False
+        assert by_elem_id["vc_caption_cancel_yes"]["props"]["value"] == "✔ Yes, cancel"
+        assert by_elem_id["vc_caption_cancel_keep"]["props"]["value"] == "✖ Keep running"
         tab_select_events = [
             dependency
             for dependency in config["dependencies"]
@@ -305,14 +316,12 @@ def test_caption_tab_action_button_hues_are_distinct() -> None:
         client.shutdown()
 
 
-def test_model_switch_handlers_never_narrow_backend_bounds() -> None:
-    """Every handler that reshapes numeric controls must keep the backend bounds.
+def test_model_switch_handlers_keep_values_inside_reported_bounds() -> None:
+    """Every handler keeps numeric values inside the bounds it reports.
 
     Gradio validates incoming values against the *backend* bound of a Number or
-    Slider, and sibling handlers on one trigger race each other, so an update
-    that narrowed a bound could make another handler's stale value fail with
-    "Value 768 is greater than maximum value 160". Bounds therefore stay at
-    their construction-time (global) values; family limits are clamped values.
+    Slider. Frame and pixel bounds stay global to avoid sibling-event races;
+    Maximum new tokens intentionally follows the selected family cap in F2.
     """
 
     from vcap.models.registry import MODEL_SPECS
@@ -334,6 +343,11 @@ def test_model_switch_handlers_never_narrow_backend_bounds() -> None:
             for component in config["components"]
             if component.get("type") in {"number", "slider"}
         }
+        max_tokens_id = next(
+            entry.component._id
+            for entry in ctx.settings_registry.entries()
+            if entry.key == "max_new_tokens"
+        )
         checked = 0
 
         def check(component_id: int, value: object, context: str) -> None:
@@ -345,7 +359,11 @@ def test_model_switch_handlers_never_narrow_backend_bounds() -> None:
                 if "minimum" in value:
                     assert value["minimum"] == low, (context, component_id, value)
                 if "maximum" in value:
-                    assert value["maximum"] == high, (context, component_id, value)
+                    if component_id == max_tokens_id:
+                        assert 1 <= value["maximum"] <= caption_tab._GLOBAL_MAX_NEW_TOKENS
+                        high = value["maximum"]
+                    else:
+                        assert value["maximum"] == high, (context, component_id, value)
                 value = value.get("value")
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return

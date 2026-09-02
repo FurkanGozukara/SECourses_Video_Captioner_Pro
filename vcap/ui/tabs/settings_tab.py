@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import gradio as gr
 
 from vcap.core.app_settings import APP_SETTINGS_PATH, load_app_settings, save_app_settings
-from vcap.core.paths import normalize_path
+from vcap.core.paths import normalize_path, open_in_file_manager
 from vcap.ui.components import action_button
 from vcap.ui.theme import THEME_CHANGE_JS
 
@@ -65,6 +65,50 @@ def build(ctx: "UiContext") -> None:
                 in_preset=False,
                 kind="str",
             )
+            logs_dir = gr.Textbox(
+                value=str(persisted.get("logs_dir") or ctx.logs_dir),
+                label="Logs directory",
+                info="Log directory; takes effect after restart.",
+                elem_id="vc_logs_dir",
+            )
+            ctx.reg(
+                "logs_dir",
+                logs_dir,
+                str(persisted.get("logs_dir") or ctx.logs_dir),
+                section="global",
+                description="Log directory; takes effect after restart.",
+                in_preset=False,
+                in_metadata=False,
+                kind="str",
+            )
+            ffmpeg_path = gr.Textbox(
+                value=str(persisted.get("ffmpeg_path") or ""),
+                label="FFmpeg path",
+                info=(
+                    "Optional folder or executable path for FFmpeg/FFprobe when they are not on PATH "
+                    "(empty = automatic search). Takes effect after restart."
+                ),
+                elem_id="vc_ffmpeg_path",
+            )
+            ctx.reg(
+                "ffmpeg_path",
+                ffmpeg_path,
+                str(persisted.get("ffmpeg_path") or ""),
+                section="global",
+                description="Optional FFmpeg folder or executable path; empty uses automatic discovery.",
+                in_preset=False,
+                in_metadata=False,
+                kind="str",
+            )
+            with gr.Row(elem_classes=["vc-compact-row"]):
+                open_presets = action_button(
+                    "📂 Open presets folder", "jade", size="md",
+                    elem_id="vc_open_presets_folder",
+                )
+                open_logs = action_button(
+                    "📂 Open logs folder", "copper", size="md",
+                    elem_id="vc_open_logs_folder_settings",
+                )
 
         with gr.Column(scale=4, min_width=340):
             gr.Markdown("### Experience")
@@ -177,6 +221,8 @@ def build(ctx: "UiContext") -> None:
         outputs_value: str,
         temp_value: str,
         models_value: str,
+        logs_value: str,
+        ffmpeg_value: str,
         save_files: bool,
         recursive: bool,
         notify_desktop: bool,
@@ -184,17 +230,26 @@ def build(ctx: "UiContext") -> None:
         open_single_output: bool,
     ) -> tuple[Any, ...]:
         try:
-            if not all(str(value or "").strip() for value in (outputs_value, temp_value, models_value)):
-                raise ValueError("Outputs, temporary, and models directories cannot be empty")
+            if not all(str(value or "").strip() for value in (outputs_value, temp_value, models_value, logs_value)):
+                raise ValueError("Outputs, temporary, models, and logs directories cannot be empty")
             normalized_outputs = normalize_path(outputs_value)
             normalized_temp = normalize_path(temp_value)
             normalized_models = normalize_path(models_value)
+            normalized_logs = normalize_path(logs_value)
+            normalized_ffmpeg = (
+                str(normalize_path(ffmpeg_value))
+                if str(ffmpeg_value or "").strip()
+                else ""
+            )
             normalized_outputs.mkdir(parents=True, exist_ok=True)
+            normalized_logs.mkdir(parents=True, exist_ok=True)
             target = save_app_settings(
                 {
                     "outputs_dir": normalized_outputs,
                     "temp_dir": normalized_temp,
                     "models_dir": normalized_models,
+                    "logs_dir": normalized_logs,
+                    "ffmpeg_path": normalized_ffmpeg,
                     "save_processed_files": bool(save_files),
                     "scan_subfolders": bool(recursive),
                     "desktop_notification_on_finish": bool(notify_desktop),
@@ -204,14 +259,19 @@ def build(ctx: "UiContext") -> None:
                 APP_SETTINGS_PATH,
             )
             ctx.outputs_dir = normalized_outputs
+            ctx.logs_dir = normalized_logs
             return (
                 str(normalized_outputs),
                 str(normalized_temp),
                 str(normalized_models),
+                str(normalized_logs),
+                normalized_ffmpeg,
                 f"<span class='vc-ok'>Saved global settings to {html.escape(str(target))}.</span>",
             )
         except Exception as exc:
             return (
+                gr.skip(),
+                gr.skip(),
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
@@ -224,13 +284,37 @@ def build(ctx: "UiContext") -> None:
             outputs_dir,
             temp_dir,
             models_dir,
+            logs_dir,
+            ffmpeg_path,
             save_processed,
             scan_subfolders,
             desktop_notification,
             completion_sound,
             open_output_on_finish,
         ],
-        outputs=[outputs_dir, temp_dir, models_dir, save_status],
+        outputs=[outputs_dir, temp_dir, models_dir, logs_dir, ffmpeg_path, save_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def open_folder(path_value: str) -> str:
+        path = normalize_path(path_value)
+        path.mkdir(parents=True, exist_ok=True)
+        ok, message = open_in_file_manager(path)
+        return f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"
+
+    open_presets.click(
+        lambda: open_folder(str(ctx.presets_dir)),
+        outputs=save_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    open_logs.click(
+        open_folder,
+        inputs=logs_dir,
+        outputs=save_status,
         queue=False,
         show_progress="hidden",
         api_visibility="private",
