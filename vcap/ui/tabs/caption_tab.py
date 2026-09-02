@@ -1545,12 +1545,16 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "maroon",
                         variant="stop",
                         size="sm",
+                        scale=0,
+                        min_width=132,
                         elem_id="vc_caption_cancel_yes",
                     )
                     cancel_keep = action_button(
                         "✖ Keep running",
                         "steel",
                         size="sm",
+                        scale=0,
+                        min_width=148,
                         elem_id="vc_caption_cancel_keep",
                     )
                 hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")

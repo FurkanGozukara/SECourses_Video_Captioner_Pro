@@ -1092,7 +1092,7 @@ def build(ctx: "UiContext") -> None:
         )
         scan = action_button("Scan", "cyan", size="md", scale=1, min_width=92)
         open_folder = action_button("📂 Open folder", "amber", size="md", scale=1, min_width=118)
-        reveal_selected = action_button("📍 Reveal selected file", "crimson", size="md", scale=1, min_width=158)
+        reveal_selected = action_button("📍 Reveal file", "crimson", size="md", scale=1, min_width=124)
         recursive = gr.Checkbox(
             value=False, label="Recursive",
             info="Include nested batch folders and run clip directories.", scale=1,
@@ -1249,10 +1249,12 @@ def build(ctx: "UiContext") -> None:
             regenerate_all_question = gr.Markdown("Regenerate 0 captions?")
             regenerate_all_yes = action_button(
                 "✔ Yes, regenerate", "maroon", size="sm", variant="stop",
+                scale=0, min_width=160,
                 elem_id="vc_editor_regenerate_all_yes",
             )
             regenerate_all_keep = action_button(
                 "✖ Keep current captions", "steel", size="sm",
+                scale=0, min_width=208,
                 elem_id="vc_editor_regenerate_all_keep",
             )
         regen_status = gr.Markdown(

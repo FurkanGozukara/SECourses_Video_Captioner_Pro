@@ -128,14 +128,20 @@ class PresetStore:
             raise PresetError("Preset settings must be a JSON object")
         return payload
 
-    def load(self, name: str) -> dict[str, Any]:
-        """Load a preset's settings and mark it as last used."""
+    def load(self, name: str, *, mark_last_used: bool = True) -> dict[str, Any]:
+        """Load a preset's settings, marking it as last used unless told not to.
+
+        Startup reads the shipped default with ``mark_last_used=False`` so that
+        opening the app does not overwrite the marker the Load last values
+        button exists to restore.
+        """
 
         entry = self._find(name)
         if entry is None:
             raise PresetError(f"Preset not found: {name}")
         payload = self._read_payload(entry.path)
-        self.set_last_used(entry.name)
+        if mark_last_used:
+            self.set_last_used(entry.name)
         return deepcopy(payload["settings"])
 
     def save(
@@ -246,18 +252,27 @@ class PresetStore:
         entry = self._find(value) if value else None
         return entry.name if entry is not None else None
 
-    def startup_preset_name(self) -> str | None:
-        """Return last-used, then the configured shipped default, then the first entry."""
+    def default_startup_name(self) -> str | None:
+        """Return the configured shipped default, then the first entry.
 
-        last_used = self.get_last_used()
-        if last_used:
-            return last_used
+        This is what a fresh launch applies: the last-used marker is deliberately
+        ignored so every start begins from the same known configuration.
+        """
+
         if self.default_preset_name:
             entry = self._find(self.default_preset_name)
             if entry is not None:
                 return entry.name
         entries = self.list_presets()
         return entries[0].name if entries else None
+
+    def startup_preset_name(self) -> str | None:
+        """Return last-used, then the configured shipped default, then the first entry."""
+
+        last_used = self.get_last_used()
+        if last_used:
+            return last_used
+        return self.default_startup_name()
 
     def set_last_used(self, name: str) -> None:
         """Persist the last-used preset marker as UTF-8 text."""

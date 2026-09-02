@@ -109,7 +109,8 @@ The default first-launch preset is Qwen3-Omni Instruct video. Select the VRAM ti
 ## Presets and Persistence
 
 - `presets_default/` contains shipped read-only presets; the UI refuses to overwrite or delete them.
-- `presets/` contains user presets and the last-used marker; saving or loading a preset marks it as last used, and startup loads it automatically.
+- `presets/` contains user presets and the last-used marker; saving or loading a preset marks it as last used.
+- **A fresh start never restores the last-used preset.** Every launch applies the shipped `Default - Qwen3-Omni Instruct video` preset, so the app always opens in the same known state. Press **⟲ Load Last Values** in the preset bar to apply the preset you used last; that is the only thing that reads the marker.
 - Selecting a preset in the universal preset dropdown applies it immediately; Load re-applies the selected preset after manual edits, and Reset restores application defaults. Task / prompt presets in the Caption tab apply on selection as well.
 - Every preset also stores the Chat tab's system prompt and generation settings plus the context window. Four shipped presets select chat-capable models: `Chat assistant (Qwen3-Omni Instruct)` and `Chat with reasoning (Qwen3-Omni Thinking)` use the INT8 ConvRot Transformers path with native video, while the `… fast (… GGUF Q8)` variants run through the private `llama-server` for several times the decode speed with video sent as sampled frames plus audio. Qwen3-Omni Instruct and Thinking hold multi-turn conversations over video, audio, images, and text; TimeChat and AVoCaDO answer one question about exactly one video per Send; the Qwen3-Omni Captioner has no chat mode.
 
@@ -121,9 +122,13 @@ Memory follows the backend: `llama-server` reserves the KV cache for the whole w
 - `app_settings.json` stores the outputs, temporary, and models directories plus the save-processed-files and recursive-scan preferences; environment variables still take precedence for application directories.
 - Recover Settings reads `metadata.json` and restores compatible controls, while source paths require an explicit opt-in and unavailable GPU indices are skipped.
 
-## Theme
+## Interface
+
+The interface uses the stock Gradio 6 **Ocean** theme (blue/cyan on a slate neutral) with only the application's own markup styled on top, so every colour comes from the theme and both modes stay correct from one definition. Fonts are the ones Gradio bundles, so a page load makes no request to Google Fonts and the app renders identically without internet access.
 
 Dark is the default. Global Settings offers Dark, Light, and System; the choice is stored in the browser, applies immediately, and System follows live operating-system color changes. Theme choice is intentionally excluded from presets and run metadata.
+
+The main tab bar sticks to the top of the window, so any tab is one click away from anywhere on a long page. **Open / Close All** in the preset bar expands or collapses every section of the tab you are looking at, including sections nested inside others; it runs entirely in the browser and never touches the server. **⟲ Load Last Values**, immediately to its left, applies the preset this machine used last.
 
 ## Keyboard Shortcuts
 
@@ -131,6 +136,7 @@ Shortcuts are scoped to the active tab.
 
 | Tab | Shortcut | Action |
 |---|---|---|
+| Any tab | `F4` | Open or close every section of the visible tab (same as **Open / Close All**). |
 | Caption, Processing Pipeline | `F9` | Start captioning. |
 | Caption, Processing Pipeline | `Esc` | Arm cancellation for six seconds; press again to confirm while a caption job is active. |
 | Caption Editor | `←` / `→` | Previous / next item when focus is outside a text field. |

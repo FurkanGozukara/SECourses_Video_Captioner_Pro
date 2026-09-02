@@ -22,6 +22,7 @@ from vcap.core.paths import (
     sanitize_filename,
 )
 from vcap.core.presets import PresetError
+from vcap.ui.theme import TOGGLE_ACCORDIONS_JS
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
@@ -76,6 +77,8 @@ class PresetBarHandles:
     delete_keep: gr.Button
     reset: gr.Button
     status: gr.Markdown
+    load_last: gr.Button
+    toggle_accordions: gr.Button
 
 
 def _preset_choices(ctx: "UiContext") -> list[tuple[str, str]]:
@@ -91,32 +94,51 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
     """Render the universal preset strip. Event wiring is finalized after all tabs."""
 
     choices = _preset_choices(ctx)
-    initial = ctx.preset_store.startup_preset_name()
-    with gr.Row(elem_classes=["vc-preset-bar", "vc-compact-row"]):
-        dropdown = gr.Dropdown(
-            choices=choices,
-            value=initial,
-            label="Universal preset",
-            info="Selecting a preset applies it immediately. Defaults are marked with a star and are read-only.",
-            scale=4,
-            min_width=260,
-        )
-        save_as = gr.Textbox(
-            label="Save as",
-            placeholder="My caption workflow",
-            info="Name for a new or existing user preset.",
-            scale=3,
-            min_width=220,
-        )
-        save = action_button("💾 Save", "green", size="md", scale=1, min_width=92)
-        load = action_button("📥 Load", "blue", size="md", scale=1, min_width=92)
-        delete = action_button("🗑️ Delete", "rose", size="md", scale=1, min_width=96)
-        reset = action_button("↺ Reset", "gold", size="md", scale=1, min_width=92)
+    # The shipped default, never the last-used marker: a launch always starts
+    # from the same configuration, and Load last values restores the other one.
+    initial = ctx.preset_store.default_startup_name()
+    # A column, not a row: the status line reads better on its own full-width
+    # line than squeezed into the last flex slot of a seven-control strip.
+    with gr.Column(elem_classes=["vc-preset-bar"]):
+        with gr.Row(elem_classes=["vc-compact-row"]):
+            dropdown = gr.Dropdown(
+                choices=choices,
+                value=initial,
+                label="Universal preset",
+                info="Selecting a preset applies it immediately. Defaults are marked with a star and are read-only.",
+                scale=4,
+                min_width=260,
+            )
+            save_as = gr.Textbox(
+                label="Save as",
+                placeholder="My caption workflow",
+                info="Name for a new or existing user preset.",
+                scale=3,
+                min_width=220,
+            )
+            save = action_button("💾 Save", "green", size="md", scale=1, min_width=92)
+            load = action_button("📥 Load", "blue", size="md", scale=1, min_width=92)
+            delete = action_button("🗑️ Delete", "rose", size="md", scale=1, min_width=96)
+            reset = action_button("↺ Reset", "gold", size="md", scale=1, min_width=92)
+            load_last = action_button(
+                "⟲ Load Last Values",
+                "teal",
+                size="md",
+                scale=2,
+                min_width=186,
+                elem_id="vc_load_last_values",
+            )
+            toggle_accordions = action_button(
+                "⇕ Open / Close All",
+                "indigo",
+                size="md",
+                scale=2,
+                min_width=168,
+                elem_id="vc_toggle_accordions",
+            )
         status = gr.Markdown(
             "<span class='vc-ok'>Ready.</span>",
             elem_classes=["vc-status"],
-            scale=3,
-            min_width=320,
         )
     with gr.Row(
         visible=False,
@@ -124,10 +146,14 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
         elem_classes=["vc-confirm-bar", "vc-compact-row"],
     ) as delete_confirmation:
         delete_question = gr.Markdown("Delete the selected user preset?")
+        # scale=0 sizes each button to its label so the question keeps the
+        # rest of the bar instead of being squeezed into a third of it.
         delete_yes = action_button(
             "✔ Yes, delete",
             "red",
             size="sm",
+            scale=0,
+            min_width=132,
             variant="stop",
             elem_id="vc_preset_delete_yes",
         )
@@ -135,6 +161,8 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
             "✖ Keep preset",
             "slate",
             size="sm",
+            scale=0,
+            min_width=140,
             elem_id="vc_preset_delete_keep",
         )
     handles = PresetBarHandles(
@@ -149,6 +177,19 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
         delete_keep=delete_keep,
         reset=reset,
         status=status,
+        load_last=load_last,
+        toggle_accordions=toggle_accordions,
+    )
+    # Purely client-side: the accordion header is a plain button, so opening or
+    # closing every section on the visible tab never touches the server.
+    toggle_accordions.click(
+        fn=None,
+        inputs=None,
+        outputs=[],
+        js=TOGGLE_ACCORDIONS_JS,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
     ctx.preset_handles = handles
     return handles
@@ -324,9 +365,10 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         defaults = registry.defaults()
         return (*preset_values(defaults), "<span class='vc-ok'>Restored preset defaults.</span>", applied("", defaults))
 
-    def startup_preset() -> tuple[Any, ...]:
-        startup_name = ctx.preset_store.startup_preset_name()
-        if not startup_name:
+    def apply_named_preset(name: str | None, *, remember: bool, lead: str) -> tuple[Any, ...]:
+        """Apply one preset by name, falling back to application defaults."""
+
+        if not name:
             defaults = registry.defaults()
             return (
                 *preset_values(defaults),
@@ -335,23 +377,46 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
                 applied("", defaults),
             )
         try:
-            loaded = ctx.preset_store.load(startup_name)
+            loaded = ctx.preset_store.load(name, mark_last_used=remember)
             coerced, warnings = registry.coerce(loaded)
             suffix = f"; adjusted {len(warnings)} value(s)" if warnings else ""
             return (
                 *preset_values(coerced),
-                gr.update(choices=_preset_choices(ctx), value=startup_name),
-                f"<span class='vc-ok'>Auto-loaded {html.escape(startup_name)}{suffix}.</span>",
-                applied(startup_name, coerced),
+                gr.update(choices=_preset_choices(ctx), value=name),
+                f"<span class='vc-ok'>{lead} {html.escape(name)}{suffix}.</span>",
+                applied(name, coerced),
             )
         except Exception as exc:
             defaults = registry.defaults()
             return (
                 *preset_values(defaults),
                 gr.update(choices=_preset_choices(ctx)),
-                f"<span class='vc-warn'>Last preset could not load: {html.escape(str(exc))}</span>",
+                f"<span class='vc-warn'>{html.escape(name)} could not load: {html.escape(str(exc))}</span>",
                 applied("", defaults),
             )
+
+    def startup_preset() -> tuple[Any, ...]:
+        """Launch with the shipped default so every start looks the same.
+
+        The last-used marker is neither read nor written here; restoring it is
+        what the Load last values button is for.
+        """
+
+        return apply_named_preset(
+            ctx.preset_store.default_startup_name(),
+            remember=False,
+            lead="Started with",
+        )
+
+    def load_last_values() -> tuple[Any, ...]:
+        """Apply the preset this browser profile used last, on request."""
+
+        remembered = ctx.preset_store.get_last_used()
+        return apply_named_preset(
+            remembered or ctx.preset_store.default_startup_name(),
+            remember=True,
+            lead="Loaded last used:" if remembered else "No preset used yet; loaded",
+        )
 
     handles.save.click(
         save_preset,
@@ -425,6 +490,13 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         show_progress="hidden",
         api_visibility="private",
     )
+    load_last_event = handles.load_last.click(
+        load_last_values,
+        outputs=[*components, handles.dropdown, handles.status, applied_state],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
     auto_vram = ctx.states.get("caption_auto_vram_binding")
     if isinstance(auto_vram, dict):
         input_keys = list(auto_vram.get("input_keys") or [])
@@ -448,6 +520,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             select_event,
             reset_event,
             startup_event,
+            load_last_event,
             delete_confirm_event,
         ):
             dependency.then(
@@ -1314,7 +1387,9 @@ def log_panel(ctx: "UiContext") -> LogPanelHandles:
     with gr.Group(elem_classes=["vc-card"]):
         with gr.Row(elem_classes=["vc-compact-row"]):
             gr.Markdown("### Live log", elem_classes=["vc-section-title"])
-            clear = action_button("⌫ Clear", "orange", size="md", min_width=86)
+            # scale=0 keeps the button at its label width instead of taking the
+            # half of the row that Gradio's default flex share would hand it.
+            clear = action_button("⌫ Clear", "orange", size="md", scale=0, min_width=112)
         log = gr.Textbox(
             value=newest_first("\n".join(initial_lines)),
             label="Application log (newest first)",

@@ -79,6 +79,27 @@ def test_explicit_startup_default_is_first_and_used_without_marker(tmp_path: Pat
     assert store.startup_preset_name() == "Default Video"
 
 
+def test_startup_ignores_the_marker_and_loading_it_does_not_erase_it(tmp_path: Path) -> None:
+    """A launch applies the shipped default; only Load last values reads the marker."""
+
+    default_dir = tmp_path / "defaults"
+    user_dir = tmp_path / "user"
+    _default_preset(default_dir / "Default Video.json", {"fps": 2})
+    store = PresetStore(user_dir, default_dir, default_preset_name="Default Video")
+    mine = store.save("Mine", {"fps": 9})
+
+    assert store.get_last_used() == mine
+    # Startup picks the shipped default even though a marker exists...
+    assert store.default_startup_name() == "Default Video"
+    assert store.load("Default Video", mark_last_used=False) == {"fps": 2}
+    # ...and reading it that way must leave the marker alone, or the button
+    # would have nothing left to restore.
+    assert store.get_last_used() == mine
+    # The button's lookup still resolves to the remembered preset.
+    assert store.startup_preset_name() == mine
+    assert store.load(mine) == {"fps": 9}
+
+
 def test_merge_forward_compatibility() -> None:
     defaults = {"known": 1, "missing": True}
     with pytest.warns(UserWarning, match="unknown"):

@@ -685,6 +685,8 @@ def build(ctx: "UiContext") -> None:
             "✔ Yes, delete",
             "berry",
             size="sm",
+            scale=0,
+            min_width=132,
             variant="stop",
             elem_id="vc_health_delete_model_yes",
         )
@@ -692,6 +694,8 @@ def build(ctx: "UiContext") -> None:
             "✖ Keep files",
             "slate",
             size="sm",
+            scale=0,
+            min_width=124,
             elem_id="vc_health_delete_model_keep",
         )
     model_status = gr.Markdown(

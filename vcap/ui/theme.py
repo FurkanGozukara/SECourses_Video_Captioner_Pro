@@ -1,10 +1,25 @@
-"""Theme, product CSS, and browser bootstrap scripts for the Gradio shell."""
+"""Theme, product CSS, and browser bootstrap scripts for the Gradio shell.
+
+The look of the app comes from a stock Gradio theme. Only three things live in
+this module's stylesheet, because Gradio genuinely cannot express them:
+
+1. app-level layout the theme has no concept of (page width, the header band,
+   rows that align a button against a labelled input),
+2. the markup this app renders itself -- input tiles, progress and VRAM meters,
+   find/replace chips -- which no Gradio component styles for us,
+3. the multi-hue action-button palette, since a theme ships exactly one primary,
+   one secondary, and one stop button.
+
+Every colour below resolves to a Gradio theme variable, so light and dark stay
+correct from a single rule instead of a duplicated palette.
+"""
 
 from __future__ import annotations
 
 import gradio as gr
 
 
+# (deep, mid, bright) gradient stops per action-button hue.
 _SEC_BTN_HUES: dict[str, tuple[str, str, str]] = {
     "red": ("#991b1b", "#dc2626", "#f87171"),
     "crimson": ("#4c0519", "#be123c", "#fb7185"),
@@ -47,270 +62,274 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
 
 
 def _build_sec_btn_css() -> str:
-    """Generate high-specificity dark and light rules for every button hue."""
+    """Emit one custom-property line per hue.
+
+    The gradient, border, shadow, and hover behaviour are declared once on
+    ``.vc-btn`` in the base stylesheet; a hue class only supplies the colours.
+    """
 
     hues = dict(_SEC_BTN_HUES)
     hues["gold"] = _SEC_BTN_HUES["yellow"]
     rules: list[str] = []
-    for name, (dark, mid, light) in hues.items():
+    for name, (deep, mid, bright) in sorted(hues.items()):
         red, green, blue = _hex_to_rgb(mid)
-        light_red, light_green, light_blue = _hex_to_rgb(light)
+        light_red, light_green, light_blue = _hex_to_rgb(bright)
         rules.append(
-            f"""
-.vc-btn-{name}, .vc-btn-{name}.vc-btn-{name},
-.vc-btn-{name} button, button.vc-btn-{name} {{
-  background: linear-gradient(135deg, {dark} 0%, {mid} 55%, {light} 100%) !important;
-  border-color: rgba({light_red}, {light_green}, {light_blue}, 0.76) !important;
-  color: #f8fafc !important;
-  text-shadow: 0 1px 2px rgba(2, 6, 23, 0.46) !important;
-  box-shadow: 0 8px 20px rgba({red}, {green}, {blue}, 0.28), inset 0 1px 0 rgba(255,255,255,0.18) !important;
-}}
-.vc-btn-{name}:hover, .vc-btn-{name} button:hover, button.vc-btn-{name}:hover {{
-  border-color: rgba({light_red}, {light_green}, {light_blue}, 0.98) !important;
-  box-shadow: 0 11px 25px rgba({red}, {green}, {blue}, 0.40), inset 0 1px 0 rgba(255,255,255,0.24) !important;
-}}
-body:not(.dark) .vc-btn-{name}, body:not(.dark) .vc-btn-{name}.vc-btn-{name},
-body:not(.dark) .vc-btn-{name} button, body:not(.dark) button.vc-btn-{name} {{
-  background: linear-gradient(135deg, {dark} 0%, {mid} 64%, {light} 100%) !important;
-  border-color: {mid} !important;
-  color: #ffffff !important;
-  box-shadow: 0 7px 17px rgba({red}, {green}, {blue}, 0.23), inset 0 1px 0 rgba(255,255,255,0.22) !important;
-}}"""
+            f".vc-btn-{name}{{--vc-h1:{deep};--vc-h2:{mid};--vc-h3:{bright};"
+            f"--vc-hue:{red} {green} {blue};--vc-hue-lt:{light_red} {light_green} {light_blue};}}"
         )
     return "\n".join(rules)
 
 
 _BASE_CSS = r"""
-:root {
-  --vc-panel: rgba(15, 23, 42, 0.72);
-  --vc-panel-strong: #111827;
-  --vc-line: rgba(148, 163, 184, 0.20);
-  --vc-muted: #94a3b8;
-  --vc-ok: #34d399;
-  --vc-warn: #fbbf24;
-  --vc-err: #fb7185;
-  --vc-log-bg: #070b12;
-  --vc-log-fg: #cbd5e1;
-  --vc-log-border: rgba(56,189,248,0.20);
+/* Semantic status colours. Gradio themes have an error palette but no success
+   or warning pair, so these three are defined here and nowhere else. */
+:root { --vc-ok: #047857; --vc-warn: #b45309; --vc-err: #be123c; }
+.dark { --vc-ok: #34d399; --vc-warn: #fbbf24; --vc-err: #f87171; }
+
+/* ---------------------------------------------------------------- shell -- */
+/* The container is also un-clipped so the tab bar below can stick; Gradio's
+   own overflow:hidden would otherwise trap it in a non-scrolling box. */
+.gradio-container {
+  max-width: 1880px !important;
+  margin-inline: auto !important;
+  overflow: visible !important;
 }
 
-.gradio-container { max-width: 1840px !important; margin-left: auto !important; margin-right: auto !important; }
-.vc-shell { padding-bottom: 28px; }
-.vc-header {
-  padding: 15px 18px 13px;
-  border-bottom: 1px solid rgba(129, 140, 248, 0.25);
-  background: linear-gradient(112deg, rgba(30,41,59,0.96), rgba(17,24,39,0.96) 58%, rgba(12,74,110,0.76));
-}
-.vc-header h1 { font-size: 24px !important; line-height: 1.2 !important; margin: 0 !important; color: #f8fafc !important; letter-spacing: 0 !important; }
-.vc-header p { margin: 4px 0 0 !important; color: #cbd5e1 !important; }
-.vc-header a { color: #7dd3fc !important; font-weight: 700; }
-.vc-header-meta { text-align: right; color: #cbd5e1; font-size: 13px; line-height: 1.45; }
-
-.vc-preset-bar {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--vc-line);
-  background: rgba(15, 23, 42, 0.34);
-}
-.vc-compact-row { gap: 8px !important; align-items: end !important; }
-.vc-card, .vc-panel {
-  border: 1px solid var(--vc-line) !important;
-  border-radius: 8px !important;
-  background: var(--vc-panel) !important;
-  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.14) !important;
-}
-.vc-card { padding: 10px !important; }
-.vc-section-title { margin: 0 0 8px !important; font-weight: 750; }
-
-#vc-input-tabs .tab-container.visually-hidden {
-  display: none !important;
-  visibility: hidden !important;
-  position: absolute !important;
-  height: 0 !important;
-  overflow: hidden !important;
-  pointer-events: none !important;
-}
-#vc-input-tabs .tab-container:not(.visually-hidden) {
-  display: flex !important;
-  flex-wrap: nowrap !important;
-  overflow-x: auto !important;
-}
-#vc-input-tabs .tab-container:not(.visually-hidden) > button {
-  flex: 1 1 0 !important;
-  min-width: 108px !important;
-  white-space: nowrap !important;
-}
-
+/* A caption run is four to five screens tall, so the tab bar follows the page
+   and every tab stays one click away from wherever the user has scrolled. */
 #vc-main-tabs > .tab-wrapper {
-  border: 1px solid rgba(99,102,241,0.22) !important;
-  border-radius: 8px !important;
-  background: rgba(15,23,42,0.38) !important;
-  padding: 5px !important;
-}
-#vc-main-tabs > .tab-wrapper > .tab-container {
-  background: linear-gradient(130deg, rgba(30,41,59,.42), rgba(15,23,42,.26)) !important;
-}
-#vc-main-tabs .tab-container button { font-weight: 700 !important; }
-#vc-main-tabs .tab-container button.selected {
-  color: #eef2ff !important;
-  border-color: rgba(56,189,248,0.66) !important;
-  background: linear-gradient(145deg, #4338ca, #0f766e) !important;
+  position: sticky;
+  top: 0;
+  /* Above the z-index 40 Gradio puts on every block title, below the 1000-plus
+     layers it reserves for dropdown menus and modals. */
+  z-index: 60;
+  padding-top: var(--spacing-lg);
+  background: var(--body-background-fill);
 }
 
+/* --------------------------------------------------------------- header -- */
+.vc-header {
+  align-items: center !important;
+  margin-bottom: var(--spacing-xxl) !important;
+  padding: var(--spacing-xxl) calc(1.5 * var(--spacing-xxl)) !important;
+  border: 1px solid var(--border-color-primary) !important;
+  border-radius: var(--container-radius) !important;
+  box-shadow: var(--shadow-drop-lg) !important;
+  background:
+    linear-gradient(104deg, color-mix(in srgb, var(--primary-500) 18%, transparent) 0%, transparent 58%),
+    var(--background-fill-secondary) !important;
+}
+.vc-header h1 { margin: 0 !important; font-size: var(--text-xxl) !important; line-height: 1.15 !important; }
+.vc-header p { margin: var(--spacing-md) 0 0 !important; color: var(--body-text-color-subdued) !important; }
+.vc-header-meta { text-align: right; color: var(--body-text-color-subdued); font-size: var(--text-sm); line-height: 1.5; }
+
+/* ----------------------------------------------------------- preset bar -- */
+.vc-preset-bar {
+  gap: var(--spacing-lg) !important;
+  margin-bottom: var(--spacing-xxl) !important;
+  padding: var(--spacing-lg) var(--spacing-xl) !important;
+  border: 1px solid var(--border-color-primary) !important;
+  border-radius: var(--container-radius) !important;
+  box-shadow: var(--shadow-drop-lg) !important;
+  background: var(--background-fill-secondary) !important;
+}
+
+/* --------------------------------------------------------------- layout -- */
+/* Puts a bare button on the same baseline as the input it sits beside. */
+.vc-compact-row { align-items: flex-end !important; }
+/* ...unless the row is nothing but buttons, where every button should match
+   the tallest one so a label that wraps to two lines keeps the row square. */
+.vc-action-row,
+.vc-compact-row:not(:has(> :not(button))) { align-items: stretch !important; }
+
+.vc-card {
+  padding: var(--spacing-xl) !important;
+  border: 1px solid var(--border-color-primary) !important;
+  border-radius: var(--container-radius) !important;
+  box-shadow: var(--shadow-drop-lg) !important;
+  background: var(--background-fill-secondary) !important;
+}
+/* gr.Group repeats elem_classes on a nested wrapper; only the outer one is the card. */
+.vc-card .vc-card { padding: 0 !important; border: 0 !important; box-shadow: none !important; background: none !important; }
+.vc-section-title { margin: 0 0 var(--spacing-lg) !important; }
+.vc-help { color: var(--body-text-color-subdued); font-size: var(--text-sm); }
+.vc-status { min-height: 24px; }
+
+/* ---------------------------------------------------------- media panes -- */
+.vc-preview video, .vc-preview img { max-height: 390px !important; object-fit: contain !important; }
+.vc-preview audio { max-height: 150px !important; }
+.vc-result-panel textarea, .vc-scroll-result { max-height: 410px !important; overflow: auto !important; }
+.vc-editor-gallery img { aspect-ratio: 16 / 10 !important; object-fit: cover !important; }
+.vc-log textarea, .vc-mono textarea {
+  font-family: var(--font-mono) !important;
+  font-size: var(--text-sm) !important;
+  line-height: 1.5 !important;
+}
+
+/* ------------------------------------------------- app-rendered widgets -- */
 .vc-input-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 6px;
+  gap: var(--spacing-md);
   max-height: 152px;
   overflow: auto;
 }
 .vc-input-tile {
   display: flex;
-  gap: 7px;
+  gap: var(--spacing-lg);
   align-items: center;
   min-width: 0;
-  padding: 7px 8px;
-  border: 1px solid var(--vc-line);
-  border-radius: 6px;
-  background: rgba(30,41,59,0.48);
+  padding: var(--spacing-lg) var(--spacing-xl);
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-lg);
+  background: var(--block-background-fill);
 }
 .vc-input-icon { flex: 0 0 auto; font-size: 17px; }
-.vc-input-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.vc-preview video, .vc-preview img { max-height: 390px !important; object-fit: contain !important; }
-.vc-preview audio { max-height: 150px !important; }
+.vc-input-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); }
 
-.vc-result-panel textarea, .vc-scroll-result { max-height: 410px !important; overflow: auto !important; }
-.vc-log textarea {
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace !important;
-  font-size: 12px !important;
-  line-height: 1.45 !important;
-  color: var(--vc-log-fg) !important;
-  background: var(--vc-log-bg) !important;
-  border-color: var(--vc-log-border) !important;
+.vc-progress, .vc-meter {
+  padding: var(--spacing-xl);
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-lg);
+  background: var(--block-background-fill);
 }
-.vc-mono textarea { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace !important; }
+.vc-meter { display: grid; gap: var(--spacing-lg); }
+.vc-progress__labels, .vc-meter__label {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--spacing-xxl);
+  margin-bottom: var(--spacing-md);
+  color: var(--body-text-color-subdued);
+  font-size: var(--text-sm);
+}
+.vc-progress__track, .vc-meter__track {
+  height: 9px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--body-text-color) 14%, transparent);
+}
+.vc-progress__fill, .vc-meter__fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--secondary-500), var(--primary-400));
+  transition: width .18s ease;
+}
+/* VRAM, then host RAM, then shared memory: the ramp from accent to neutral
+   tells the three bars apart at a glance without inventing a palette. */
+.vc-meter__row:nth-child(2) .vc-meter__fill { background: linear-gradient(90deg, var(--primary-700), var(--primary-500)); }
+.vc-meter__row:nth-child(3) .vc-meter__fill { background: linear-gradient(90deg, var(--neutral-500), var(--neutral-400)); }
 
-.vc-progress { padding: 10px 12px; border: 1px solid var(--vc-line); border-radius: 7px; background: rgba(15,23,42,0.56); }
-.vc-progress__labels { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--vc-muted); margin-bottom: 6px; }
-.vc-progress__track, .vc-meter__track { height: 9px; overflow: hidden; border-radius: 4px; background: rgba(100,116,139,0.25); }
-.vc-progress__fill, .vc-meter__fill { display: block; height: 100%; background: linear-gradient(90deg, #2563eb, #14b8a6, #22c55e); transition: width .18s ease; }
-.vc-meter { display: grid; gap: 8px; padding: 9px 10px; border: 1px solid var(--vc-line); border-radius: 7px; background: rgba(15,23,42,0.46); }
-.vc-meter__label { display: flex; justify-content: space-between; gap: 12px; color: var(--vc-muted); font-size: 12px; margin-bottom: 4px; }
-.vc-meter__row:first-child .vc-meter__fill { background: linear-gradient(90deg, #2563eb, #06b6d4); }
-.vc-meter__row:last-child .vc-meter__fill { background: linear-gradient(90deg, #7c3aed, #ec4899); }
+.vcap-replace-chips { display: flex; flex-wrap: wrap; gap: var(--spacing-md); min-height: 28px; align-items: center; }
+.vcap-replace-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm) var(--spacing-lg);
+  border: 1px solid var(--border-color-accent-subdued);
+  border-radius: var(--radius-lg);
+  background: var(--color-accent-soft);
+  font-size: var(--text-sm);
+}
+.vcap-replace-arrow { color: var(--color-accent); font-weight: 800; }
 
 .vc-ok { color: var(--vc-ok) !important; font-weight: 700; }
 .vc-warn { color: var(--vc-warn) !important; font-weight: 700; }
 .vc-err { color: var(--vc-err) !important; font-weight: 700; }
-.vc-status { min-height: 24px; }
-.vc-help { color: var(--vc-muted); font-size: 12px; }
+
 .vc-confirm-bar {
-  padding: 8px 10px !important;
-  border: 1px solid rgba(248,113,113,.50) !important;
-  border-radius: 7px !important;
-  background: rgba(127,29,29,.22) !important;
   align-items: center !important;
+  padding: var(--spacing-lg) var(--spacing-xl) !important;
+  border: 1px solid var(--error-border-color) !important;
+  border-radius: var(--container-radius) !important;
+  background: var(--error-background-fill) !important;
 }
-.vc-confirm-bar p { margin: 0 !important; font-weight: 750; }
-body:not(.dark) .vc-confirm-bar {
-  background: rgba(254,226,226,.92) !important;
-  border-color: rgba(185,28,28,.42) !important;
-}
-.vc-editor-gallery img { aspect-ratio: 16 / 10 !important; object-fit: cover !important; }
+.vc-confirm-bar p { margin: 0 !important; color: var(--error-text-color); font-weight: 700; }
 
-.vcap-replace-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; align-items: center; }
-.vcap-replace-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid rgba(56,189,248,.30); border-radius: 6px; background: rgba(8,145,178,.12); font-size: 12px; }
-.vcap-replace-arrow { color: #38bdf8; font-weight: 800; }
-
-.vc-btn, .vc-btn.vc-btn { border-radius: 7px !important; min-height: 36px !important; font-weight: 780 !important; letter-spacing: 0 !important; transition: transform .14s ease, filter .14s ease, box-shadow .14s ease !important; }
-.vc-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.04); }
-.vc-btn:focus-visible { outline: 2px solid #bae6fd !important; outline-offset: 2px !important; }
-.vc-btn:disabled { filter: grayscale(.46) opacity(.62) !important; transform: none !important; }
-
-body:not(.dark) {
-  --vc-panel: rgba(255,255,255,0.94);
-  --vc-panel-strong: #ffffff;
-  --vc-line: rgba(71,85,105,0.20);
-  --vc-muted: #475569;
-  --vc-ok: #047857;
-  --vc-warn: #a16207;
-  --vc-err: #be123c;
-  --vc-log-bg: #f8fafc;
-  --vc-log-fg: #0f172a;
-  --vc-log-border: rgba(2,132,199,.25);
+/* ------------------------------------------------------ action buttons --- */
+/* The hue classes below supply --vc-h1/2/3; everything else is declared once. */
+.vc-btn, .vc-btn.vc-btn {
+  min-height: 38px;
+  border: 1px solid rgb(var(--vc-hue-lt) / .74) !important;
+  border-radius: var(--radius-lg) !important;
+  background: linear-gradient(135deg, var(--vc-h1) 0%, var(--vc-h2) 55%, var(--vc-h3) 100%) !important;
+  box-shadow: 0 6px 16px rgb(var(--vc-hue) / .26), inset 0 1px 0 rgb(255 255 255 / .18) !important;
+  color: #f8fafc !important;
+  font-weight: 600 !important;
+  text-shadow: 0 1px 2px rgb(2 6 23 / .45);
+  transition: transform .13s ease, filter .13s ease, box-shadow .13s ease !important;
 }
-body:not(.dark) .vc-header {
-  background: linear-gradient(112deg, #eef2ff, #f8fafc 55%, #ecfeff) !important;
-  border-color: rgba(79,70,229,.22) !important;
+.vc-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+  border-color: rgb(var(--vc-hue-lt) / 1) !important;
+  box-shadow: 0 10px 22px rgb(var(--vc-hue) / .40), inset 0 1px 0 rgb(255 255 255 / .24) !important;
 }
-body:not(.dark) .gradio-container .contain .vc-header.vc-header h1 { color: #0f172a !important; }
-body:not(.dark) .gradio-container .contain .vc-header.vc-header p,
-body:not(.dark) .gradio-container .contain .vc-header.vc-header .vc-header-meta { color: #334155 !important; }
-body:not(.dark) .gradio-container .contain .vc-header.vc-header a { color: #0369a1 !important; }
-body:not(.dark) .vc-preset-bar { background: rgba(241,245,249,.86) !important; }
-body:not(.dark) .vc-card, body:not(.dark) .vc-panel { background: rgba(255,255,255,.96) !important; box-shadow: 0 8px 22px rgba(15,23,42,.07) !important; }
-body:not(.dark) #vc-main-tabs > .tab-wrapper,
-body:not(.dark) #vc-main-tabs > .tab-wrapper > .tab-container { background: linear-gradient(130deg, rgba(224,231,255,.78), rgba(236,254,255,.72)) !important; border-color: rgba(37,99,235,.20) !important; }
-body:not(.dark) #vc-main-tabs .tab-container button { color: #0f172a !important; background: rgba(255,255,255,.84) !important; border-color: rgba(100,116,139,.28) !important; }
-body:not(.dark) #vc-main-tabs .tab-container button.selected { color: #ffffff !important; background: linear-gradient(145deg, #4f46e5, #0d9488) !important; border-color: #0d9488 !important; }
-body:not(.dark) .vc-input-tile { background: #f8fafc !important; }
-body:not(.dark) .vc-progress, body:not(.dark) .vc-meter { background: #f8fafc !important; }
-body:not(.dark) .gradio-container .vc-log textarea { color: #0f172a !important; background: #f8fafc !important; border-color: rgba(2,132,199,.25) !important; }
-body:not(.dark) input[type=checkbox]:not(:checked),
-body:not(.dark) input[type=radio]:not(:checked) { background: #ffffff !important; border: 1.5px solid #64748b !important; box-shadow: inset 0 0 0 1px rgba(100,116,139,.08) !important; }
-body:not(.dark) .vcap-replace-chip { background: rgba(8,145,178,.08) !important; border-color: rgba(3,105,161,.34) !important; }
-body:not(.dark) .vcap-replace-arrow { color: #0369a1 !important; }
-body:not(.dark) .vc-btn:focus-visible { outline-color: #0369a1 !important; }
+.vc-btn:active:not(:disabled) { transform: translateY(0); }
+.vc-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.vc-btn:disabled { filter: grayscale(.5) opacity(.62) !important; transform: none !important; box-shadow: none !important; }
+body:not(.dark) .vc-btn, body:not(.dark) .vc-btn.vc-btn {
+  border-color: var(--vc-h2) !important;
+  box-shadow: 0 5px 14px rgb(var(--vc-hue) / .22), inset 0 1px 0 rgb(255 255 255 / .22) !important;
+}
+
+/* ------------------------------------------------------------- polish ---- */
+/* Thin, theme-coloured scrollbars: the app has many scroll panes and the OS
+   default renders as a bright slab in dark mode. */
+* { scrollbar-width: thin; scrollbar-color: var(--border-color-primary) transparent; }
 
 @media (max-width: 760px) {
   .vc-header-meta { text-align: left; }
   .vc-input-list { grid-template-columns: 1fr 1fr; }
-  .vc-action-row { grid-template-columns: 1fr 1fr !important; }
 }
 """
 
 
-def build_theme() -> gr.themes.Soft:
-    """Return the product theme; Gradio 6 receives it at ``launch()``."""
+def build_theme() -> gr.themes.Base:
+    """Return the stock Gradio Ocean theme, tuned for a dense desktop tool.
 
-    return gr.themes.Soft(
-        primary_hue="indigo",
-        secondary_hue="sky",
+    Only constructor arguments and design tokens are used here -- no CSS.
+
+    * ``blue``/``cyan``/``slate`` keeps the chrome cool and neutral, which the
+      several dozen coloured action buttons need in order to read as the accent.
+    * Ocean ships pill-shaped ``radius_xxl`` corners and wide spacing; both are
+      pulled in one notch so several hundred controls fit on a screen.
+    * The fonts are the ones Gradio bundles, so a page load makes no request to
+      Google Fonts -- this app is expected to run without internet access.
+    """
+
+    return gr.themes.Ocean(
+        primary_hue="blue",
+        secondary_hue="cyan",
         neutral_hue="slate",
-        spacing_size="sm",
-        radius_size="md",
-        text_size="md",
-        font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
-        font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
+        spacing_size=gr.themes.sizes.spacing_md,
+        radius_size=gr.themes.sizes.radius_md,
+        text_size=gr.themes.sizes.text_md,
     ).set(
-        body_background_fill="#f8fafc",
-        body_background_fill_dark="#080d16",
-        block_background_fill="#ffffff",
-        block_background_fill_dark="#0f172a",
-        block_border_color="#dbe3ee",
-        block_border_color_dark="#263449",
-        body_text_color="#172033",
-        body_text_color_dark="#e2e8f0",
-        button_primary_background_fill="#4f46e5",
-        button_primary_background_fill_dark="#6366f1",
-        button_primary_background_fill_hover="#4338ca",
-        button_primary_background_fill_hover_dark="#818cf8",
-        # Every gr.Button size (sm/md/lg) renders with the large metrics so the whole UI
-        # shares one button font size and height (matches "Start Captioning").
-        button_small_text_size="*text_lg",
-        button_medium_text_size="*text_lg",
-        button_large_text_size="*text_lg",
-        button_small_text_weight="600",
-        button_medium_text_weight="600",
-        button_large_text_weight="600",
+        # Accordion and tab headings carry the section hierarchy of this app,
+        # so they are weighted rather than left at the theme's body weight.
+        section_header_text_weight="600",
+        block_title_text_weight="500",
+        # Ocean's light palette leaves labels and help text at neutral_400/500,
+        # which is under 3:1 against white. Both are darkened for light mode
+        # only; dark mode already has the contrast.
+        body_text_color_subdued="*neutral_600",
+        body_text_color_subdued_dark="*neutral_400",
+        block_title_text_color="*neutral_700",
+        block_title_text_color_dark="*neutral_200",
+        # Every gr.Button size (sm/md/lg) renders with the same metrics so the
+        # whole UI shares one button font size and height.
+        button_small_text_size="*text_md",
+        button_medium_text_size="*text_md",
+        button_large_text_size="*text_md",
         button_small_padding="*spacing_lg calc(2 * *spacing_lg)",
         button_medium_padding="*spacing_lg calc(2 * *spacing_lg)",
         button_large_padding="*spacing_lg calc(2 * *spacing_lg)",
-        loader_color="#0ea5e9",
     )
 
 
 def build_css() -> str:
-    """Return all static application CSS including generated button palettes."""
+    """Return all static application CSS including the action-button palette."""
 
     return _BASE_CSS + "\n" + _build_sec_btn_css()
 
@@ -330,6 +349,16 @@ THEME_CHANGE_JS = r"""
     url.searchParams.set('__theme', effective);
     window.history.replaceState({}, '', url.toString());
   }
+  return [];
+}
+"""
+
+
+# Runs entirely in the browser: Gradio's accordion header is a plain button, so
+# opening or closing every section costs no server round-trip.
+TOGGLE_ACCORDIONS_JS = r"""
+() => {
+  if (window.__vcapToggleAccordions) window.__vcapToggleAccordions();
   return [];
 }
 """
@@ -428,6 +457,40 @@ HOTKEYS_HEAD = r"""
   if (typeof themeMedia.addEventListener === 'function') themeMedia.addEventListener('change', onSystemThemeChange);
   else if (typeof themeMedia.addListener === 'function') themeMedia.addListener(onSystemThemeChange);
 
+  // Accordion headers of the tab the user is looking at. Hidden tabs are left
+  // alone so the button always does what the visible page suggests.
+  function visibleAccordionHeaders() {
+    return Array.prototype.filter.call(
+      document.querySelectorAll('.gr-accordion button.label-wrap'),
+      function (header) { return header.offsetParent !== null; }
+    );
+  }
+
+  window.__vcapToggleAccordions = function () {
+    const first = visibleAccordionHeaders();
+    if (!first.length) return;
+    // Any section still closed means the user wants everything open.
+    const shouldOpen = first.some(function (header) { return !header.classList.contains('open'); });
+    const button = document.getElementById('vc_toggle_accordions');
+    if (button) button.setAttribute('aria-expanded', String(shouldOpen));
+
+    // Opening a section reveals the accordions nested inside it, and Svelte
+    // only shows them on the next frame, so opening runs until nothing new
+    // turns up. Closing needs one pass: a closed parent hides its children.
+    let pass = 0;
+    (function step() {
+      let changed = false;
+      visibleAccordionHeaders().forEach(function (header) {
+        if (header.classList.contains('open') !== shouldOpen) {
+          header.click();
+          changed = true;
+        }
+      });
+      pass += 1;
+      if (shouldOpen && changed && pass < 6) setTimeout(step, 60);
+    })();
+  };
+
   function activeMainTab() {
     const root = document.getElementById('vc-main-tabs');
     if (!root) return null;
@@ -483,6 +546,11 @@ HOTKEYS_HEAD = r"""
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
     const primary = (event.ctrlKey || event.metaKey) && !event.altKey;
 
+    if (plain && !isTextEntry(target) && event.key === 'F4') {
+      event.preventDefault();
+      window.__vcapToggleAccordions();
+      return;
+    }
     if (tab === 'caption') {
       if (plain && event.key === 'F9' && !captionJobRunning()) clickHotkey('hk_caption_start', event);
       else if (plain && event.key === 'Escape' && captionJobRunning()) clickHotkey('hk_caption_cancel', event);
@@ -502,4 +570,10 @@ HOTKEYS_HEAD = r"""
 """
 
 
-__all__ = ["HOTKEYS_HEAD", "THEME_CHANGE_JS", "build_css", "build_theme"]
+__all__ = [
+    "HOTKEYS_HEAD",
+    "THEME_CHANGE_JS",
+    "TOGGLE_ACCORDIONS_JS",
+    "build_css",
+    "build_theme",
+]
