@@ -242,6 +242,7 @@ def run_transcription(
     worker = WorkerProcess()
     item_payloads: list[dict] = []
     results: dict[int, TranscriptResult] = {}
+    worker_diagnostics: list[str] = []
     done_payload: dict[str, Any] | None = None
     fatal_error: str | None = None
     cancelled = False
@@ -294,6 +295,16 @@ def run_transcription(
             if event is None:
                 output_finished = True
                 continue
+            if event.get("ev") in {"stdout", "log", "error"}:
+                diagnostic = str(
+                    event.get("text")
+                    or event.get("message")
+                    or event.get("traceback")
+                    or ""
+                ).strip()
+                if diagnostic:
+                    worker_diagnostics.append(diagnostic)
+                    del worker_diagnostics[:-1000]
             completed, error = _handle_event(event, sink, item_payloads, results)
             if completed is not None:
                 done_payload = completed
@@ -315,6 +326,22 @@ def run_transcription(
             and return_code not in {0, None}
         ):
             fatal_error = f"Whisper worker exited with code {return_code}"
+        if fatal_error is not None or (
+            return_code not in {0, None} and done_payload is None
+        ):
+            try:
+                from vcap.core.logs import get_log
+
+                path = get_log().write_worker_crash(
+                    worker.pid,
+                    [
+                        f"Whisper worker {worker.pid} exited with code {return_code}.",
+                        *worker_diagnostics,
+                    ],
+                )
+                _mirror_log(f"Whisper worker crash output saved to {path}", "error")
+            except Exception:
+                pass
     except OSError as exc:
         fatal_error = f"Could not start Whisper worker: {exc}"
         _mirror_log(fatal_error, "error")

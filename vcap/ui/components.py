@@ -6,6 +6,7 @@ import hashlib
 import html
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from vcap import TEMP_DIR
 from vcap.core import gpu
 from vcap.core.captions_post import parse_replace_pairs, replace_pairs_to_html_chips
 from vcap.core.media import MediaInfo, make_thumbnail, probe_media
+from vcap.core.logs import get_log
 from vcap.core.paths import (
     guess_kind_by_extension,
     list_media_files,
@@ -604,7 +606,12 @@ def _duration(value: float | None) -> str:
 
 def _media_info_markdown(info: MediaInfo) -> str:
     if info.kind == "unknown":
-        return f"<span class='vc-err'>Could not inspect media: {html.escape(info.error or 'unknown error')}</span>"
+        raw = str(info.error or "unknown ffprobe error")
+        get_log().warn(f"{info.path.name}: {raw}", scope="inputs")
+        return (
+            "<span class='vc-warn'>1 unreadable file: "
+            f"{html.escape(info.path.name)} (skipped)</span>"
+        )
     audio = (
         f"{info.audio_codec or 'audio'}, {info.audio_sample_rate or '?'} Hz, {info.audio_channels or '?'} ch"
         if info.has_audio
@@ -651,7 +658,7 @@ def _preview_updates(paths: list[str]) -> tuple[Any, ...]:
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
-            "<span class='vc-help'>Choose a file to see its media details.</span>",
+            "<span class='vc-help'>No inputs selected.</span>",
             _input_gallery([]),
             "unknown",
             0.0,
@@ -1229,11 +1236,29 @@ def media_input_block(
 
     preview_outputs = [video, audio, image, info, gallery, modality_state, duration_state]
 
+    # Gradio can finish a light folder scan after another tab has already been
+    # selected. This server-side generation guard prevents that late callback
+    # from replacing the newly active tab's preview and resolved-input state.
+    mode_guard = {"mode": "upload", "revision": 0}
+    mode_guard_lock = threading.Lock()
+
+    def activate_mode(selected_mode: str) -> int:
+        with mode_guard_lock:
+            mode_guard["mode"] = selected_mode
+            mode_guard["revision"] += 1
+            return int(mode_guard["revision"])
+
+    def mode_snapshot() -> tuple[str, int]:
+        with mode_guard_lock:
+            return str(mode_guard["mode"]), int(mode_guard["revision"])
+
     def choose_upload(value: Any) -> tuple[Any, ...]:
+        activate_mode("upload")
         selected = _paths(value)
         return (*_preview_updates(selected), selected)
 
     def choose_path(value: str) -> tuple[Any, ...]:
+        activate_mode("path")
         selected = _paths(value)
         return (*_preview_updates(selected), selected)
 
@@ -1248,6 +1273,9 @@ def media_input_block(
         existing_extension_value: str = ".txt",
         save_next_value: bool = False,
     ) -> tuple[Any, ...]:
+        active_mode, revision = mode_snapshot()
+        if active_mode != "folder":
+            return tuple(gr.skip() for _ in folder_outputs)
         selected, summary = _folder_scan(
             value,
             recursive_value,
@@ -1263,10 +1291,21 @@ def media_input_block(
             existing_files_label,
             include_caption_coverage,
         )
+        if mode_snapshot() != ("folder", revision):
+            return tuple(gr.skip() for _ in folder_outputs)
         return (*_preview_updates(selected), selected, summary)
 
+    def select_input_mode(event: gr.SelectData) -> str:
+        selected_mode = input_mode_from_tab(event)
+        activate_mode(selected_mode)
+        return selected_mode
+
+    def choose_folder_tab(*values: Any) -> tuple[Any, ...]:
+        activate_mode("folder")
+        return scan_folder(*values)
+
     input_tabs.select(
-        input_mode_from_tab,
+        select_input_mode,
         outputs=mode_state,
         queue=False,
         show_progress="hidden",
@@ -1320,7 +1359,7 @@ def media_input_block(
     if save_next_to_source is not None:
         folder_inputs.append(save_next_to_source)
     folder_tab.select(
-        scan_folder,
+        choose_folder_tab,
         inputs=folder_inputs,
         outputs=folder_outputs,
         queue=False,
@@ -1374,6 +1413,7 @@ def media_input_block(
         name_filter_value: str,
         save_next_value: bool = False,
     ) -> tuple[Any, ...]:
+        activate_mode("folder")
         raw = getattr(uploaded, "name", uploaded)
         if not raw:
             return (
@@ -1487,6 +1527,14 @@ def media_input_block(
             show_progress="minimal",
             api_visibility="private",
         )
+
+    ctx.states[state_key("media_mode_guard")] = mode_guard
+    ctx.states[state_key("media_mode_handlers")] = {
+        "upload": choose_upload,
+        "path": choose_path,
+        "folder": choose_folder_tab,
+        "select": select_input_mode,
+    }
 
     def accept_editor_value(
         value: str | None,

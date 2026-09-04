@@ -20,6 +20,33 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Added a split dataset layout that writes clean video captions to `video_caption/`, Whisper and/or Qwen3-Omni sound captions to `audio_caption/`, and an optional merged `<clip>.txt` beside every source or produced segment clip.
 - Folder batches can save all media-facing artifacts beside their source files while keeping run metadata and work files in the numbered batch run directory; existing captions can be reused without loading the main caption model.
 - Added configurable audio and merge templates, no-speech handling, 30-second sound-caption windowing, JSON metadata fields, Caption Editor part previews and merge-aware regeneration, coverage scanning, and three shipped dataset presets.
+
+### Fixed in v1.6.0
+
+- Task presets now stay selected while moving through empty upload and folder contexts.
+- Changing model families can no longer leave a foreign-family task label in the dropdown.
+- Returning to Upload files refreshes its preview and ignores late folder-scan results.
+- Caption Editor recovers source media for mirrored batch captions and can open a batch run directory directly.
+- Regenerating a scene caption processes only that scene's recorded time window.
+- Editor regeneration reuses the shared resident model instead of starting a duplicate worker.
+- A completed or cancelled run's final status is no longer overwritten by its cancel note.
+- Expired cancel confirmations clear themselves instead of leaving a stale waiting message.
+- Run history columns fit common desktop widths and keep a compact preview column last.
+- The Clips result tab explains how to enable clip saving when a run produced none.
+- Batch ETA ignores unsupported and zero-time items until a real item completes.
+- Dataset sub-split suggestions use millisecond precision without invalid Number values.
+- Autosaved caption edits immediately refresh character, word, token, and queue counts.
+- Editor regeneration status hides third-party worker noise while retaining it in the live log.
+- Unreadable folder items show a concise skipped-file message while preserving ffprobe diagnostics in logs.
+- Idle model release and worker shutdown are reported in the console and live log.
+- Application logs persist daily for 14 days, with a separate diagnostic file for crashed workers.
+- Shipped Whisper and dataset presets contain only portable preset settings.
+- GGUF startup shows a timed friendly status while raw llama-server output stays in the live log.
+- Model precision, backend, and checkpoint details update in the dropdown's first event chain.
+- Double-Escape cancellation uses an eight-second confirm window and re-arms after expiry.
+- Silent videos are skipped cleanly by Whisper and corrupt media reports a concise ffmpeg error.
+- Chat discards superseded load progress so final token statistics arrive with the answer.
+- A preset-applied model remains resident after its run unless the user selects another variant while it is busy.
 """.strip(),
     ),
     (

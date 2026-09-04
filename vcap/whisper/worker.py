@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from vcap import TEMP_DIR
+from vcap.core.media import probe_media
 from vcap.core.paths import normalize_path
 from vcap.core.subprocess_runner import CancelledError
 
@@ -25,6 +26,15 @@ _EMIT_LOCK = threading.Lock()
 _NO_INPUT = object()
 _STDIN_BUFFER = bytearray()
 _STDIN_EOF = False
+
+
+def _public_media_error(error: object) -> str:
+    detail = str(error or "").casefold()
+    if "moov atom not found" in detail:
+        return "unreadable media (ffmpeg: moov atom not found)"
+    if "invalid data found when processing input" in detail:
+        return "unreadable media (ffmpeg: Invalid data found when processing input)"
+    return "unreadable media (ffmpeg could not inspect the file)"
 
 
 def _emit(event: str, **payload: Any) -> None:
@@ -268,6 +278,12 @@ def _run_request(
 ) -> int:
     from .params import TranscriptOutputOptions, WhisperParams
 
+    # Protocol tests and downstream integrations can provide a synthetic engine
+    # whose fixture paths are intentionally not decodable media. Production
+    # transcription always probes inputs so silent video is skipped before the
+    # decoder sees it.
+    probe_inputs = not bool(os.environ.get("VCAP_WHISPER_FAKE_ENGINE", "").strip())
+
     action = str(request.get("action") or "transcribe").strip().casefold()
     started = time.perf_counter()
     if action == "probe_runtime":
@@ -343,6 +359,31 @@ def _run_request(
             cleanup: Callable[[], None] = lambda: None
             try:
                 source = normalize_path(item.get("path") or "", must_exist=True)
+                if probe_inputs:
+                    media_info = probe_media(source)
+                    if media_info.kind == "unknown":
+                        raw_error = str(media_info.error or "ffprobe could not inspect the file")
+                        log(f"{source}: {raw_error}", "error")
+                        items_failed += 1
+                        _emit(
+                            "item_error",
+                            item_index=item_index,
+                            message=_public_media_error(raw_error),
+                        )
+                        continue
+                    if not media_info.has_audio:
+                        items_skipped += 1
+                        message = "No audio track; skipped"
+                        log(f"Whisper skipped {source.name}: no audio track", "warning")
+                        _emit(
+                            "item_done",
+                            item_index=item_index,
+                            files=[],
+                            result=None,
+                            skipped=True,
+                            message=message,
+                        )
+                        continue
                 trim_start = max(0.0, float(item.get("trim_start_s") or 0.0))
                 raw_trim_end = item.get("trim_end_s")
                 trim_end = float(raw_trim_end) if raw_trim_end is not None else None
@@ -388,11 +429,15 @@ def _run_request(
                 break
             except Exception as exc:
                 items_failed += 1
+                log(traceback.format_exc(), "error")
                 _emit(
                     "item_error",
                     item_index=item_index,
-                    message=str(exc),
-                    traceback=traceback.format_exc(),
+                    message=(
+                        "Whisper could not transcribe this media. See the live log for diagnostics."
+                        if isinstance(exc, (IndexError, OSError, RuntimeError))
+                        else str(exc)
+                    ),
                 )
             finally:
                 cleanup()

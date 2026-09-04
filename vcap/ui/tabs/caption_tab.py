@@ -349,18 +349,46 @@ def _prompt_choices(family: str, modality: str) -> list[tuple[str, str]]:
     ]
 
 
+def _preset_supports_family(preset: Any, family: str) -> bool:
+    supported = tuple(getattr(preset, "applies_to_models", ()) or ())
+    return "*" in supported or family in supported
+
+
 def _resolve_prompt_preset(
     variant_key: str,
     modality: str,
     current_preset_id: str | None,
+    *,
+    family_union: bool = False,
 ) -> tuple[str, list[tuple[str, str]], Any | None]:
-    """Resolve one compatible prompt selection for a model and modality."""
+    """Resolve a family-safe prompt without discarding an intentional task."""
 
     family = variant_to_family(variant_key)
-    presets = list_presets(family, modality)
-    choices = _prompt_choices(family, modality)
+    presets = list_presets(family, None if family_union else modality)
+    current: Any | None = None
+    try:
+        candidate = get_preset(str(current_preset_id or ""))
+        if _preset_supports_family(candidate, family):
+            current = candidate
+    except KeyError:
+        pass
+
+    # With real inputs the menu stays focused on that modality, but a task the
+    # family can run remains visible and selected. The runner deliberately
+    # substitutes per item when a mixed batch needs a different prompt.
+    if current is not None and current.id not in {preset.id for preset in presets}:
+        family_presets = list_presets(family)
+        order = {preset.id: index for index, preset in enumerate(family_presets)}
+        presets = sorted(
+            [*presets, current],
+            key=lambda preset: order.get(preset.id, len(order)),
+        )
+    choices = [
+        (f"{preset.group} · {_display(preset.label)}", preset.id)
+        for preset in presets
+    ]
     by_id = {preset.id: preset for preset in presets}
-    selected = by_id.get(str(current_preset_id or ""))
+    selected = by_id.get(current.id) if current is not None else None
     if selected is None:
         try:
             selected = by_id.get(default_preset_for(family, modality).id)
@@ -368,6 +396,14 @@ def _resolve_prompt_preset(
             selected = None
         if selected is None:
             selected = presets[0] if presets else None
+        if selected is None and not family_union:
+            family_presets = list_presets(family)
+            selected = family_presets[0] if family_presets else None
+            if selected is not None:
+                choices = [
+                    (f"{preset.group} · {_display(preset.label)}", preset.id)
+                    for preset in family_presets
+                ]
     return family, choices, selected
 
 
@@ -577,7 +613,7 @@ def request_caption_cancel(token: CancelToken | None) -> str:
 
     if token is None or token.is_cancelled():
         return "inactive"
-    token.arm_confirmation(window_s=24 * 60 * 60)
+    token.arm_confirmation(window_s=8.0)
     return "confirm"
 
 
@@ -876,7 +912,7 @@ def run_history_rows(summaries: Iterable[Any]) -> list[list[Any]]:
                 int(_summary_value(summary, "items", 0) or 0),
                 f"{int(counts.get('done', 0) or 0)} / {int(counts.get('failed', 0) or 0)}",
                 when_text,
-                preview[:160],
+                preview if len(preview) <= 90 else preview[:87].rstrip() + "...",
             ]
         )
     return rows
@@ -1427,6 +1463,7 @@ class CaptionTabHandles:
     start: gr.Button
     cancel: gr.Button
     cancel_confirmation: gr.Row
+    cancel_note: gr.Markdown
     cancel_yes: gr.Button
     cancel_keep: gr.Button
     hotkey_start: gr.Button
@@ -1457,6 +1494,7 @@ class CaptionTabHandles:
     reasoning_tab: gr.Tab
     files: gr.File
     clips: gr.Gallery
+    clips_empty_hint: gr.Markdown
     last_outputs_state: gr.State
     job_done_hook: gr.HTML
 
@@ -1584,6 +1622,11 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 elem_id="vc_caption_result_files",
                             )
                         with gr.Tab("Clips"):
+                            clips_empty_hint = gr.Markdown(
+                                'No clips were saved for this run. Enable "Save produced clips" in '
+                                "Processing Pipeline → 5. Scene detection & splitting.",
+                                elem_classes=["vc-help"],
+                            )
                             clips = gr.Gallery(
                                 label="Produced clips",
                                 columns=4,
@@ -1593,6 +1636,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 allow_preview=True,
                                 type="filepath",
                                 buttons=["download", "fullscreen"],
+                                visible=False,
                             )
 
                 with gr.Row():
@@ -1665,6 +1709,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         min_width=148,
                         elem_id="vc_caption_cancel_keep",
                     )
+                cancel_note = gr.Markdown("", elem_classes=["vc-status"])
                 hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")
                 hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
                 cancel_timer = gr.Timer(1.0)
@@ -1683,6 +1728,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         type="array",
                         interactive=False,
                         wrap=True,
+                        column_widths=[160, 80, 220, 65, 100, 145, 360],
                         max_height=330,
                         buttons=["copy", "fullscreen"],
                         label="Recent runs",
@@ -3672,6 +3718,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         start=start,
         cancel=cancel,
         cancel_confirmation=cancel_confirmation,
+        cancel_note=cancel_note,
         cancel_yes=cancel_yes,
         cancel_keep=cancel_keep,
         hotkey_start=hotkey_start,
@@ -3702,6 +3749,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         reasoning_tab=reasoning_tab,
         files=result_files,
         clips=clips,
+        clips_empty_hint=clips_empty_hint,
         last_outputs_state=last_outputs_state,
         job_done_hook=job_done_hook,
     )
@@ -3875,6 +3923,17 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         return _quant_line(value), _ready_line(value)
 
     model_key.change(
+        model_identity_lines,
+        inputs=model_key,
+        outputs=[quant_info, ready_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    # This is the first user-selection chain, so the inexpensive identity line
+    # changes in the same browser turn as the dropdown instead of waiting behind
+    # model-default and VRAM recalculation handlers.
+    model_key.select(
         model_identity_lines,
         inputs=model_key,
         outputs=[quant_info, ready_status],
@@ -4638,19 +4697,35 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         previous_context: list[str] | tuple[str, str] | None,
         *values: Any,
     ) -> tuple[Any, str, Any, Any, list[str], Any]:
+        has_inputs = bool(selected_inputs)
+        resolved_modality = (
+            _modality_for_inputs(selected_inputs or [], modality)
+            if has_inputs
+            else modality
+        )
         effective_modality = _effective_prompt_modality(
             variant_key,
-            modality,
+            resolved_modality,
             include_audio,
-            has_inputs=bool(selected_inputs),
+            has_inputs=has_inputs,
         )
         family, choices, preset = _resolve_prompt_preset(
             variant_key,
             effective_modality,
             current_preset_id,
+            family_union=(
+                not has_inputs
+                or not str(resolved_modality or "").strip()
+                or str(resolved_modality).casefold() == "unknown"
+            ),
         )
-        context = [family, effective_modality]
+        context_modality = "family" if not has_inputs else effective_modality
+        context = [family, context_modality]
         if preset is None:
+            ctx.app_log.warn(
+                f"No task preset supports {family} for {effective_modality} input.",
+                scope="prompts",
+            )
             return (
                 gr.update(choices=[], value=None),
                 "<span class='vc-warn'>No compatible task preset for this model and modality.</span>",
@@ -4659,6 +4734,35 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 context,
                 {"system": "", "user": ""},
             )
+        description = _display(preset.description)
+        current: Any | None = None
+        try:
+            current = get_preset(str(current_preset_id or ""))
+        except KeyError:
+            pass
+        if current is not None and not _preset_supports_family(current, family):
+            family_label = _display(MODEL_SPECS[family].label)
+            decision = (
+                f"Preset {_display(current.label)} does not support {family_label}; "
+                f"using {_display(preset.label)}."
+            )
+            description = f"{description}<br><span class='vc-warn'>{decision}</span>"
+            ctx.app_log.warn(decision, scope="prompts")
+        elif (
+            has_inputs
+            and current is not None
+            and current.id == preset.id
+            and current.id not in {
+                candidate.id for candidate in list_presets(family, effective_modality)
+            }
+        ):
+            targets = ", ".join(current.modalities)
+            hint = (
+                f"{_display(current.label)} targets {targets}; it is kept for this "
+                f"{effective_modality} input and the runner will substitute per item when needed."
+            )
+            description = f"{description}<br><span class='vc-help'>{html.escape(hint)}</span>"
+            ctx.app_log.log(hint, scope="prompts")
         same_context = list(previous_context or []) == context
         if same_context and preset.id == str(current_preset_id or ""):
             system: Any = gr.skip()
@@ -4671,7 +4775,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             tracked = {"system": system, "user": user}
         return (
             gr.update(choices=choices, value=preset.id),
-            _display(preset.description),
+            description,
             system,
             user,
             context,
@@ -4695,6 +4799,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         prompt_context_state,
         prompt_auto_state,
     ]
+    ctx.states["caption_prompt_context_handler"] = sync_prompt_context
     model_key.select(
         sync_prompt_context,
         inputs=prompt_sync_inputs,
@@ -5550,6 +5655,7 @@ def wire(ctx: "UiContext") -> None:
         handles.reasoning,
         handles.reasoning_tab,
         handles.clips,
+        handles.clips_empty_hint,
         handles.last_outputs_state,
         handles.job_done_hook,
         handles.cancel,
@@ -5619,7 +5725,7 @@ def wire(ctx: "UiContext") -> None:
                     "**ETA:** —",
                     "**Speed:** — · **Context:** —",
                     [],
-                    *[gr.skip() for _ in range(7)],
+                    *[gr.skip() for _ in range(8)],
                     "",
                     gr.update(value="⏹ Cancel", interactive=False),
                     gr.update(visible=False),
@@ -5786,7 +5892,12 @@ def wire(ctx: "UiContext") -> None:
             "",
             "",
             gr.update(visible=False),
-            [],
+            gr.update(value=[], visible=False),
+            gr.update(
+                value='No clips were saved for this run. Enable "Save produced clips" in '
+                "Processing Pipeline → 5. Scene detection & splitting.",
+                visible=True,
+            ),
             {},
             "",
             gr.update(value="⏹ Cancel", interactive=True),
@@ -5866,6 +5977,8 @@ def wire(ctx: "UiContext") -> None:
                         data.get("remaining", max(0, total_count - processed_count))
                         or 0
                     )
+                    eta_seconds = data.get("eta_s", data.get("eta_seconds"))
+                    last_eta = format_eta(eta_seconds) if eta_seconds is not None else "\u2014"
                     last_message = event.message
                     last_fraction = float(event.fraction or last_fraction)
                 if now - last_emit < 0.12 and kind == "progress":
@@ -5880,7 +5993,7 @@ def wire(ctx: "UiContext") -> None:
                     f"**ETA:** {last_eta}",
                     f"**Speed:** {last_speed} · **Context:** {last_context}",
                     item_rows,
-                    *[gr.skip() for _ in range(6)],
+                    *[gr.skip() for _ in range(7)],
                     dict(live_outputs) if live_dirty else gr.skip(),
                     gr.skip(),
                     gr.skip(),
@@ -5958,7 +6071,8 @@ def wire(ctx: "UiContext") -> None:
                 srt_text,
                 reasoning_text,
                 gr.update(visible=bool(reasoning_text)),
-                gallery,
+                gr.update(value=gallery, visible=bool(gallery)),
+                gr.update(visible=not bool(gallery)),
                 state,
                 _job_done_payload(_job_done_message(result), settings),
                 gr.update(value="⏹ Cancel", interactive=False),
@@ -5978,7 +6092,7 @@ def wire(ctx: "UiContext") -> None:
                 "**ETA:** cancelled",
                 f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
-                *[gr.skip() for _ in range(6)],
+                *[gr.skip() for _ in range(7)],
                 gr.skip(),
                 _job_done_payload("Job cancelled", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
@@ -5998,7 +6112,7 @@ def wire(ctx: "UiContext") -> None:
                 "**ETA:** failed",
                 f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
-                *[gr.skip() for _ in range(7)],
+                *[gr.skip() for _ in range(8)],
                 _job_done_payload("Job failed", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
@@ -6102,12 +6216,12 @@ def wire(ctx: "UiContext") -> None:
             return (
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
-                "**Status:** No active caption job to cancel.",
+                "No active caption job to cancel.",
             )
         return (
             gr.update(value="⏹ Cancel", interactive=True),
             gr.update(visible=True),
-            "<span class='vc-warn'>**Status:** Waiting for cancel confirmation.</span>",
+            "<span class='vc-warn'>Waiting for cancel confirmation.</span>",
         )
 
     def confirm_cancel_job() -> tuple[Any, Any, str]:
@@ -6117,14 +6231,14 @@ def wire(ctx: "UiContext") -> None:
             return (
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
-                "**Status:** No armed caption cancellation request.",
+                "No armed caption cancellation request.",
             )
         if token is caption_token:
             ctx.pipeline_client.cancel(force=False)
         return (
             gr.update(value="Cancelling…", interactive=False),
             gr.update(visible=False),
-            "<span class='vc-warn'>**Status:** Cooperative cancellation requested.</span>",
+            "<span class='vc-warn'>Cooperative cancellation requested.</span>",
         )
 
     def keep_running_job() -> tuple[Any, Any, str]:
@@ -6134,9 +6248,9 @@ def wire(ctx: "UiContext") -> None:
             gr.update(value="⏹ Cancel", interactive=bool(kept)),
             gr.update(visible=False),
             (
-                "<span class='vc-ok'>**Status:** Caption job continues.</span>"
+                "<span class='vc-ok'>Caption job continues.</span>"
                 if kept
-                else "**Status:** No active caption job."
+                else "No active caption job."
             ),
         )
 
@@ -6148,21 +6262,21 @@ def wire(ctx: "UiContext") -> None:
 
     handles.cancel.click(
         request_cancel_job,
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     handles.hotkey_cancel.click(
         escape_cancel_job,
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     confirm_cancel_event = handles.cancel_yes.click(
         confirm_cancel_job,
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -6181,7 +6295,7 @@ def wire(ctx: "UiContext") -> None:
     )
     handles.cancel_keep.click(
         keep_running_job,
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -6212,15 +6326,17 @@ def wire(ctx: "UiContext") -> None:
                 gr.update(interactive=bool(state.get("failed_paths")) and not any_job_running),
                 gr.update(interactive=bool(state.get("job_finished")) and not any_job_running),
                 gr.update(interactive=bool(str(current_caption or "").strip()) and not any_job_running),
+                "",
             )
         if token.is_armed():
             return (
                 gr.skip(),
                 gr.skip(),
                 gr.update(interactive=False),
+                gr.skip(),
                 gr.update(interactive=False),
                 gr.update(interactive=False),
-                gr.update(interactive=False),
+                gr.skip(),
             )
         return (
             gr.update(value="⏹ Cancel", interactive=True),
@@ -6229,8 +6345,10 @@ def wire(ctx: "UiContext") -> None:
             gr.update(interactive=False),
             gr.update(interactive=False),
             gr.update(interactive=False),
+            "",
         )
 
+    ctx.states["caption_cancel_timer_handler"] = refresh_cancel_button
     handles.cancel_timer.tick(
         refresh_cancel_button,
         inputs=[handles.last_outputs_state, handles.caption],
@@ -6241,6 +6359,7 @@ def wire(ctx: "UiContext") -> None:
             handles.retry_failed,
             handles.results_zip,
             handles.copy_caption,
+            handles.cancel_note,
         ],
         queue=False,
         show_progress="hidden",

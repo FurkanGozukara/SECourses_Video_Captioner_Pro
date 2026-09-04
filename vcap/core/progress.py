@@ -134,8 +134,9 @@ class ProgressTracker:
                 raise RuntimeError("start_item() must be called before finish_item()")
             previous = self._statuses.get(self._current_index)
             self._statuses[self._current_index] = normalized
-            if previous is None and normalized != "skipped":
-                self._durations.append(max(0.0, float(seconds)))
+            duration = max(0.0, float(seconds))
+            if previous is None and normalized != "skipped" and duration > 0.0:
+                self._durations.append(duration)
             self._step_fraction = 1.0
 
     @property

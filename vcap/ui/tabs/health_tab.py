@@ -653,6 +653,11 @@ def build(ctx: "UiContext") -> None:
             model_health_status = gr.Markdown(
                 _model_health_report(ctx), elem_classes=["vc-status"]
             )
+            gr.Markdown(
+                "Application log: `logs/app_YYYY-MM-DD.log`. Crashed worker stderr: "
+                "`logs/worker_<pid>.log`.",
+                elem_classes=["vc-help"],
+            )
             with gr.Row():
                 refresh_model_health = action_button("Refresh model status", "cyan")
                 unload_model = action_button(

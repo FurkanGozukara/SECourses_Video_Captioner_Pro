@@ -1,17 +1,11 @@
 {
   "_meta": {
-    "description": "v1.5.0 Whisper preset",
     "format": "secourses_vcap_preset",
     "version": 1,
-    "app_version": "1.4.1",
-    "created_at": "2026-09-04T14:57:40.532133+00:00",
-    "modified_at": "2026-09-04T14:57:40.532133+00:00"
+    "name": "Caption + Whisper transcript (Qwen3-Omni Instruct)",
+    "description": "v1.5.0 Whisper preset"
   },
   "settings": {
-    "input_files": [],
-    "input_path": "",
-    "batch_input_folder": "",
-    "batch_output_folder": "G:\\SECourses_Video_Captioner_Pro_v1\\SECourses_Video_Captioner_Pro\\outputs\\batch_captions",
     "batch_include_kinds": [
       "video",
       "audio",
@@ -29,9 +23,7 @@
     "show_all_variants": false,
     "vram_preset": "auto",
     "attention_backend": "auto",
-    "gpu_index": 0,
     "subprocess_mode": true,
-    "gpu_indices": [],
     "keep_model_loaded": true,
     "idle_unload_minutes": 10,
     "oom_retries": 2,
@@ -65,8 +57,6 @@
     "prompt_preset_id": "qwen3_video_dense",
     "system_prompt": null,
     "user_prompt": "Describe the video in one {{CAPTION_LENGTH}} {{LANGUAGE}} paragraph, integrating visible and audible events in chronological order. Ground the caption in subjects, clothing, objects, setting, physical action, interactions, camera framing and movement, lighting, readable screen text, speech with speaker cues, music, sound effects, and environmental sound. Align each sound with the event or interval it accompanies, quote only clearly intelligible speech, and mark uncertain details rather than guessing. Use objective present tense with no heading, bullet list, analysis, or unsupported intent. {{AVOID}} {{EXTRA_INSTRUCTIONS}}",
-    "prompt_library_selection": "",
-    "prompt_library_name": "",
     "trigger_word": "ohwx",
     "language": "English",
     "source_language": "English",
@@ -152,6 +142,14 @@
     "summarize_segments": false,
     "summary_prompt": "You are given timestamped captions of consecutive segments of one video. Write (1) one paragraph summarizing the whole video in {{LANGUAGE}}, then (2) a chapter list with one line per chapter formatted as \"MM:SS-MM:SS Title - one sentence\". Use only information present in the captions and keep the chronological order.",
     "summary_max_new_tokens": 1024,
+    "transcript_enabled": true,
+    "transcript_formats": [
+      "srt",
+      "txt"
+    ],
+    "transcript_inject_prompt": true,
+    "transcript_prompt_wrapper": "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n{{TRANSCRIPT}}",
+    "transcript_file_suffix": "_transcript",
     "audio_caption_source": "none",
     "video_caption_source": "generate",
     "audio_caption_model_key": "auto",
@@ -161,18 +159,6 @@
     "caption_merge_template": "{{VIDEO_CAPTION}}\n\n{{AUDIO_CAPTION}}",
     "audio_caption_empty_policy": "skip",
     "audio_caption_empty_text": "No speech.",
-    "transcript_enabled": true,
-    "transcript_formats": [
-      "srt",
-      "txt"
-    ],
-    "transcript_inject_prompt": true,
-    "transcript_prompt_wrapper": "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n{{TRANSCRIPT}}",
-    "transcript_file_suffix": "_transcript",
-    "whisper_input_files": [],
-    "whisper_input_path": "",
-    "whisper_batch_input_folder": "",
-    "whisper_batch_output_dir": "",
     "whisper_batch_recursive": false,
     "whisper_batch_overwrite": false,
     "whisper_batch_limit_items": 0,
@@ -240,16 +226,7 @@
     "chat_repetition_penalty": 1.0,
     "chat_seed": -1,
     "chat_enable_thinking": false,
-    "outputs_dir": "G:\\SECourses_Video_Captioner_Pro_v1\\SECourses_Video_Captioner_Pro\\outputs",
-    "temp_dir": "G:\\SECourses_Video_Captioner_Pro_v1\\SECourses_Video_Captioner_Pro\\temp",
-    "models_dir": "G:\\SECourses_Video_Captioner_Pro_v1\\SECourses_Video_Captioner_Pro\\models",
-    "logs_dir": "G:\\SECourses_Video_Captioner_Pro_v1\\SECourses_Video_Captioner_Pro\\logs",
-    "ffmpeg_path": "",
-    "theme_mode": "dark",
     "save_processed_files": false,
-    "scan_subfolders": false,
-    "desktop_notification_on_finish": true,
-    "play_sound_on_finish": true,
-    "open_output_folder_on_single_finish": false
+    "scan_subfolders": false
   }
 }

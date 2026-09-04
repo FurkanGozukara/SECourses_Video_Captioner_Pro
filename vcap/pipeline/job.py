@@ -256,10 +256,22 @@ class InputItem:
     kind: str = "auto"
     text_prompt_only: bool = False
     text: str | None = None
+    trim_start_s: float | None = None
+    trim_end_s: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", os.fspath(self.path))
         object.__setattr__(self, "kind", str(self.kind or "auto").casefold())
+        start = _optional_float(self.trim_start_s)
+        end = _optional_float(self.trim_end_s)
+        if start is not None:
+            start = max(0.0, start)
+        if end is not None:
+            end = max(0.0, end)
+        if start is not None and end is not None and end <= start:
+            raise ValueError("InputItem trim_end_s must be greater than trim_start_s")
+        object.__setattr__(self, "trim_start_s", start)
+        object.__setattr__(self, "trim_end_s", end)
 
 
 @dataclass(frozen=True)

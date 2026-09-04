@@ -920,35 +920,48 @@ def wire(ctx: "UiContext") -> None:
         last_emit = 0.0
         try:
             while True:
-                event = events.get()
-                kind = str(event.get("ev") or "")
-                if kind == "terminal":
-                    break
-                if kind == "delta":
-                    current_text = str(event.get("text") or current_text)
-                    current_reasoning = str(event.get("reasoning") or current_reasoning)
-                    if current_reasoning and reasoning_started is None:
-                        reasoning_started = time.monotonic()
-                    if current_text and reasoning_started is not None and reasoning_s is None:
-                        reasoning_s = time.monotonic() - reasoning_started
-                elif kind == "status":
-                    current_status = str(event.get("message") or current_status)
-                    data = dict(event.get("data") or {})
-                    new_tokens = data.get("new_tokens")
-                    speed = data.get("tok_per_s", data.get("tokens_per_second"))
-                    token_text = str(new_tokens) if new_tokens is not None else "generating"
+                batch = [events.get()]
+                while True:
                     try:
-                        speed_text = f"{float(speed):.2f} tok/s" if speed is not None else "—"
-                    except (TypeError, ValueError):
-                        speed_text = "—"
-                    if data.get("prompt_tokens") is not None:
-                        context_used = data.get("prompt_tokens")
-                        context_limit = data.get("context_limit", context_limit)
-                    token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
-                elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
-                    current_status = str(event.get("text") or current_status)
+                        batch.append(events.get_nowait())
+                    except queue.Empty:
+                        break
+                if any(str(event.get("ev") or "") == "terminal" for event in batch):
+                    break
+                # chat_result is an ordering barrier. PipelineClient returns its
+                # authoritative ChatResponse immediately after publishing it, so
+                # do not send any older queued load/generation status afterward.
+                if any(str(event.get("ev") or "") == "chat_result" for event in batch):
+                    continue
+                saw_delta = False
+                for event in batch:
+                    kind = str(event.get("ev") or "")
+                    if kind == "delta":
+                        saw_delta = True
+                        current_text = str(event.get("text") or current_text)
+                        current_reasoning = str(event.get("reasoning") or current_reasoning)
+                        if current_reasoning and reasoning_started is None:
+                            reasoning_started = time.monotonic()
+                        if current_text and reasoning_started is not None and reasoning_s is None:
+                            reasoning_s = time.monotonic() - reasoning_started
+                    elif kind == "status":
+                        current_status = str(event.get("message") or current_status)
+                        data = dict(event.get("data") or {})
+                        new_tokens = data.get("new_tokens")
+                        speed = data.get("tok_per_s", data.get("tokens_per_second"))
+                        token_text = str(new_tokens) if new_tokens is not None else "generating"
+                        try:
+                            speed_text = f"{float(speed):.2f} tok/s" if speed is not None else "—"
+                        except (TypeError, ValueError):
+                            speed_text = "—"
+                        if data.get("prompt_tokens") is not None:
+                            context_used = data.get("prompt_tokens")
+                            context_limit = data.get("context_limit", context_limit)
+                        token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
+                    elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
+                        current_status = str(event.get("text") or current_status)
                 now = time.monotonic()
-                if now - last_emit < 0.05 and kind == "delta":
+                if now - last_emit < 0.05 and saw_delta:
                     continue
                 last_emit = now
                 yield (

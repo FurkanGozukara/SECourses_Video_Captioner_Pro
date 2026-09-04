@@ -123,8 +123,8 @@ def test_caption_and_retry_generators_match_wired_outputs(tmp_path: Path) -> Non
         values = context.registry.dict_to_values(context.registry.defaults())
         normal_updates = list(run_caption(*values, ["bad.mp4"], "upload", "video"))
         assert all(len(update) == len(dependency["outputs"]) for update in normal_updates)
-        assert normal_updates[-1][11]["failed_paths"] == ["bad.mp4"]
-        assert normal_updates[-1][18]["interactive"] is True
+        assert normal_updates[-1][12]["failed_paths"] == ["bad.mp4"]
+        assert normal_updates[-1][19]["interactive"] is True
 
         uploaded = tmp_path / "file component upload.mp4"
         uploaded.write_bytes(b"not decoded by this UI test")

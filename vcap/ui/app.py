@@ -142,6 +142,8 @@ def _gpu_summary() -> str:
 def build_app() -> gr.Blocks:
     """Construct the complete Gradio application without launching a server."""
 
+    app_log = get_log()
+    app_log.configure_persistence(LOGS_DIR)
     context = UiContext(
         settings_registry=SettingsRegistry(),
         preset_store=PresetStore(
@@ -150,7 +152,7 @@ def build_app() -> gr.Blocks:
             default_preset_name=DEFAULT_PRESET_NAME,
         ),
         pipeline_client=PipelineClient(subprocess_mode=True),
-        app_log=get_log(),
+        app_log=app_log,
     )
 
     with gr.Blocks(

@@ -261,6 +261,7 @@ def build(ctx: "UiContext") -> None:
 
     fitness_plan = gr.State({})
     initial_suggestion, initial_target_seconds = trainer_clip_suggestion("wan", 16.0, 81)
+    initial_target_seconds = round(initial_target_seconds, 3)
 
     with gr.Accordion("Clip fitness checker", open=True):
         with gr.Row():
@@ -373,7 +374,7 @@ def build(ctx: "UiContext") -> None:
             )
         with gr.Row():
             target_seconds = gr.Number(
-                value=initial_target_seconds, minimum=0.1, step=0.1, label="Target seconds",
+                value=initial_target_seconds, minimum=0.1, step=0.001, precision=3, label="Target seconds",
                 info="Maximum duration of each fixed-length segment.",
             )
             overlap = gr.Radio(
@@ -402,7 +403,7 @@ def build(ctx: "UiContext") -> None:
             gr.update(visible=custom),
             gr.update(visible=custom),
             suggestion,
-            seconds,
+            round(seconds, 3),
         )
 
     target.change(
@@ -416,7 +417,7 @@ def build(ctx: "UiContext") -> None:
         if str(value) != "custom":
             return gr.skip(), gr.skip()
         suggestion, seconds = trainer_clip_suggestion(value, fps_value, frames_value)
-        return suggestion, seconds
+        return suggestion, round(seconds, 3)
 
     for custom_control in (custom_fps, custom_frames):
         custom_control.change(

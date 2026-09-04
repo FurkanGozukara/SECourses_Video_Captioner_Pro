@@ -1076,7 +1076,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                     f"Context clamped to {self._active_server_plan.context_size} by the "
                     f"{self._active_server_plan.vram_tier_gb} GB VRAM tier",
                 )
-            _emit(progress_cb, f"Starting llama-server for {self.variant.key} on 127.0.0.1:{port}")
+            _emit(progress_cb, "Starting llama-server (GGUF)... 0 s", phase="llama_start")
             creationflags = 0
             popen_options: dict[str, Any] = {}
             if os.name == "nt":
@@ -1126,6 +1126,7 @@ class LlamaCppCaptioner(BaseCaptioner):
             deadline = time.monotonic() + max(10.0, resolved_timeout)
             peak = baseline
             last_health_error = ""
+            last_progress_second = 0
             try:
                 while time.monotonic() < deadline:
                     peak = max(
@@ -1163,6 +1164,14 @@ class LlamaCppCaptioner(BaseCaptioner):
                             return self
                     except requests.RequestException as exc:
                         last_health_error = str(exc)
+                    elapsed_second = int(time.perf_counter() - started)
+                    if elapsed_second > last_progress_second:
+                        last_progress_second = elapsed_second
+                        _emit(
+                            progress_cb,
+                            f"Starting llama-server (GGUF)... {elapsed_second} s",
+                            phase="llama_start",
+                        )
                     time.sleep(0.25)
                 tail = self.server_log_tail or "(no server output)"
                 self.stop()

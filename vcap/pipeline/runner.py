@@ -338,7 +338,13 @@ class _Emitter:
         outputs: Mapping[str, Any] | None = None,
         clip_path: str | None = None,
     ) -> None:
-        tracker_status = status if status in {"done", "skipped", "failed"} else "failed"
+        tracker_status = (
+            status
+            if status in {"done", "skipped", "failed"}
+            else "skipped"
+            if status in {"unsupported", "cancelled"}
+            else "failed"
+        )
         self.tracker.finish_item(tracker_status, seconds)
         payload = self._payload(
             event_index,
@@ -655,7 +661,21 @@ def _apply_preassigned_outputs(spec: JobSpec, resolved: list[_ResolvedInput]) ->
     return True
 
 
-def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: ModelSpec) -> None:
+def _public_probe_error(error: object) -> str:
+    detail = str(error or "").casefold()
+    if "moov atom not found" in detail:
+        return "unreadable media (ffmpeg: moov atom not found)"
+    if "invalid data found when processing input" in detail:
+        return "unreadable media (ffmpeg: Invalid data found when processing input)"
+    return "unreadable media (ffmpeg could not inspect the file)"
+
+
+def _probe_and_classify(
+    spec: JobSpec,
+    resolved: list[_ResolvedInput],
+    model: ModelSpec,
+    emitter: _Emitter | None = None,
+) -> None:
     fake_captioner = os.environ.get("VCAP_FAKE_CAPTIONER", "").strip().casefold() in {
         "1",
         "true",
@@ -674,7 +694,14 @@ def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: Mo
             if entry.info.kind == "unknown":
                 entry.status = "unsupported"
                 entry.kind = "unknown"
-                entry.message = f"Unsupported or unreadable input: {entry.info.error or entry.path}"
+                raw_error = str(entry.info.error or entry.path)
+                entry.message = _public_probe_error(raw_error)
+                if emitter is not None:
+                    emitter.log(
+                        f"Could not inspect {entry.path}: {raw_error}",
+                        level="warning",
+                        scope="inputs",
+                    )
                 continue
         if spec.audio_caption.enabled and spec.audio_caption.video_source == "existing":
             if entry.info is None:
@@ -901,6 +928,68 @@ def _write_batch_summary(
     return OutputWriter().write_json(run_dir / "summary.json", summary, pretty=False)
 
 
+def _write_captions_index(
+    spec: JobSpec,
+    run_dir: Path,
+    items: Sequence[ItemResult],
+) -> Path:
+    """Write the batch caption-to-source lookup consumed by Caption Editor."""
+
+    caption_suffixes = {".txt", ".json", ".srt", ".vtt", ".jsonl"}
+    indexed: dict[str, dict[str, Any]] = {}
+
+    def add_outputs(
+        outputs: Mapping[str, Any],
+        item: ItemResult,
+        *,
+        start_s: Any = None,
+        end_s: Any = None,
+    ) -> None:
+        for output_key, raw in outputs.items():
+            normalized_key = str(output_key).casefold()
+            if normalized_key.startswith("transcript_") or normalized_key == "reasoning":
+                continue
+            if not isinstance(raw, (str, os.PathLike)):
+                continue
+            caption = normalize_path(raw)
+            if caption.suffix.casefold() not in caption_suffixes:
+                continue
+            indexed[str(caption)] = {
+                "source_path": str(normalize_path(item.path)),
+                "kind": item.kind,
+                "start_s": start_s,
+                "end_s": end_s,
+                "output_key": str(output_key),
+            }
+
+    by_index = {index: value for index, value in enumerate(spec.inputs)}
+    for item in sorted(items, key=lambda value: value.index):
+        input_item = by_index.get(int(item.index))
+        add_outputs(
+            item.outputs,
+            item,
+            start_s=getattr(input_item, "trim_start_s", None),
+            end_s=getattr(input_item, "trim_end_s", None),
+        )
+        for segment in item.segments:
+            if not isinstance(segment, Mapping):
+                continue
+            add_outputs(
+                dict(segment.get("outputs") or {}),
+                item,
+                start_s=segment.get("start_s"),
+                end_s=segment.get("end_s"),
+            )
+    return OutputWriter().write_json(
+        run_dir / "captions_index.json",
+        {
+            "_meta": {"format": "secourses_vcap_captions_index", "version": 1},
+            "captions": indexed,
+        },
+        pretty=True,
+    )
+
+
 def _write_metadata(
     spec: JobSpec,
     items: list[ItemResult],
@@ -980,6 +1069,7 @@ def _write_metadata(
             spec.output.limit_items,
             include_audio=_split_layout(spec),
         )
+        _write_captions_index(spec, run_dir, items)
     return target
 
 
@@ -1154,11 +1244,18 @@ class _ModelSession:
         self._prepare_compile()
         if os.environ.get("VCAP_FAKE_CAPTIONER", "").strip().casefold() in {"1", "true", "yes", "on"}:
             with _FAKE_LOCK:
-                if _FAKE_CAPTIONER is None or _FAKE_VARIANT != self.spec.model.variant_key:
+                reused = (
+                    _FAKE_CAPTIONER is not None
+                    and _FAKE_VARIANT == self.spec.model.variant_key
+                )
+                if not reused:
                     _FAKE_CAPTIONER = _FakeCaptioner(self.spec.model.variant_key)
                     _FAKE_VARIANT = self.spec.model.variant_key
                 self.captioner = _FAKE_CAPTIONER
-            self.emitter.log(f"Using CPU fake captioner for {self.spec.model.variant_key}", scope="models")
+            self.emitter.log(
+                f"{'Reusing resident' if reused else 'Loading'} {self.spec.model.variant_key}",
+                scope="models",
+            )
             return self.captioner
 
         from vcap.models import captioner_for_loaded
@@ -1171,11 +1268,20 @@ class _ModelSession:
             and getattr(load_function, "__name__", "") == "load_model"
         )
         self._patched_loader = loader_is_patched
+        resident_variant = (
+            loader.MODEL_CACHE.loaded_variant_key()
+            if not loader_is_patched
+            else None
+        )
 
         def download_progress(message: Any, payload: Any = None) -> None:
             _emit_model_download_progress(self.emitter, message, payload)
 
-        if not loader_is_patched and os.environ.get("VCAP_SKIP_MODEL_ENSURE", "") != "1":
+        if (
+            not loader_is_patched
+            and resident_variant != self.spec.model.variant_key
+            and os.environ.get("VCAP_SKIP_MODEL_ENSURE", "") != "1"
+        ):
             ready, detail = downloads.ensure_model(
                 self.spec.model.variant_key,
                 progress_cb=download_progress,
@@ -1186,6 +1292,9 @@ class _ModelSession:
 
         def load_progress(*args: Any) -> None:
             message = str(args[0]) if args else "Loading model"
+            if message.startswith("llama-server: "):
+                self.emitter.log(message, scope="llama.cpp")
+                return
             fraction: float | None = None
             data: dict[str, Any] = {"phase": "model_load"}
             if len(args) > 1 and isinstance(args[1], Mapping):
@@ -1261,11 +1370,27 @@ class _ModelSession:
             accepts_runtime = False
         if accepts_runtime:
             load_kwargs["runtime"] = self.spec.runtime
+        cached_before = loader.MODEL_CACHE.loaded if not loader_is_patched else None
+        if cached_before is None:
+            self.emitter.log(
+                f"Loading {self.spec.model.variant_key}",
+                scope="models",
+            )
         self.loaded = (
             load_function(self.spec.model.variant_key, **load_kwargs)
             if loader_is_patched
             else loader.MODEL_CACHE.load(self.spec.model.variant_key, **load_kwargs)
         )
+        if cached_before is not None and self.loaded is cached_before:
+            self.emitter.log(
+                f"Reusing resident {self.spec.model.variant_key}",
+                scope="models",
+            )
+        elif cached_before is not None:
+            self.emitter.log(
+                f"Loading {self.spec.model.variant_key}",
+                scope="models",
+            )
         report = getattr(self.loaded, "load_report", None)
         self.load_report = report
         self.peak_vram_gb = max(self.peak_vram_gb, float(getattr(report, "peak_vram_gb", 0.0) or 0.0))
@@ -1541,10 +1666,19 @@ def _trim_source(
 ) -> tuple[Path, MediaInfo, float]:
     assert entry.info is not None
     info = entry.info
-    if spec.output.kind == "batch":
+    item_trim = (
+        entry.item.trim_start_s is not None
+        or entry.item.trim_end_s is not None
+    )
+    if spec.output.kind == "batch" and not item_trim:
         return source, info, 0.0
-    start = max(0.0, spec.preprocess.trim_start_s)
-    end = spec.preprocess.trim_end_s
+    start = max(
+        0.0,
+        float(entry.item.trim_start_s or 0.0)
+        if item_trim
+        else spec.preprocess.trim_start_s,
+    )
+    end = entry.item.trim_end_s if item_trim else spec.preprocess.trim_end_s
     if info.duration is not None:
         start = min(start, info.duration)
         end = info.duration if end is None else min(max(0.0, end), info.duration)
@@ -1563,7 +1697,11 @@ def _trim_source(
         target_dir = work_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"trimmed{source.suffix or '.mp4'}"
-    emitter.log(f"Trimming {source.name}: {start:.3f}s to {end:.3f}s")
+    scope = "per-item clip" if item_trim else "single-file"
+    emitter.log(
+        f"Trimming {source.name}: {start:.3f}s to {end:.3f}s ({scope} range)",
+        scope="preprocess",
+    )
     trim_media(
         source,
         target,
@@ -1921,6 +2059,10 @@ def _run_item_transcript(
         items[0] if items else {},
     )
     if result is None:
+        if bool(item_payload.get("skipped")):
+            message = str(item_payload.get("message") or "no audio track")
+            emitter.log(f"Whisper skipped for {entry.stem}: {message}", scope="transcript")
+            return None, {"skipped": True, "message": message}, {}
         error = str(
             item_payload.get("message")
             or getattr(outcome, "error", "")
@@ -2501,7 +2643,12 @@ def _process_item(
         transcript_result: Any | None = None
         transcript_data: dict[str, Any] | None = None
         transcript_outputs: dict[str, str] = {}
-        if _needs_whisper(spec) and entry.kind in {"video", "audio"} and source is not None:
+        if (
+            _needs_whisper(spec)
+            and entry.kind in {"video", "audio"}
+            and source is not None
+            and (info is None or info.has_audio)
+        ):
             try:
                 transcript_result, transcript_data, transcript_outputs = _run_item_transcript(
                     spec,
@@ -2520,6 +2667,11 @@ def _process_item(
                     level="warning",
                     scope="transcript",
                 )
+        elif _needs_whisper(spec) and info is not None and not info.has_audio:
+            emitter.log(
+                f"Whisper skipped for {entry.stem}: no audio track",
+                scope="transcript",
+            )
         emitter.progress(entry.tracker_index, entry.result_index, "Planning segments", 0.18, step_index=2)
         segments = (
             [SceneRange(0.0, 0.0)]
@@ -2971,7 +3123,11 @@ def _process_existing_item(
     transcript_result: Any | None = None
     transcript_data: dict[str, Any] | None = None
     transcript_outputs: dict[str, str] = {}
-    if _needs_whisper(spec) and entry.info.kind in {"video", "video_no_audio", "audio"}:
+    if (
+        _needs_whisper(spec)
+        and entry.info.kind in {"video", "video_no_audio", "audio"}
+        and entry.info.has_audio
+    ):
         try:
             transcript_result, transcript_data, transcript_outputs = _run_item_transcript(
                 spec,
@@ -2990,6 +3146,11 @@ def _process_existing_item(
                 level="warning",
                 scope="transcript",
             )
+    elif _needs_whisper(spec) and not entry.info.has_audio:
+        emitter.log(
+            f"Whisper skipped for {entry.stem}: no audio track",
+            scope="transcript",
+        )
     video_caption, video_path = _existing_video_caption(spec, entry, emitter)
     duration = float(entry.info.duration or 0.0)
     clip_transcript = render_transcript(
@@ -3623,7 +3784,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                 entry.kind = "unknown"
                 entry.message = f"Unknown model variant: {spec.model.variant_key}"
         else:
-            _probe_and_classify(spec, resolved, model)
+            _probe_and_classify(spec, resolved, model, emitter)
             if not existing_mode and not spec.internal.get("suppress_job_contract_logs"):
                 _log_job_generation_contracts(spec, model, resolved, emitter)
             _apply_batch_skip(spec, resolved)
@@ -3964,7 +4125,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     if spec.output.kind == "batch" and spec.output.limit_items > 0:
         try:
             limit_model = MODEL_SPECS[variant_to_family(spec.model.variant_key)]
-            _probe_and_classify(spec, expanded, limit_model)
+            _probe_and_classify(spec, expanded, limit_model, emitter)
         except KeyError:
             pass
         _apply_batch_skip(spec, expanded)

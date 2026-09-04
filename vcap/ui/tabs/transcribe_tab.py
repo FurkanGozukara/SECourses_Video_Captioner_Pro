@@ -71,6 +71,7 @@ class TranscribeTabHandles:
     start: gr.Button
     cancel: gr.Button
     cancel_confirmation: gr.Row
+    cancel_note: gr.Markdown
     confirm_cancel: gr.Button
     keep_running: gr.Button
     open_output: gr.Button
@@ -354,7 +355,7 @@ def write_transcription_metadata(
 def request_transcription_cancel(ctx: "UiContext") -> tuple[Any, Any, str]:
     token = ctx.states.get("transcribe_job_token")
     if isinstance(token, CancelToken) and not token.is_cancelled():
-        token.arm_confirmation(7.0)
+        token.arm_confirmation(8.0)
         return (
             gr.update(value="⏹ Cancel", interactive=True),
             gr.update(visible=True),
@@ -562,6 +563,7 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
                 gr.Markdown("⚠ Cancel the running transcription?")
                 confirm_cancel = action_button("✔ Yes, cancel", "red")
                 keep_running = action_button("✖ Keep running", "gray")
+            cancel_note = gr.Markdown("", elem_classes=["vc-status"])
             with gr.Row():
                 results_zip_file = gr.File(
                     label="Results ZIP download",
@@ -1013,6 +1015,7 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
         start=start,
         cancel=cancel,
         cancel_confirmation=cancel_confirmation,
+        cancel_note=cancel_note,
         confirm_cancel=confirm_cancel,
         keep_running=keep_running,
         open_output=open_output,
@@ -1658,7 +1661,11 @@ def wire(ctx: "UiContext") -> None:
                         is_skipped = bool(payload.get("skipped", False))
                         current.update(
                             status="skipped" if is_skipped else "done",
-                            message="Existing transcript kept" if is_skipped else "Transcribed",
+                            message=(
+                                str(payload.get("message") or "Existing transcript kept")
+                                if is_skipped
+                                else "Transcribed"
+                            ),
                             files=[str(value) for value in payload.get("files", []) or []],
                         )
                         produced_files.extend(
@@ -1699,7 +1706,18 @@ def wire(ctx: "UiContext") -> None:
                 for payload in list(getattr(outcome, "items", []) or []):
                     item_index = int(payload.get("item_index", 0))
                     current = item_state.setdefault(item_index, {"index": item_index, "path": ""})
-                    if payload.get("event") == "item_error" or payload.get("message") and not payload.get("files"):
+                    if payload.get("skipped"):
+                        current.update(
+                            status="skipped",
+                            message=str(payload.get("message") or "Existing transcript kept"),
+                            files=[str(value) for value in payload.get("files", []) or []],
+                        )
+                        produced_files.extend(
+                            value
+                            for value in current.get("files", [])
+                            if value not in produced_files and Path(value).is_file()
+                        )
+                    elif payload.get("event") == "item_error" or payload.get("message") and not payload.get("files"):
                         current.update(status="failed", message=str(payload.get("message") or "Transcription failed"))
                     else:
                         current.update(
@@ -1889,7 +1907,7 @@ def wire(ctx: "UiContext") -> None:
 
     handles.cancel.click(
         lambda: request_transcription_cancel(ctx),
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -1903,21 +1921,21 @@ def wire(ctx: "UiContext") -> None:
 
     handles.hotkey_cancel.click(
         escape_cancel,
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     handles.keep_running.click(
         lambda: keep_transcription_running(ctx),
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     handles.confirm_cancel.click(
         lambda: confirm_transcription_cancel(ctx),
-        outputs=[handles.cancel, handles.cancel_confirmation, handles.progress.status],
+        outputs=[handles.cancel, handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -1939,6 +1957,20 @@ def wire(ctx: "UiContext") -> None:
     handles.cancel_timer.tick(
         refresh_cancel_confirmation,
         outputs=handles.cancel,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def refresh_cancel_note() -> tuple[Any, Any]:
+        token = ctx.states.get("transcribe_job_token")
+        if isinstance(token, CancelToken) and not token.is_cancelled() and token.is_armed():
+            return gr.skip(), gr.skip()
+        return gr.update(visible=False), ""
+
+    handles.cancel_timer.tick(
+        refresh_cancel_note,
+        outputs=[handles.cancel_confirmation, handles.cancel_note],
         queue=False,
         show_progress="hidden",
         api_visibility="private",

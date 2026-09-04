@@ -21,20 +21,23 @@ PRESET_NAMES = (
 def registry_defaults() -> tuple[dict, list[str]]:
     app = build_app()
     try:
-        return app.settings_registry.defaults(), app.settings_registry.keys()
+        return app.settings_registry.defaults(), [
+            entry.key for entry in app.settings_registry.entries() if entry.in_preset
+        ]
     finally:
         app.vcap_context.pipeline.shutdown()
 
 
-def test_shipped_whisper_presets_contain_every_registered_key(
+def test_shipped_whisper_presets_contain_only_registered_preset_keys(
     registry_defaults: tuple[dict, list[str]],
 ) -> None:
-    _defaults, keys = registry_defaults
+    _defaults, preset_keys = registry_defaults
+    keys = set(preset_keys)
     root = Path("presets_default")
     for name in PRESET_NAMES:
         payload = json.loads((root / f"{name}.json").read_text(encoding="utf-8"))
         assert payload["_meta"]["format"] == "secourses_vcap_preset"
-        assert set(payload["settings"]) == set(keys)
+        assert set(payload["settings"]) == keys
 
 
 def test_whisper_preset_values_match_large_v1_and_turbo_defaults() -> None:

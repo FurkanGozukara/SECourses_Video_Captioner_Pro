@@ -438,7 +438,7 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
         if "thinking" in payload["settings"]["model_key"]:
             assert payload["settings"]["enable_thinking"] is True, preset_file.name
         else:
-            if preset_file.name not in whisper_preset_names:
+            if preset_file.name not in whisper_preset_names | dataset_preset_names:
                 assert "enable_thinking" not in keys, preset_file.name
         assert payload["settings"]["prompt_preset_id"] in EXPECTED_PRESET_IDS
         assert payload["settings"]["split_mode"] in {"copy", "precise"}

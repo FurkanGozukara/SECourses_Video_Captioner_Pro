@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping, TypedDict
 import gradio as gr
 from PIL import Image, ImageDraw
 
+from vcap import OUTPUTS_DIR
 from vcap.core.archive import zip_directory
 from vcap.core.caption_stats import calculate_caption_statistics, render_caption_statistics
 from vcap.core.captions_post import (
@@ -57,6 +58,7 @@ _RUN_DIR_RE = re.compile(r"^(?:batch_)?\d{4,}_.+", re.IGNORECASE)
 _IGNORED_JSON_NAMES = {
     ".vcap_flags.json",
     "metadata.json",
+    "captions_index.json",
     "summary.json",
     "split_manifest.json",
     "vcap_model_info.json",
@@ -106,6 +108,7 @@ class EditorItem(TypedDict, total=False):
     encode_crf: int
     encode_preset: str
     encode_audio_bitrate: str
+    batch_run_item: bool
 
 
 class EditorState(TypedDict, total=False):
@@ -347,10 +350,20 @@ def _is_caption_match(raw: str, caption_path: Path, metadata_path: Path) -> bool
         candidate = _metadata_candidate(raw, metadata_path)
     except Exception:
         return False
-    return candidate == caption_path or (
+    return _path_identity(candidate) == _path_identity(caption_path) or (
         candidate.stem.casefold() == caption_path.stem.casefold()
         and candidate.suffix.casefold() in CAPTION_EXTENSIONS
     )
+
+
+def _path_identity(path: str | os.PathLike[str]) -> str:
+    """Return a Unicode-safe path key with Windows-style case folding."""
+
+    try:
+        value = os.path.normcase(str(normalize_path(path)))
+    except Exception:
+        value = os.path.normcase(os.fspath(path))
+    return value.casefold()
 
 
 def _metadata_media_candidates(
@@ -407,9 +420,151 @@ def _metadata_media_candidates(
     return candidates
 
 
+def _batch_document_records(
+    document: Mapping[str, Any],
+    document_path: Path,
+) -> list[dict[str, Any]]:
+    """Normalize a captions index or legacy batch metadata into lookup rows."""
+
+    records: list[dict[str, Any]] = []
+    captions = document.get("captions")
+    if isinstance(captions, Mapping):
+        for raw_caption, raw_record in captions.items():
+            if not isinstance(raw_record, Mapping):
+                continue
+            source_values = _path_values(raw_record.get("source_path"))
+            if not source_values:
+                continue
+            try:
+                caption = _metadata_candidate(str(raw_caption), document_path)
+                source = _metadata_candidate(source_values[0], document_path)
+            except Exception:
+                continue
+            records.append(
+                {
+                    "caption_path": str(caption),
+                    "source_path": str(source),
+                    "kind": str(raw_record.get("kind") or guess_kind_by_extension(source)),
+                    "start_s": raw_record.get("start_s"),
+                    "end_s": raw_record.get("end_s"),
+                    "output_key": str(raw_record.get("output_key") or ""),
+                    "metadata_path": str(document_path),
+                }
+            )
+        return records
+
+    for entry in _metadata_entries(document):
+        sources = _entry_source_paths(entry)
+        if not sources:
+            continue
+        try:
+            source = _metadata_candidate(sources[0], document_path)
+        except Exception:
+            continue
+        groups: list[Mapping[str, Any]] = [entry]
+        segments = entry.get("segments")
+        if isinstance(segments, list):
+            groups.extend(value for value in segments if isinstance(value, Mapping))
+        for group in groups:
+            output_records: list[tuple[str, str]] = []
+            raw_outputs = group.get("outputs")
+            if isinstance(raw_outputs, Mapping):
+                for output_key, raw_value in raw_outputs.items():
+                    output_records.extend(
+                        (str(output_key), raw_caption)
+                        for raw_caption in _path_values(raw_value)
+                    )
+            for key in ("output", "caption_path", "output_path"):
+                output_records.extend(
+                    (key, raw_caption) for raw_caption in _path_values(group.get(key))
+                )
+            for output_key, raw_caption in output_records:
+                normalized_key = output_key.casefold()
+                if normalized_key.startswith("transcript_") or normalized_key == "reasoning":
+                    continue
+                try:
+                    caption = _metadata_candidate(raw_caption, document_path)
+                except Exception:
+                    continue
+                if caption.suffix.casefold() not in CAPTION_EXTENSIONS:
+                    continue
+                records.append(
+                    {
+                        "caption_path": str(caption),
+                        "source_path": str(source),
+                        "kind": str(entry.get("kind") or guess_kind_by_extension(source)),
+                        "start_s": group.get("start_s"),
+                        "end_s": group.get("end_s"),
+                        "output_key": output_key,
+                        "metadata_path": str(document_path),
+                    }
+                )
+    return records
+
+
+def _read_batch_records(run_dir: Path) -> list[dict[str, Any]]:
+    """Prefer a batch captions index and fall back to its metadata."""
+
+    for name in ("captions_index.json", "metadata.json"):
+        path = run_dir / name
+        if not path.is_file():
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(document, Mapping):
+            records = _batch_document_records(document, path)
+            if records or name == "captions_index.json":
+                return records
+    return []
+
+
+def _batch_caption_lookup(scan_root: Path) -> dict[str, dict[str, Any]]:
+    """Load at most the newest 50 batch index documents once per editor scan."""
+
+    roots: list[Path] = []
+    root_keys: set[str] = set()
+    for candidate in (scan_root, scan_root.parent, OUTPUTS_DIR):
+        normalized = normalize_path(candidate)
+        key = _path_identity(normalized)
+        if key not in root_keys:
+            roots.append(normalized)
+            root_keys.add(key)
+    run_dirs: dict[str, Path] = {}
+    for root in roots:
+        if (root / "captions_index.json").is_file() or (root / "metadata.json").is_file():
+            run_dirs[_path_identity(root)] = root
+        try:
+            for child in root.glob("batch_*"):
+                if child.is_dir() and (
+                    (child / "captions_index.json").is_file()
+                    or (child / "metadata.json").is_file()
+                ):
+                    run_dirs[_path_identity(child)] = child
+        except (OSError, PermissionError):
+            continue
+
+    def newest(path: Path) -> float:
+        values: list[float] = []
+        for candidate in (path / "captions_index.json", path / "metadata.json"):
+            try:
+                values.append(candidate.stat().st_mtime)
+            except OSError:
+                pass
+        return max(values, default=0.0)
+
+    lookup: dict[str, dict[str, Any]] = {}
+    for run_dir in sorted(run_dirs.values(), key=newest, reverse=True)[:50]:
+        for record in _read_batch_records(run_dir):
+            lookup.setdefault(_path_identity(record["caption_path"]), record)
+    return lookup
+
+
 def resolve_media_from_metadata(
     caption_path: str | os.PathLike[str],
     scan_root: str | os.PathLike[str] | None = None,
+    batch_lookup: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[Path | None, Path | None]:
     """Return an existing source and the best metadata path candidate for a caption."""
 
@@ -435,6 +590,11 @@ def resolve_media_from_metadata(
                     return existing, existing or candidates[0]
         if root is not None and directory == root:
             break
+    lookup = batch_lookup if batch_lookup is not None else _batch_caption_lookup(root or caption.parent)
+    record = lookup.get(_path_identity(caption)) if isinstance(lookup, Mapping) else None
+    if isinstance(record, Mapping) and record.get("source_path"):
+        source = normalize_path(str(record["source_path"]))
+        return (source if source.is_file() else None), source
     return None, None
 
 
@@ -688,6 +848,8 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
             key=lambda value: (natural_sort_key(value), str(value).casefold(), str(value)),
         )
     caption_files = _walk_caption_files(root, recursive)
+    batch_lookup = _batch_caption_lookup(root)
+    run_records = _read_batch_records(root)
     captions_by_key: dict[tuple[str, str], list[Path]] = {}
     for path in caption_files:
         captions_by_key.setdefault((str(path.parent).casefold(), path.stem.casefold()), []).append(path)
@@ -735,7 +897,9 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
         if caption_path != formats[0]:
             continue
         used_captions.update(str(path.resolve(strict=False)).casefold() for path in formats)
-        resolved_media, source_media = resolve_media_from_metadata(caption_path, root)
+        resolved_media, source_media = resolve_media_from_metadata(
+            caption_path, root, batch_lookup
+        )
         item = _item_from_pair(
             resolved_media,
             caption_path,
@@ -748,6 +912,67 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
         if source_media is not None:
             item["source_media_path"] = str(source_media)
         _enrich_segment_item(item, root)
+        items.append(item)
+
+    # Numbered batch run directories keep captions in mirrored/next-to-source
+    # destinations. Their index still provides a complete editor queue.
+    records_by_window: dict[tuple[str, Any, Any], list[dict[str, Any]]] = {}
+    for record in run_records:
+        window_key = (
+            _path_identity(str(record["source_path"])),
+            record.get("start_s"),
+            record.get("end_s"),
+        )
+        records_by_window.setdefault(window_key, []).append(record)
+    preferred_records: list[dict[str, Any]] = []
+    for records in records_by_window.values():
+        main = [
+            record
+            for record in records
+            if str(record.get("output_key") or "").casefold()
+            not in {"video_caption", "audio_caption"}
+        ]
+        video = [
+            record
+            for record in records
+            if str(record.get("output_key") or "").casefold() == "video_caption"
+        ]
+        preferred_records.extend(main or video or records)
+
+    run_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in preferred_records:
+        caption_path = normalize_path(str(record["caption_path"]))
+        if not caption_path.is_file():
+            continue
+        key = (_path_identity(caption_path.parent), caption_path.stem.casefold())
+        run_groups.setdefault(key, []).append(record)
+    for records in run_groups.values():
+        records.sort(
+            key=lambda value: CAPTION_EXTENSIONS.index(
+                Path(str(value["caption_path"])).suffix.casefold()
+            )
+        )
+        selected_record = records[0]
+        caption_path = normalize_path(str(selected_record["caption_path"]))
+        if _path_identity(caption_path) in used_captions:
+            continue
+        formats = [normalize_path(str(value["caption_path"])) for value in records]
+        used_captions.update(_path_identity(value) for value in formats)
+        source = normalize_path(str(selected_record["source_path"]))
+        item = _item_from_pair(
+            source if source.is_file() else None,
+            caption_path,
+            formats,
+            root,
+            flags,
+            failed_paths,
+            failed_names,
+        )
+        item["source_media_path"] = str(source)
+        item["batch_run_item"] = True
+        window = _finite_window(selected_record)
+        if window:
+            item.update(start_s=window[0], end_s=window[1])
         items.append(item)
 
     def item_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -848,6 +1073,11 @@ def editor_item_label(item: Mapping[str, Any], scan_root: str | os.PathLike[str]
     """Return the stable row/gallery label for an editor item."""
 
     caption = Path(str(item.get("caption_path") or "caption"))
+    if item.get("batch_run_item"):
+        source = Path(
+            str(item.get("source_media_path") or item.get("media_path") or "source")
+        )
+        return f"{caption.name} - {source.name}"
     is_segment = item.get("segment_index") is not None or caption.parent.name.casefold().endswith("_segments")
     if is_segment:
         try:
@@ -1426,7 +1656,17 @@ def build_editor_regeneration_spec(
         mirror_names=False,
         overwrite=True,
     )
-    spec = JobSpec.from_settings(merged, [InputItem(path=str(media_path))], output)
+    spec = JobSpec.from_settings(
+        merged,
+        [
+            InputItem(
+                path=str(media_path),
+                trim_start_s=trim_start,
+                trim_end_s=trim_end,
+            )
+        ],
+        output,
+    )
     return replace(
         spec,
         preprocess=replace(spec.preprocess, trim_start_s=trim_start, trim_end_s=trim_end),
@@ -2258,18 +2498,20 @@ def build(ctx: "UiContext") -> None:
         api_visibility="private",
     )
 
-    def mark_dirty(current: EditorState, text: str) -> tuple[EditorState, str]:
+    def mark_dirty(current: EditorState, text: str) -> tuple[EditorState, str, list[list[Any]]]:
         next_state = deepcopy(current or initial_state)
         selected = next_state.get("selected_index")
         if selected is not None and 0 <= int(selected) < len(next_state.get("items") or []):
             item = next_state["items"][int(selected)]
             _refresh_item(item, str(text or ""))
             next_state.update(dirty=True, draft_caption=str(text or ""), last_edit=time.monotonic())
-            return next_state, _stats_markdown(item, _state_token_limit(next_state))
-        return next_state, _stats_markdown(None)
+            rows, _ = _page_rows(next_state)
+            return next_state, _stats_markdown(item, _state_token_limit(next_state)), rows
+        rows, _ = _page_rows(next_state)
+        return next_state, _stats_markdown(None), rows
 
     caption.input(
-        mark_dirty, inputs=[state, caption], outputs=[state, stats],
+        mark_dirty, inputs=[state, caption], outputs=[state, stats, table],
         queue=False, show_progress="hidden", trigger_mode="always_last", api_visibility="private",
     )
 
@@ -2302,21 +2544,25 @@ def build(ctx: "UiContext") -> None:
         saved_draft = str(current.get("draft_caption") or "")
         result = list(save_handler(current, saved_draft, True))
         current_text = str(textbox_value or "")
-        if current_text != saved_draft and isinstance(result[0], dict):
+        if isinstance(result[0], dict):
             saved_state = result[0]
             selected = saved_state.get("selected_index")
             if selected is not None and 0 <= int(selected) < len(saved_state.get("items") or []):
                 selected_item = saved_state["items"][int(selected)]
-                _refresh_item(selected_item, current_text)
-                saved_state.update(
-                    dirty=True,
-                    draft_caption=current_text,
-                    last_edit=time.monotonic(),
-                )
+                if current_text != saved_draft:
+                    _refresh_item(selected_item, current_text)
+                    saved_state.update(
+                        dirty=True,
+                        draft_caption=current_text,
+                        last_edit=time.monotonic(),
+                    )
                 result[1], _ = _page_rows(saved_state)
                 result[2] = _counter_markdown(saved_state)
                 result[3] = _stats_markdown(selected_item, _state_token_limit(saved_state))
         return tuple(result)
+
+    ctx.states["editor_mark_dirty_handler"] = mark_dirty
+    ctx.states["editor_autosave_handler"] = autosave_handler
 
     autosave_timer.tick(
         autosave_handler, inputs=[state, autosave, caption], outputs=[state, table, counters, stats, status],
@@ -2577,14 +2823,37 @@ def build(ctx: "UiContext") -> None:
             self.events = events
 
         def on_log(self, message: str, level: str = "info", scope: str | None = None) -> None:
-            del level
-            self.events.put(("log", f"[{scope}] {message}" if scope else message))
+            # PipelineClient already mirrors worker logs into AppLog. Raw loader
+            # and native-library stderr must never replace the editor status.
+            del message, level, scope
+
+        @staticmethod
+        def _status(event: Any) -> str | None:
+            message = str(getattr(event, "message", event) or "").strip()
+            data = dict(getattr(event, "data", {}) or {})
+            phase = str(data.get("phase") or "").casefold()
+            lowered = message.casefold()
+            if any(token in lowered for token in ("info:", "debug:", ".dll", "llama-server:")):
+                return None
+            if "llama" in phase or "llama-server" in lowered:
+                return "Starting llama-server (GGUF)..."
+            if "load" in phase or "loading" in lowered or "checkpoint" in lowered:
+                return "Loading model..."
+            if any(token in lowered for token in ("caption", "generat", "segment", "clip")):
+                return "Captioning clip..."
+            return message or None
 
         def on_progress(self, event: Any) -> None:
-            self.events.put(("progress", getattr(event, "message", str(event))))
+            status = self._status(event)
+            if status:
+                self.events.put(("progress", status))
 
         def on_item(self, event: Any) -> None:
-            self.events.put(("progress", getattr(event, "message", str(event))))
+            status = self._status(event)
+            if status:
+                self.events.put(("progress", status))
+
+    ctx.states["editor_regeneration_sink_class"] = _RegenerationSink
 
     def request_regenerate_all(
         current: EditorState,
@@ -2688,7 +2957,11 @@ def build(ctx: "UiContext") -> None:
 
         def work() -> None:
             try:
-                ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
+                set_mode = getattr(ctx.pipeline_client, "set_subprocess_mode", None)
+                if callable(set_mode):
+                    set_mode(bool(settings.get("subprocess_mode", True)))
+                else:
+                    ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
                 results = []
                 sink = _RegenerationSink(events)
                 for spec, log_message in specs:
@@ -2820,7 +3093,11 @@ def build(ctx: "UiContext") -> None:
 
         def work() -> None:
             try:
-                ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
+                set_mode = getattr(ctx.pipeline_client, "set_subprocess_mode", None)
+                if callable(set_mode):
+                    set_mode(bool(settings.get("subprocess_mode", True)))
+                else:
+                    ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
                 log_message = editor_regeneration_log(item)
                 ctx.app_log.log(log_message, scope="editor")
                 events.put(("log", log_message))

@@ -259,6 +259,11 @@ def build(ctx: "UiContext") -> None:
             )
             ctx.outputs_dir = normalized_outputs
             ctx.logs_dir = normalized_logs
+            ctx.app_log.configure_persistence(normalized_logs)
+            ctx.app_log.log(
+                f"Application log directory set to {normalized_logs}",
+                scope="settings",
+            )
             return (
                 str(normalized_outputs),
                 str(normalized_temp),

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -128,6 +129,10 @@ class PipelineClient:
         self._local_chat_cancel: CancelToken | None = None
         self._selected_variant: str | None = None
         self._release_pending = False
+        self._resident_variant: str | None = None
+        self._idle_released_variant: str | None = None
+        self._worker_output_tail: deque[str] = deque(maxlen=1000)
+        self._crash_logs_written: set[int] = set()
         self._shutdown = threading.Event()
         self._console_key = ("pipeline-client", id(self))
         self._console_throttle = UiThrottle(0.5)
@@ -204,6 +209,7 @@ class PipelineClient:
                 self._worker_gpu = None
                 self._worker_compile = None
                 self._reader = None
+                self._resident_variant = None
         if worker_exited:
             self._wait_for_worker_vram(worker_gpu)
 
@@ -282,6 +288,7 @@ class PipelineClient:
         if kind in {"log", "stdout"}:
             level = str(event.get("level") or ("warning" if event.get("source") == "stderr" else "info"))
             message = str(event.get("text", ""))
+            self._worker_output_tail.append(message)
             scope = event.get("scope")
             _relay_app_log(message, level=level, scope=scope)
             _sink_call(
@@ -326,6 +333,29 @@ class PipelineClient:
             pass
         return None
 
+    def _persist_worker_crash(self, worker: WorkerProcess) -> None:
+        pid = worker.pid
+        if pid is None or pid in self._crash_logs_written:
+            return
+        self._crash_logs_written.add(pid)
+        try:
+            from vcap.core.logs import get_log
+
+            path = get_log().write_worker_crash(
+                pid,
+                [
+                    f"Pipeline worker {pid} exited with code {worker.returncode}.",
+                    *self._worker_output_tail,
+                ],
+            )
+            _relay_app_log(
+                f"Pipeline worker crashed; captured output in {path}",
+                level="error",
+                scope="worker",
+            )
+        except Exception:
+            pass
+
     def _ensure_worker(self, gpu_index: int, compile_enabled: bool, sink: ProgressSink) -> WorkerProcess:
         with self._state_lock:
             worker = self._worker
@@ -363,6 +393,7 @@ class PipelineClient:
             ),
             name=f"pipeline-gpu-{gpu_index}",
         )
+        self._worker_output_tail.clear()
         event_queue: queue.Queue[Any] = queue.Queue()
         reader = threading.Thread(
             target=self._reader_loop,
@@ -392,6 +423,7 @@ class PipelineClient:
             if event.get("ev") == "ready":
                 return worker
             self._forward(event, sink)
+        self._persist_worker_crash(worker)
         self._stop_worker(graceful=False)
         raise RuntimeError("Caption worker did not become ready")
 
@@ -408,7 +440,11 @@ class PipelineClient:
     def _release_after_selection_change(self, used_variant: str) -> None:
         with self._state_lock:
             selected = self._selected_variant
-        if selected is None or selected == str(used_variant):
+            pending = self._release_pending
+        # A selection made before a run is not a request to unload the model the
+        # run just loaded. Only a selection that arrived while that run was busy
+        # may release its resident variant when the run finishes.
+        if not pending or selected is None or selected == str(used_variant):
             with self._state_lock:
                 self._release_pending = False
             return
@@ -452,6 +488,7 @@ class PipelineClient:
     ) -> JobResult:
         """Run a job and synchronously forward every worker event to ``sinks``."""
 
+        self.record_job_variant(spec.model.variant_key)
         sink: ProgressSink = sinks or _NullSink()
         token = cancel or CancelToken()
         if not self.subprocess_mode:
@@ -468,7 +505,15 @@ class PipelineClient:
                     self._idle_unloaded = not local_spec.runtime.keep_model_loaded
                     self._idle_exited = False
                 try:
-                    return run_in_process(local_spec, sink, token)
+                    result = run_in_process(local_spec, sink, token)
+                    with self._state_lock:
+                        self._resident_variant = (
+                            local_spec.model.variant_key
+                            if local_spec.runtime.keep_model_loaded
+                            else None
+                        )
+                        self._idle_released_variant = None
+                    return result
                 finally:
                     with self._state_lock:
                         self._busy = False
@@ -518,14 +563,23 @@ class PipelineClient:
                         event = self._events.get(timeout=0.1)
                     except queue.Empty:
                         if not worker.is_alive():
+                            self._persist_worker_crash(worker)
                             raise RuntimeError(f"Caption worker exited unexpectedly (code {worker.returncode})")
                         continue
                     if event is _EOF:
                         if self._force_requested.is_set() or cancel_sent_at is not None:
                             raise CancelledError("Caption worker exited during cancellation")
+                        self._persist_worker_crash(worker)
                         raise RuntimeError(f"Caption worker exited unexpectedly (code {worker.returncode})")
                     result = self._forward(event, sink)
                     if result is not None:
+                        with self._state_lock:
+                            self._resident_variant = (
+                                worker_spec.model.variant_key
+                                if worker_spec.runtime.keep_model_loaded
+                                else None
+                            )
+                            self._idle_released_variant = None
                         return result
                     if event.get("ev") == "error":
                         message = str(event.get("message", "Worker error"))
@@ -557,6 +611,7 @@ class PipelineClient:
         token = cancel or CancelToken()
         settings = selected.settings
         used_variant = str(settings.get("model_key") or "")
+        self.record_job_variant(used_variant)
         requested_mode = bool(settings.get("subprocess_mode", self.subprocess_mode))
         if requested_mode != self.subprocess_mode:
             self.set_subprocess_mode(requested_mode)
@@ -615,7 +670,11 @@ class PipelineClient:
                     self._idle_unloaded = not keep_loaded
                     self._idle_exited = False
                 try:
-                    return run_chat(selected, publish, token)
+                    response = run_chat(selected, publish, token)
+                    with self._state_lock:
+                        self._resident_variant = used_variant if keep_loaded else None
+                        self._idle_released_variant = None
+                    return response
                 finally:
                     with self._state_lock:
                         self._busy = False
@@ -657,17 +716,22 @@ class PipelineClient:
                         event = self._events.get(timeout=0.1)
                     except queue.Empty:
                         if not worker.is_alive():
+                            self._persist_worker_crash(worker)
                             raise RuntimeError(
                                 f"Chat worker exited unexpectedly (code {worker.returncode})"
                             )
                         continue
                     if event is _EOF:
+                        self._persist_worker_crash(worker)
                         raise RuntimeError(
                             f"Chat worker exited unexpectedly (code {worker.returncode})"
                         )
                     publish(event)
                     kind = str(event.get("ev") or "")
                     if kind == "chat_result":
+                        with self._state_lock:
+                            self._resident_variant = used_variant if keep_loaded else None
+                            self._idle_released_variant = None
                         return ChatResponse.from_dict(event.get("result") or {})
                     if kind == "error":
                         message = str(event.get("message") or "Chat worker error")
@@ -754,6 +818,7 @@ class PipelineClient:
                 if released is not None:
                     with self._state_lock:
                         self._idle_unloaded = True
+                        self._resident_variant = None
                         self._last_activity = time.monotonic()
                 return result
 
@@ -789,6 +854,7 @@ class PipelineClient:
                             if result.get("released") is not None:
                                 with self._state_lock:
                                     self._idle_unloaded = True
+                                    self._resident_variant = None
                                     self._last_activity = time.monotonic()
                             return result
                         if kind == "error":
@@ -818,6 +884,15 @@ class PipelineClient:
                 self._release_pending = True
                 return True
         return False
+
+    def record_job_variant(self, variant_key: str) -> None:
+        """Make the submitted variant authoritative over stale pre-run UI events."""
+
+        selected = str(variant_key)
+        with self._state_lock:
+            self._selected_variant = selected
+            if not self._busy:
+                self._release_pending = False
 
     def select_variant(self, variant_key: str) -> dict[str, Any]:
         """Record a model selection and release any different resident model."""
@@ -850,12 +925,14 @@ class PipelineClient:
             worker.send({"cmd": "unload"})
             with self._state_lock:
                 self._idle_unloaded = True
+                self._resident_variant = None
         elif not busy and not self.subprocess_mode:
             from .runner import unload_cached_model
 
             unload_cached_model()
             with self._state_lock:
                 self._idle_unloaded = True
+                self._resident_variant = None
 
     def ping(self, timeout_s: float = 0.6) -> dict[str, Any]:
         """Report the resident model and its block-swap summary without loading anything.
@@ -924,6 +1001,8 @@ class PipelineClient:
                 idle_for = time.monotonic() - self._last_activity
                 unloaded = self._idle_unloaded
                 exited = self._idle_exited
+                resident_variant = self._resident_variant
+                released_variant = self._idle_released_variant
             if busy or idle_minutes <= 0:
                 continue
             threshold = idle_minutes * 60.0
@@ -936,6 +1015,15 @@ class PipelineClient:
                     unload_cached_model()
                     with self._state_lock:
                         self._idle_unloaded = True
+                        self._resident_variant = None
+                        self._idle_released_variant = resident_variant
+                    if resident_variant:
+                        _relay_app_log(
+                            f"Idle for {idle_minutes:g} min: released {resident_variant} "
+                            "from the in-process cache",
+                            scope="models",
+                        )
+                    released_variant = resident_variant
                 except Exception:
                     pass
                 continue
@@ -944,6 +1032,15 @@ class PipelineClient:
                     worker.send({"cmd": "unload"})
                     with self._state_lock:
                         self._idle_unloaded = True
+                        self._resident_variant = None
+                        self._idle_released_variant = resident_variant
+                    if resident_variant:
+                        _relay_app_log(
+                            f"Idle for {idle_minutes:g} min: released {resident_variant}; "
+                            "the worker remains ready for reuse",
+                            scope="models",
+                        )
+                    released_variant = resident_variant
                 except Exception:
                     pass
             if not exited and idle_for >= threshold * 2.0:
@@ -951,6 +1048,11 @@ class PipelineClient:
                     worker.send({"cmd": "exit"})
                     with self._state_lock:
                         self._idle_exited = True
+                    variant = released_variant or resident_variant or "resident model"
+                    _relay_app_log(
+                        f"Idle for {idle_minutes:g} min: released {variant} and stopped the worker",
+                        scope="models",
+                    )
                 except Exception:
                     worker.kill_tree(grace=0.25)
 

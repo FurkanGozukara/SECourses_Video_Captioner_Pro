@@ -292,6 +292,13 @@ class WorkerProcess:
         with self._lock:
             return self._process.poll() if self._process is not None else None
 
+    @property
+    def pid(self) -> int | None:
+        """Return the spawned process id, if this wrapper has been started."""
+
+        with self._lock:
+            return int(self._process.pid) if self._process is not None else None
+
     def kill_tree(self, grace: float = 2.0) -> None:
         """Stop this worker and all of its descendants."""
 

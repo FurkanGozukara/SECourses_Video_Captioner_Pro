@@ -101,7 +101,87 @@ class AppLog:
             self._revision = 0
             self._files: dict[Path, TextIO] = {}
             self._file_last_messages: dict[Path, str] = {}
+            self._persistence_dir: Path | None = None
+            self._daily_path: Path | None = None
+            self._daily_file: TextIO | None = None
             self._initialized = True
+
+    def configure_persistence(self, directory: str | Path, keep_files: int = 14) -> Path:
+        """Persist every AppLog line to a daily UTF-8 append-only file."""
+
+        target = Path(directory).resolve(strict=False)
+        with self._lock:
+            if target != self._persistence_dir:
+                if self._daily_file is not None:
+                    try:
+                        self._daily_file.close()
+                    except OSError:
+                        pass
+                self._daily_file = None
+                self._daily_path = None
+                self._persistence_dir = target
+            target.mkdir(parents=True, exist_ok=True)
+            files = sorted(
+                (path for path in target.glob("app_????-??-??.log") if path.is_file()),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+            for stale in files[max(1, int(keep_files)) :]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            return self._ensure_daily_file_locked()
+
+    def _ensure_daily_file_locked(self) -> Path:
+        directory = self._persistence_dir
+        if directory is None:
+            from vcap import LOGS_DIR
+
+            directory = Path(LOGS_DIR).resolve(strict=False)
+            self._persistence_dir = directory
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"app_{datetime.now():%Y-%m-%d}.log"
+        if target != self._daily_path or self._daily_file is None:
+            if self._daily_file is not None:
+                try:
+                    self._daily_file.close()
+                except OSError:
+                    pass
+            self._daily_file = target.open("a", encoding="utf-8", newline="\n")
+            self._daily_path = target
+            files = sorted(
+                (path for path in directory.glob("app_????-??-??.log") if path.is_file()),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+            for stale in files[14:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        return target
+
+    @property
+    def current_log_path(self) -> Path:
+        with self._lock:
+            return self._ensure_daily_file_locked()
+
+    def write_worker_crash(self, pid: int | None, lines: object) -> Path:
+        """Persist a crashed worker's captured merged stderr/stdout tail."""
+
+        with self._lock:
+            daily = self._ensure_daily_file_locked()
+            target = daily.parent / f"worker_{int(pid or 0)}.log"
+            if isinstance(lines, str):
+                text = lines
+            else:
+                try:
+                    text = "\n".join(str(value) for value in lines)  # type: ignore[arg-type]
+                except TypeError:
+                    text = str(lines)
+            target.write_text(text.rstrip() + "\n", encoding="utf-8", newline="\n")
+            return target
 
     @property
     def revision(self) -> int:
@@ -133,6 +213,18 @@ class AppLog:
                 rendered.append(line)
                 if console:
                     console_progress.log(line)
+                try:
+                    self._ensure_daily_file_locked()
+                    assert self._daily_file is not None
+                    self._daily_file.write(line + "\n")
+                    self._daily_file.flush()
+                except (OSError, ValueError):
+                    if self._daily_file is not None:
+                        try:
+                            self._daily_file.close()
+                        except OSError:
+                            pass
+                    self._daily_file = None
                 stale: list[Path] = []
                 for path, handle in self._files.items():
                     persisted_message = line.split("] ", 1)[-1]
