@@ -574,12 +574,11 @@ def build(ctx: "UiContext") -> None:
                 value=report_text, language=None, lines=15, max_lines=22,
                 label="Environment report", buttons=["copy"], interactive=False,
             )
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                copy_report = action_button("Copy environment report", "cyan", size="md")
+            with gr.Row():
+                copy_report = action_button("Copy environment report", "cyan")
                 check_updates = action_button(
                     "🔎 Check for updates",
                     "cobalt",
-                    size="md",
                     elem_id="vc_check_for_updates",
                 )
             update_status = gr.Markdown(
@@ -605,9 +604,9 @@ def build(ctx: "UiContext") -> None:
         with gr.Column(scale=6, min_width=520):
             gr.Markdown("### llama.cpp runtime")
             runtime_status = gr.Markdown(_runtime_report(), elem_classes=["vc-status"])
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                install_runtime = action_button("Install / repair llama.cpp", "emerald", size="md")
-                refresh_runtime = action_button("Refresh", "amber", size="md")
+            with gr.Row():
+                install_runtime = action_button("Install / repair llama.cpp", "emerald")
+                refresh_runtime = action_button("Refresh", "amber")
             runtime_progress = gr.HTML(render_progress_html(0.0, "Ready", "Runtime inspection complete."))
             runtime_log = gr.Textbox(
                 value="", label="llama.cpp install log", lines=8, max_lines=12,
@@ -617,19 +616,19 @@ def build(ctx: "UiContext") -> None:
         with gr.Column(scale=4, min_width=420):
             gr.Markdown("### torch.compile toolchain")
             compile_status = gr.Markdown(_compile_report(), elem_classes=["vc-status"])
-            clear_compile = action_button("Clear compile caches", "orange", size="md")
+            clear_compile = action_button("Clear compile caches", "orange")
             gr.Markdown("### Loaded model & block swap")
             model_health_status = gr.Markdown(
                 _model_health_report(ctx), elem_classes=["vc-status"]
             )
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                refresh_model_health = action_button("Refresh model status", "cyan", size="md")
+            with gr.Row():
+                refresh_model_health = action_button("Refresh model status", "cyan")
                 unload_model = action_button(
-                    "⏏ Unload model", "plum", size="md",
+                    "⏏ Unload model", "plum",
                     elem_id="vc_health_unload_model",
                 )
                 open_logs = action_button(
-                    "📂 Open logs folder", "berry", size="md",
+                    "📂 Open logs folder", "berry",
                     elem_id="vc_open_logs_folder_health",
                 )
 
@@ -658,33 +657,31 @@ def build(ctx: "UiContext") -> None:
             f"{html.escape(str(initial_delete_check.get('message') or 'Delete unavailable.'))}"
             "</span>"
         )
-    with gr.Row(elem_classes=["vc-compact-row"]):
+    with gr.Row():
         variant = gr.Dropdown(
             choices=variant_choices, value=initial_variant_key or None,
             label="Model action", info="Pick a variant to download or verify.", scale=5,
         )
-        download = action_button("📥 Download", "sky", size="md")
-        cancel = action_button("Cancel", "red", size="md")
-        verify = action_button("🔍 Verify", "violet", size="md")
+        download = action_button("📥 Download", "sky")
+        cancel = action_button("Cancel", "red")
+        verify = action_button("🔍 Verify", "violet")
         delete_model = action_button(
             "🗑 Delete model files",
             "olive",
-            size="md",
             elem_id="vc_health_delete_model_files",
             interactive=initial_delete_check.get("state") == "confirm",
         )
-        open_models = action_button("Open models folder", "teal", size="md")
+        open_models = action_button("Open models folder", "teal")
     delete_confirmation_state = gr.State({})
     with gr.Row(
         visible=False,
         elem_id="vc_health_delete_model_confirmation",
-        elem_classes=["vc-confirm-bar", "vc-compact-row"],
+        elem_classes=["vc-confirm-bar"],
     ) as delete_confirmation:
         delete_question = gr.Markdown("Delete the selected model files from disk?")
         delete_yes = action_button(
             "✔ Yes, delete",
             "berry",
-            size="sm",
             scale=0,
             min_width=132,
             variant="stop",
@@ -693,7 +690,6 @@ def build(ctx: "UiContext") -> None:
         delete_keep = action_button(
             "✖ Keep files",
             "slate",
-            size="sm",
             scale=0,
             min_width=124,
             elem_id="vc_health_delete_model_keep",

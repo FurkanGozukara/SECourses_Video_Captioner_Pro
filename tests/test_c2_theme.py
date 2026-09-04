@@ -8,6 +8,7 @@ from vcap.ui.theme import (
     HOTKEYS_HEAD,
     THEME_CHANGE_JS,
     TOGGLE_ACCORDIONS_JS,
+    TOGGLE_THEME_JS,
     build_css,
     build_theme,
 )
@@ -57,17 +58,26 @@ def test_open_close_all_accordions_runs_in_the_browser_only() -> None:
     assert "event.key === 'F4'" in HOTKEYS_HEAD
 
 
+def test_header_theme_button_flips_the_mode_and_mirrors_the_settings_radio() -> None:
+    assert "document.body.classList.contains('dark') ? 'light' : 'dark'" in TOGGLE_THEME_JS
+    assert "localStorage.setItem('secourses_theme_mode', mode)" in TOGGLE_THEME_JS
+    assert "window.__secoursesApplyThemeMode(mode)" in TOGGLE_THEME_JS
+    # The new mode is handed back as the radio's value so both controls agree.
+    assert "return [mode];" in TOGGLE_THEME_JS
+
+
 def test_product_css_carries_no_second_light_mode_palette() -> None:
     """Light and dark must come from theme variables, not a duplicated palette.
 
-    The one exception is the action-button border/shadow pair, which needs a
-    lighter drop shadow on a white page than on a dark one.
+    The one exception is the action-button gradient, border, and shadow, which
+    need a lighter drop shadow on a white page than on a dark one.
     """
 
     css = build_css()
     light_overrides = re.findall(r"body:not\(\.dark\)[^{]*\{", css)
     assert light_overrides == [
-        "body:not(.dark) .vc-btn, body:not(.dark) .vc-btn.vc-btn {"
+        "body:not(.dark) button.vc-btn {",
+        "body:not(.dark) button.vc-btn:hover:not(:disabled) {",
     ], light_overrides
 
     # Every other colour resolves through a Gradio theme variable. Literal hex
@@ -87,42 +97,71 @@ def test_product_css_only_styles_markup_the_theme_cannot_reach() -> None:
         ".vc-progress__track",  # app-rendered job progress
         ".vc-meter__fill",  # app-rendered VRAM/RAM meters
         ".vcap-replace-chip",  # app-rendered find/replace chips
-        ".vc-header",  # product header band
-        ".vc-btn",  # multi-hue action buttons
+        ".vc-ok",  # status words
+        ".vc-header",  # header rule
+        ".vc-preset-bar",  # preset strip button alignment
+        ".vc-confirm-bar",  # inline confirmation bar
+        ".vc-mono textarea",  # monospace logs
+        "button.vc-btn",  # multi-hue action buttons
     ):
-        assert selector in css
-    # Chrome the stock theme now provides on its own must not be re-styled.
-    for removed in ("#vc-main-tabs .tab-container", "#vc-input-tabs", ".vc-shell"):
-        assert removed not in css
+        assert selector in css, selector
+    # Chrome the stock theme provides on its own must not be re-styled: page
+    # width, tab bar, block cards, row alignment, media sizing, scrollbars.
+    for removed in (
+        ".gradio-container",
+        "position: sticky",
+        ".vc-card",
+        ".vc-section-title",
+        ".vc-compact-row",
+        ".vc-action-row",
+        ".vc-preview",
+        ".vc-result-panel",
+        ".vc-scroll-result",
+        ".vc-editor-gallery",
+        "scrollbar-width",
+        "@media",
+    ):
+        assert removed not in css, removed
 
 
-def test_sticky_tab_bar_clears_gradio_block_titles() -> None:
+def test_action_buttons_use_the_indextts_recipe() -> None:
+    """Both SECourses apps share one button recipe: one height, weight, glow."""
+
     css = build_css()
-    assert "position: sticky" in css
-    # Block titles sit at z-index 40; dropdown menus use --layer-top.
-    assert "z-index: 60" in css
-    assert "overflow: visible !important" in css
+    button = re.search(r"^button\.vc-btn \{([^}]*)\}", css, re.MULTILINE)
+    assert button is not None
+    body = button.group(1)
+    for declaration in (
+        "min-height: 44px",
+        "padding: var(--size-2) var(--size-4) !important",
+        "font-size: var(--text-md) !important",
+        "font-weight: 650 !important",
+        "border-radius: var(--radius-lg) !important",
+        "linear-gradient(135deg, var(--vc-h1) 0%, var(--vc-h2) 55%, var(--vc-h3) 100%)",
+        "box-shadow: 0 8px 20px rgb(var(--vc-hue) / .30)",
+    ):
+        assert declaration in body, declaration
+    # Buttons keep the uniform height inside rows instead of stretching to the
+    # tallest neighbour, and the preset strip lines them up with its fields.
+    assert ".row > button.vc-btn { align-self: center; }" in css
+    assert ".row.vc-preset-bar > button.vc-btn { align-self: flex-end !important; margin-bottom: 12px; }" in css
+    # Every hue is one custom-property line; the twenty IndexTTS hues use the
+    # same stops as that app.
+    for hue in (
+        "emerald", "green", "lime", "teal", "cyan", "sky", "blue", "indigo", "violet", "purple",
+        "fuchsia", "pink", "rose", "red", "crimson", "orange", "amber", "bronze", "slate", "gray",
+    ):
+        assert f".vc-btn-{hue}{{--vc-h1:" in css, hue
+    assert ".vc-btn-crimson{--vc-h1:#4c0519;--vc-h2:#9f1239;--vc-h3:#fb7185;" in css
+    assert ".vc-btn-bronze{--vc-h1:#5c3a21;--vc-h2:#8b5a2b;--vc-h3:#d4a373;" in css
+    assert ".vc-btn-gold{" in css  # alias of yellow, used by the preset strip
 
 
-def test_every_button_size_shares_the_same_metrics() -> None:
+def test_theme_is_stock_origin_with_offline_fonts() -> None:
     theme = build_theme()
-    assert theme.button_small_text_size == theme.button_medium_text_size == theme.button_large_text_size == "*text_md"
-    assert theme.button_small_padding == theme.button_medium_padding == theme.button_large_padding
-
-
-def test_theme_is_a_stock_gradio_theme_with_offline_fonts() -> None:
-    theme = build_theme()
-    assert isinstance(theme, gr.themes.Ocean)
+    assert isinstance(theme, gr.themes.Origin)
+    # Used exactly as shipped: no design token differs from a fresh Origin.
+    assert theme.to_dict() == gr.themes.Origin().to_dict()
     # Bundled fonts only: a caption box with no internet must still render.
     for stylesheet in theme._stylesheets:
         assert not stylesheet.startswith("http"), stylesheet
-
-
-def test_light_mode_label_and_help_text_meet_contrast() -> None:
-    """Ocean leaves both at neutral_400/500, which is under 3:1 on white."""
-
-    theme = build_theme()
-    assert theme.body_text_color_subdued == "*neutral_600"
-    assert theme.body_text_color_subdued_dark == "*neutral_400"
-    assert theme.block_title_text_color == "*neutral_700"
-    assert theme.block_title_text_color_dark == "*neutral_200"

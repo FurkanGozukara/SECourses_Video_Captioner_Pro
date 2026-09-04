@@ -33,7 +33,8 @@ from vcap.core.presets import PresetStore
 from vcap.core.registry import SettingsRegistry
 from vcap.core.subprocess_runner import CancelToken
 from vcap.pipeline.client import PipelineClient
-from vcap.ui.components import PresetBarHandles, preset_bar, wire_preset_bar
+from vcap.ui.components import PresetBarHandles, action_button, preset_bar, wire_preset_bar
+from vcap.ui.theme import TOGGLE_THEME_JS
 from vcap.ui.tabs import (
     caption_tab,
     chat_tab,
@@ -152,22 +153,22 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(
         title=APP_NAME,
-        fill_width=True,
         delete_cache=(86_400, 86_400),
         analytics_enabled=False,
     ) as demo:
         with gr.Row(elem_classes=["vc-header"]):
-            with gr.Column(scale=7, min_width=420):
-                gr.Markdown(
-                    f"# {APP_NAME}\n"
-                    "Local audiovisual captions, clips, subtitles, and dataset-ready metadata. "
-                    "[Support SECourses on Patreon](https://www.patreon.com/SECourses)."
-                )
-            with gr.Column(scale=3, min_width=300):
-                gr.HTML(
-                    f"<div class='vc-header-meta'><strong>Version {html.escape(VERSION)}</strong><br>"
-                    f"{_gpu_summary()}</div>"
-                )
+            gr.Markdown(
+                f"# {APP_NAME}\n"
+                f"Version {html.escape(VERSION)} · {_gpu_summary()} · "
+                "[Support SECourses on Patreon](https://www.patreon.com/SECourses)"
+            )
+            theme_button = action_button(
+                "🌗 Light / dark theme",
+                "gray",
+                scale=0,
+                min_width=230,
+                elem_id="vc_toggle_theme",
+            )
 
         preset_bar(context)
         with gr.Tabs(selected="caption", elem_id="vc-main-tabs") as main_tabs:
@@ -207,6 +208,18 @@ def build_app() -> gr.Blocks:
             )
 
         theme_component = context.states["theme_component"]
+
+        # Client-side only, like the radio it mirrors: the new mode is written
+        # into the Global Settings radio so the two controls never disagree.
+        theme_button.click(
+            fn=None,
+            inputs=None,
+            outputs=[theme_component],
+            js=TOGGLE_THEME_JS,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
         def restore_theme_mode(mode: str) -> str:
             return mode if mode in {"dark", "light", "system"} else "dark"

@@ -100,13 +100,13 @@ def build(ctx: "UiContext") -> None:
                 in_metadata=False,
                 kind="str",
             )
-            with gr.Row(elem_classes=["vc-compact-row"]):
+            with gr.Row():
                 open_presets = action_button(
-                    "📂 Open presets folder", "jade", size="md",
+                    "📂 Open presets folder", "jade",
                     elem_id="vc_open_presets_folder",
                 )
                 open_logs = action_button(
-                    "📂 Open logs folder", "copper", size="md",
+                    "📂 Open logs folder", "copper",
                     elem_id="vc_open_logs_folder_settings",
                 )
 
@@ -201,15 +201,14 @@ def build(ctx: "UiContext") -> None:
             gr.Markdown(
                 "**Telemetry-free.** Captioning, presets, logs, and model checks stay on this machine. "
                 "Gradio analytics are disabled by the application entry point.",
-                elem_classes=["vc-card"],
-            )
+                    )
 
     gr.Markdown(
         "Outputs apply immediately after saving. Temporary and model directories take effect after restart.",
         elem_classes=["vc-help"],
     )
-    with gr.Row(elem_classes=["vc-compact-row"]):
-        save_global = action_button("💾 Save global settings", "fuchsia", size="lg", scale=2)
+    with gr.Row():
+        save_global = action_button("💾 Save global settings", "fuchsia", scale=2)
         save_status = gr.Markdown(
             "<span class='vc-help'>Global settings have not changed.</span>",
             elem_classes=["vc-status"],

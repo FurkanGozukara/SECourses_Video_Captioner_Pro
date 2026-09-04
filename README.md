@@ -124,11 +124,11 @@ Memory follows the backend: `llama-server` reserves the KV cache for the whole w
 
 ## Interface
 
-The interface uses the stock Gradio 6 **Ocean** theme (blue/cyan on a slate neutral) with only the application's own markup styled on top, so every colour comes from the theme and both modes stay correct from one definition. Fonts are the ones Gradio bundles, so a page load makes no request to Google Fonts and the app renders identically without internet access.
+The interface uses the stock Gradio 6 **Origin** theme exactly as shipped, the same theme as the SECourses IndexTTS app, so every colour, radius, shadow, and font comes from Gradio and the page width follows Gradio's own responsive limits. The application stylesheet covers only what a theme cannot express: the multi-hue action buttons (the same recipe as IndexTTS), the app's own markup (file tiles, progress and VRAM meters, find/replace chips, status words), and the header rule, preset-strip alignment, and confirmation bar. Fonts are the ones Gradio bundles, so a page load makes no request to Google Fonts and the app renders identically without internet access.
 
-Dark is the default. Global Settings offers Dark, Light, and System; the choice is stored in the browser, applies immediately, and System follows live operating-system color changes. Theme choice is intentionally excluded from presets and run metadata.
+Dark is the default. The **🌗 Light / dark theme** button at the top right of the header flips between the two instantly, and Global Settings offers Dark, Light, and System; the choice is stored in the browser, applies immediately, and System follows live operating-system color changes. The two controls always agree. Theme choice is intentionally excluded from presets and run metadata.
 
-The main tab bar sticks to the top of the window, so any tab is one click away from anywhere on a long page. **Open / Close All** in the preset bar expands or collapses every section of the tab you are looking at, including sections nested inside others; it runs entirely in the browser and never touches the server. **⟲ Load Last Values**, immediately to its left, applies the preset this machine used last.
+**Open / Close All** in the preset bar expands or collapses every section of the tab you are looking at, including sections nested inside others; it runs entirely in the browser and never touches the server. **⟲ Load Last Values**, immediately to its left, applies the preset this machine used last.
 
 ## Keyboard Shortcuts
 

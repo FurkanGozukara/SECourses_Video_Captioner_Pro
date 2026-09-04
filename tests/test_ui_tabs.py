@@ -215,5 +215,20 @@ def test_build_app_with_all_tabs_smoke() -> None:
     try:
         assert demo.vcap_context.states["editor_state"] is not None
         assert len(demo.vcap_context.registry.keys()) > 60
+        # The header theme button is a browser-only toggle that writes the
+        # new mode into the Global Settings radio.
+        config = demo.get_config_file()
+        button = next(
+            item for item in config["components"]
+            if item.get("props", {}).get("elem_id") == "vc_toggle_theme"
+        )
+        assert button["props"]["value"] == "🌗 Light / dark theme"
+        toggle = next(
+            item for item in config["dependencies"]
+            if any(target[0] == button["id"] for target in item["targets"])
+        )
+        assert toggle["backend_fn"] is False
+        assert toggle["outputs"] == [demo.vcap_context.states["theme_component"]._id]
+        assert "secourses_theme_mode" in toggle["js"]
     finally:
         demo.vcap_context.pipeline.shutdown()

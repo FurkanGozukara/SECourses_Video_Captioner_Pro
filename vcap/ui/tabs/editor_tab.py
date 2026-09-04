@@ -1085,21 +1085,21 @@ def build(ctx: "UiContext") -> None:
     registry = ctx.settings_registry
     model_entry = next((entry for entry in registry.entries() if entry.key == "model_key"), None)
 
-    with gr.Row(elem_classes=["vc-compact-row"]):
+    with gr.Row():
         folder = gr.Textbox(
             value=str(ctx.outputs_dir), label="Caption folder",
             info="Scan media/caption sidecars or SECourses run directories.", scale=7,
         )
-        scan = action_button("Scan", "cyan", size="md", scale=1, min_width=92)
-        open_folder = action_button("📂 Open folder", "amber", size="md", scale=1, min_width=118)
-        reveal_selected = action_button("📍 Reveal file", "crimson", size="md", scale=1, min_width=124)
+        scan = action_button("Scan", "cyan", scale=1, min_width=92)
+        open_folder = action_button("📂 Open folder", "amber", scale=1, min_width=118)
+        reveal_selected = action_button("📍 Reveal file", "crimson", scale=1, min_width=124)
         recursive = gr.Checkbox(
             value=False, label="Recursive",
             info="Include nested batch folders and run clip directories.", scale=1,
         )
 
     with gr.Accordion("Filters", open=False):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             search = gr.Textbox(label="Contains", info="Search file paths and caption text.", scale=4)
             search_regex = gr.Checkbox(label="Regex", value=False, info="Interpret Contains as a regular expression.")
             flag_filter = gr.Dropdown(
@@ -1116,7 +1116,7 @@ def build(ctx: "UiContext") -> None:
                 ],
                 value="all", label="Status", info="Show empty or failed captions only.",
             )
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             min_length = gr.Number(label="Min chars", precision=0, minimum=0, info="Minimum caption length; 0 = no limit.")
             max_length = gr.Number(label="Max chars", precision=0, minimum=0, info="Maximum caption length; 0 = no limit.")
             min_tokens = gr.Number(label="Min tokens", precision=0, minimum=0, info="Minimum approximate token count; 0 = no limit.")
@@ -1129,7 +1129,7 @@ def build(ctx: "UiContext") -> None:
                 info="Warn and filter captions that may exceed the trainer text encoder limit.",
                 elem_id="vc_editor_token_limit",
             )
-            apply_filters = action_button("Apply filters", "blue", size="md", min_width=126)
+            apply_filters = action_button("Apply filters", "blue", min_width=126)
 
     status = gr.Markdown("Ready to scan.", elem_classes=["vc-status"])
     with gr.Row(equal_height=False):
@@ -1158,13 +1158,12 @@ def build(ctx: "UiContext") -> None:
                 allow_preview=False,
                 visible=False,
                 elem_id="vc_editor_gallery",
-                elem_classes=["vc-editor-gallery"],
             )
             counters = gr.Markdown(_counter_markdown(initial_state))
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                previous_page = action_button("Prev page", "indigo", size="md", scale=1)
+            with gr.Row():
+                previous_page = action_button("Prev page", "indigo", scale=1)
                 page_label = gr.Markdown("**Page 1 / 1** · showing 0 of 0", scale=3)
-                next_page = action_button("Next page", "sky", size="md", scale=1)
+                next_page = action_button("Next page", "sky", scale=1)
                 page_size = gr.Dropdown(
                     choices=[10, 25, 50, 100, 200], value=25, label="Per page",
                     info="Rows shown on each editor page.", scale=1, min_width=105,
@@ -1173,27 +1172,27 @@ def build(ctx: "UiContext") -> None:
         with gr.Column(scale=5, min_width=480):
             preview_placeholder = gr.Markdown(
                 "No preview selected.",
-                elem_classes=["vc-status", "vc-preview-placeholder"],
+                elem_classes=["vc-status"],
             )
-            video = gr.Video(label="Video preview", visible=False, interactive=False, elem_classes=["vc-preview"])
-            audio = gr.Audio(label="Audio preview", visible=False, interactive=False, elem_classes=["vc-preview"])
-            image = gr.Image(label="Image preview", visible=False, interactive=False, type="filepath", elem_classes=["vc-preview"])
+            video = gr.Video(label="Video preview", visible=False, interactive=False, height=390)
+            audio = gr.Audio(label="Audio preview", visible=False, interactive=False)
+            image = gr.Image(label="Image preview", visible=False, interactive=False, type="filepath", height=390)
             caption = gr.Textbox(
                 label="Caption", lines=12, max_lines=18, buttons=["copy"],
                 info="Edits are saved after a short pause when autosave is enabled.",
             )
             stats = gr.Markdown(_stats_markdown(None))
-            with gr.Row(elem_classes=["vc-compact-row"]):
+            with gr.Row():
                 autosave = gr.Checkbox(
                     value=True, label="Autosave on edit",
                     info="Atomically save after 0.7 seconds without another edit.", scale=2,
                 )
-                save = action_button("💾 Save", "green", size="md", scale=1)
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                previous_item = action_button("⬅ Prev", "violet", size="md", scale=1)
-                next_item = action_button("➡ Next", "slate", size="md", scale=1)
-                approve = action_button("✅ Approve", "emerald", size="md", scale=1)
-                reject = action_button("❌ Reject", "rose", size="md", scale=1)
+                save = action_button("💾 Save", "green", scale=1)
+            with gr.Row():
+                previous_item = action_button("⬅ Prev", "violet", scale=1)
+                next_item = action_button("➡ Next", "slate", scale=1)
+                approve = action_button("✅ Approve", "emerald", scale=1)
+                reject = action_button("❌ Reject", "rose", scale=1)
                 gr.HTML('<span class="vc-help" title="Left/Right: previous/next; Ctrl+S: save; Ctrl+Enter: approve; Ctrl+Delete: reject">&#9432;</span>', min_width=24)
 
     # Canonical editor hooks plus aliases consumed by T6's global shortcut map.
@@ -1217,7 +1216,7 @@ def build(ctx: "UiContext") -> None:
             default_variant,
             None,
         )
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             regen_variant = gr.Dropdown(
                 choices=variants, value=default_variant, label="Model variant",
                 info="The selected checkpoint replaces only this caption.", scale=3,
@@ -1232,28 +1231,28 @@ def build(ctx: "UiContext") -> None:
             label="User prompt override", lines=4,
             info="Leave blank to use the selected prompt preset unchanged.",
         )
-        with gr.Row(elem_classes=["vc-compact-row"]):
-            regenerate = action_button("Regenerate selected", "fuchsia", size="md", elem_id="vc_editor_regenerate_selected")
+        with gr.Row():
+            regenerate = action_button("Regenerate selected", "fuchsia", elem_id="vc_editor_regenerate_selected")
             regenerate_all = action_button(
-                "Regenerate all in current filter", "navy", size="md",
+                "Regenerate all in current filter", "navy",
                 elem_id="vc_editor_regenerate_all",
             )
-            keep_new = action_button("Keep new", "lime", size="md")
-            revert = action_button("Revert", "red", size="md")
+            keep_new = action_button("Keep new", "lime")
+            revert = action_button("Revert", "red")
         regenerate_all_targets = gr.State([])
         with gr.Row(
             visible=False,
             elem_id="vc_editor_regenerate_all_confirmation",
-            elem_classes=["vc-confirm-bar", "vc-compact-row"],
+            elem_classes=["vc-confirm-bar"],
         ) as regenerate_all_confirmation:
             regenerate_all_question = gr.Markdown("Regenerate 0 captions?")
             regenerate_all_yes = action_button(
-                "✔ Yes, regenerate", "maroon", size="sm", variant="stop",
+                "✔ Yes, regenerate", "maroon", variant="stop",
                 scale=0, min_width=160,
                 elem_id="vc_editor_regenerate_all_yes",
             )
             regenerate_all_keep = action_button(
-                "✖ Keep current captions", "steel", size="sm",
+                "✖ Keep current captions", "steel",
                 scale=0, min_width=208,
                 elem_id="vc_editor_regenerate_all_keep",
             )
@@ -1375,23 +1374,23 @@ def build(ctx: "UiContext") -> None:
     )
 
     with gr.Accordion("🔎 Find & replace across folder", open=False):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             find_text = gr.Textbox(label="Find", info="Text or regular expression to locate.")
             replace_text = gr.Textbox(label="Replace", info="Replacement text applied by the shared post-processor.")
             replace_scope = gr.Radio(
                 choices=["Filtered items", "All items"], value="Filtered items", label="Scope",
                 info="Choose the current filtered queue or the complete scan.",
             )
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             replace_regex = gr.Checkbox(value=False, label="Regex", info="Treat Find as a regular expression.")
             replace_case = gr.Checkbox(value=False, label="Case sensitive", info="Match letter case exactly.")
             replace_whole = gr.Checkbox(value=False, label="Whole word", info="Exclude matches embedded inside longer words.")
-            preview_replace = action_button("Preview", "purple", size="md")
-            apply_replace = action_button("Apply", "orange", size="md")
+            preview_replace = action_button("Preview", "purple")
+            apply_replace = action_button("Apply", "orange")
         replace_result = gr.HTML("")
 
     with gr.Accordion("➕ Bulk edit", open=False):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             bulk_prefix = gr.Textbox(label="Prefix", info="Text placed before each scoped caption.")
             bulk_suffix = gr.Textbox(label="Suffix", info="Text placed after each scoped caption.")
             bulk_trigger = gr.Textbox(label="Trigger word", info="Optional dataset trigger token.")
@@ -1403,14 +1402,14 @@ def build(ctx: "UiContext") -> None:
                 choices=["Filtered items", "All items"], value="Filtered items", label="Scope",
                 info="Apply changes to the visible queue or every scanned item.",
             )
-        with gr.Row(elem_classes=["vc-compact-row"]):
-            bulk_apply = action_button("Apply bulk edit", "teal", size="md")
-            strip_whitespace = action_button("Strip edges", "yellow", size="md")
-            collapse_newlines = action_button("Collapse newlines", "bronze", size="md")
+        with gr.Row():
+            bulk_apply = action_button("Apply bulk edit", "teal")
+            strip_whitespace = action_button("Strip edges", "yellow")
+            collapse_newlines = action_button("Collapse newlines", "bronze")
         bulk_result = gr.Markdown("", elem_classes=["vc-status"])
 
     with gr.Accordion("📤 Export approved", open=False):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             export_destination = gr.Textbox(
                 value=str(ctx.outputs_dir / "approved_dataset"), label="Destination",
                 info="Approved media/caption pairs are copied here without deleting sources.", scale=5,
@@ -1431,7 +1430,7 @@ def build(ctx: "UiContext") -> None:
                 info="Write a ZIP archive next to the exported folder.",
                 elem_id="vc_editor_export_zip",
             )
-            export_button = action_button("Export approved only", "pink", size="md")
+            export_button = action_button("Export approved only", "pink")
         export_result = gr.Markdown("", elem_classes=["vc-status"])
 
     with gr.Accordion(
@@ -1439,7 +1438,7 @@ def build(ctx: "UiContext") -> None:
         elem_id="vc_editor_statistics_accordion",
     ):
         compute_statistics = action_button(
-            "📊 Compute statistics", "olive", size="md",
+            "📊 Compute statistics", "olive",
             elem_id="vc_editor_compute_statistics",
         )
         statistics_output = gr.Markdown(

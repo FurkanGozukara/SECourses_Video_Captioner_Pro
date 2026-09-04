@@ -232,7 +232,6 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 "buttons": ["copy", "copy_all"],
                 "feedback_options": None,
                 "placeholder": "Start a conversation with the selected model.",
-                "elem_classes": ["vc-chatbot"],
             }
             if "type" in inspect.signature(gr.Chatbot).parameters:
                 chatbot_kwargs["type"] = "messages"
@@ -256,31 +255,31 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 max_lines=8,
                 autofocus=False,
             )
-            with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
-                send = action_button("➤ Send", "cyan", variant="primary", size="lg", scale=3)
+            with gr.Row():
+                send = action_button("➤ Send", "cyan", variant="primary", scale=3)
                 stop = action_button(
                     "⏹ Stop",
                     "red",
                     variant="stop",
-                    size="lg",
                     scale=2,
                     interactive=False,
                 )
-                clear = action_button("⌫ Clear history", "orange", size="md", scale=2)
-                copy_last = action_button("⧉ Copy last answer", "blue", size="md", scale=2)
-                save = action_button("💾 Save conversation", "green", size="md", scale=2)
+                clear = action_button("⌫ Clear history", "orange", scale=2)
+                copy_last = action_button("⧉ Copy last answer", "blue", scale=2)
+                save = action_button("💾 Save conversation", "green", scale=2)
             status = gr.Markdown("<span class='vc-ok'>Ready.</span>", elem_classes=["vc-status"])
             tokens = gr.Markdown(_tokens_line(), elem_classes=["vc-help"])
         with gr.Column(scale=4, min_width=420):
-            with gr.Group(elem_classes=["vc-card"]):
-                gr.Markdown("### Media", elem_classes=["vc-section-title"])
-                files = gr.File(
-                    file_count="multiple",
-                    file_types=["video", "audio", "image"],
-                    type="filepath",
-                    label="Attachments",
-                    height=112,
-                )
+            with gr.Column():
+                gr.Markdown("### Media")
+                with gr.Group():
+                    files = gr.File(
+                        file_count="multiple",
+                        file_types=["video", "audio", "image"],
+                        type="filepath",
+                        label="Attachments",
+                        height=112,
+                    )
                 path = gr.Textbox(
                     label="Media path",
                     placeholder="Paste a local path; use one path per line",
@@ -349,7 +348,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                     in_preset=True,
                     in_metadata=False,
                 )
-                with gr.Row(elem_classes=["vc-compact-row"]):
+                with gr.Row():
                     top_p = gr.Slider(
                         0.0,
                         1.0,
@@ -433,7 +432,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                     in_preset=True,
                     in_metadata=False,
                 )
-                with gr.Row(elem_classes=["vc-compact-row"]):
+                with gr.Row():
                     seed = gr.Number(
                         value=-1,
                         minimum=-1,

@@ -1406,7 +1406,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 media = media_input_block(ctx)
 
                 with gr.Accordion("Trim range", open=False):
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         trim_start = gr.Number(
                             value=0.0,
                             minimum=0.0,
@@ -1436,8 +1436,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         elem_classes=["vc-help"],
                     )
 
-                with gr.Group(elem_classes=["vc-card", "vc-result-panel"]):
-                    gr.Markdown("### Result", elem_classes=["vc-section-title"])
+                with gr.Column():
+                    gr.Markdown("### Result")
                     caption = gr.Textbox(
                         label="Caption",
                         lines=14,
@@ -1480,33 +1480,30 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 buttons=["download", "fullscreen"],
                             )
 
-                with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
-                    start = action_button("▶ Start Captioning", "emerald", variant="primary", size="lg", scale=3)
+                with gr.Row():
+                    start = action_button("▶ Start Captioning", "emerald", variant="primary", scale=3)
                     cancel = action_button(
                         "⏹ Cancel",
                         "red",
                         variant="stop",
-                        size="lg",
                         scale=2,
                         elem_id="vc_caption_cancel",
                         interactive=False,
                     )
-                    open_output = action_button("📂 Open Output", "teal", size="md", scale=2)
-                    open_caption = action_button("📝 Open Last Caption", "violet", size="md", scale=2)
-                    reveal_clip = action_button("🎬 Reveal Clip", "amber", size="md", scale=2)
+                    open_output = action_button("📂 Open Output", "teal", scale=2)
+                    open_caption = action_button("📝 Open Last Caption", "violet", scale=2)
+                    reveal_clip = action_button("🎬 Reveal Clip", "amber", scale=2)
                     open_editor = action_button(
                         "✏️ Open in Caption Editor",
                         "cobalt",
-                        size="md",
                         scale=2,
                         elem_id="vc_open_caption_editor",
                         interactive=False,
                     )
-                with gr.Row(elem_classes=["vc-action-row", "vc-compact-row"]):
+                with gr.Row():
                     copy_caption = action_button(
                         "⧉ Copy caption",
                         "blue",
-                        size="md",
                         scale=2,
                         elem_id="vc_copy_caption",
                         interactive=False,
@@ -1514,7 +1511,6 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     retry_failed = action_button(
                         "🔁 Retry failed",
                         "yellow",
-                        size="md",
                         scale=2,
                         elem_id="vc_retry_failed",
                         interactive=False,
@@ -1522,7 +1518,6 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     results_zip = action_button(
                         "⬇ Results ZIP",
                         "fuchsia",
-                        size="md",
                         scale=2,
                         elem_id="vc_results_zip",
                         interactive=False,
@@ -1537,14 +1532,13 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 with gr.Row(
                     visible=False,
                     elem_id="vc_caption_cancel_confirmation",
-                    elem_classes=["vc-confirm-bar", "vc-compact-row"],
+                    elem_classes=["vc-confirm-bar"],
                 ) as cancel_confirmation:
                     gr.Markdown("⚠ Cancel the running job?")
                     cancel_yes = action_button(
                         "✔ Yes, cancel",
                         "maroon",
                         variant="stop",
-                        size="sm",
                         scale=0,
                         min_width=132,
                         elem_id="vc_caption_cancel_yes",
@@ -1552,7 +1546,6 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     cancel_keep = action_button(
                         "✖ Keep running",
                         "steel",
-                        size="sm",
                         scale=0,
                         min_width=148,
                         elem_id="vc_caption_cancel_keep",
@@ -1584,31 +1577,27 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "Newest caption, batch, and chat runs discovered below the Outputs directory.",
                         elem_classes=["vc-help"],
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         run_history_refresh = action_button(
                             "🔄 Refresh",
                             "pink",
-                            size="md",
                             elem_id="vc_run_history_refresh",
                         )
                         run_history_open = action_button(
                             "📂 Open folder",
                             "bronze",
-                            size="md",
                             elem_id="vc_run_history_open_folder",
                             interactive=False,
                         )
                         run_history_editor = action_button(
                             "✏️ Open in editor",
                             "mint",
-                            size="md",
                             elem_id="vc_run_history_open_editor",
                             interactive=False,
                         )
                         run_history_recover = action_button(
                             "🔁 Recover settings",
                             "coral",
-                            size="md",
                             elem_id="vc_run_history_recover",
                             interactive=False,
                         )
@@ -1655,7 +1644,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         description="Show model variants that exceed the active VRAM tier.", kind="bool",
                     )
                     quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
                         vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
                         vram_preset = gr.Dropdown(
@@ -1681,7 +1670,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     vram_note = gr.Markdown(
                         f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         gpu_picker = gr.Dropdown(
                             choices=gpu_choices,
                             value=gpu_default,
@@ -1716,7 +1705,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         description="Physical GPU indices used for data-parallel folder batch workers.",
                         choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         keep_loaded = gr.Checkbox(
                             value=True,
                             label="Keep model loaded",
@@ -1786,7 +1775,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         maximum=0.95,
                     )
                     with gr.Accordion("Block swap & offload plan", open=True):
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             block_swap_auto = gr.Checkbox(
                                 value=True,
                                 label="Automatic block swap",
@@ -1816,7 +1805,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             _initial_block_swap_note(ctx, _INITIAL_VARIANT, gpu_default, detected_tier),
                             elem_classes=["vc-status"],
                         )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             vram_reserve_gb = gr.Number(
                                 value=2.0,
                                 minimum=0,
@@ -1865,7 +1854,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 minimum=0,
                                 maximum=8192,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             offload_experts = gr.Checkbox(
                                 value=False,
                                 label="Offload MoE experts",
@@ -1898,7 +1887,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description=_CONTROL_INFO["pinned_ram_budget_gb"],
                                 kind="float", minimum=0, maximum=1024,
                             )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         compile_enabled = gr.Checkbox(
                             value=False,
                             label="torch.compile",
@@ -1925,7 +1914,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         visible=False,
                         elem_id="vc_gguf_options",
                     ) as gguf_options:
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_max_frames = gr.Number(
                                 value=32, minimum=1, maximum=128, step=1, precision=0,
                                 label="GGUF maximum frames",
@@ -1957,7 +1946,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="JPEG quality of frames sent to llama-server.",
                                 kind="int", minimum=50, maximum=100,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_threads = gr.Number(
                                 value=0, minimum=0, maximum=256, step=1, precision=0,
                                 label="CPU threads",
@@ -1982,7 +1971,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="llama.cpp flash attention (-fa).",
                                 kind="str", choices=["auto", "on", "off"],
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_batch_size = gr.Number(
                                 value=2048, minimum=64, maximum=8192, step=64, precision=0,
                                 label="Logical batch size",
@@ -2007,7 +1996,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="Physical micro-batch size (-ub); lower values reduce VRAM during prefill.",
                                 kind="int", minimum=32, maximum=4096,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_cache_reuse = gr.Number(
                                 value=0, minimum=0, maximum=4096, step=1, precision=0,
                                 label="Prompt cache reuse",
@@ -2037,7 +2026,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 ),
                                 kind="bool",
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_min_p = gr.Slider(
                                 minimum=0.0,
                                 maximum=1.0,
@@ -2078,7 +2067,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="Number of previous tokens considered by the llama.cpp repetition penalty.",
                                 kind="int", minimum=0, maximum=4096,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_presence_penalty = gr.Slider(
                                 minimum=-2.0,
                                 maximum=2.0,
@@ -2109,7 +2098,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="llama.cpp frequency penalty scaled by how often a token appeared.",
                                 kind="float", minimum=-2.0, maximum=2.0,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             gguf_fit_headroom_mib = gr.Number(
                                 value=1536,
                                 minimum=0,
@@ -2180,12 +2169,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         )
                     compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
                     compile_probe_timer = gr.Timer(1.0)
-                    with gr.Row(elem_classes=["vc-compact-row"]):
-                        download = action_button("📥 Download / Verify model", "sky", size="md", scale=3)
-                        refresh_ready = action_button("↻ Refresh", "lime", size="md", scale=1)
-                        clear_compile = action_button("⌫ Clear compile caches", "rose", size="md", scale=2)
+                    with gr.Row():
+                        download = action_button("📥 Download / Verify model", "sky", scale=3)
+                        refresh_ready = action_button("↻ Refresh", "lime", scale=1)
+                        clear_compile = action_button("⌫ Clear compile caches", "rose", scale=2, min_width=200)
                         unload_model = action_button(
-                            "⏏ Unload model", "navy", size="md", scale=2,
+                            "⏏ Unload model", "navy", scale=2,
                             elem_id="vc_unload_model",
                         )
                     ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
@@ -2227,7 +2216,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "user_prompt", user_prompt, initial_user, section="prompt",
                         description="Rendered or custom user instruction.", kind="str",
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         my_prompts = gr.Dropdown(
                             choices=initial_prompt_names,
                             value=None,
@@ -2263,15 +2252,15 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             in_preset=False,
                             in_metadata=False,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         save_prompt = action_button(
-                            "💾 Save prompt", "green", size="md", elem_id="vc_save_prompt"
+                            "💾 Save prompt", "green", elem_id="vc_save_prompt"
                         )
                         load_prompt = action_button(
-                            "📥 Load prompt", "jade", size="md", elem_id="vc_load_prompt"
+                            "📥 Load prompt", "jade", elem_id="vc_load_prompt"
                         )
                         delete_prompt = action_button(
-                            "🗑 Delete prompt", "crimson", size="md", elem_id="vc_delete_prompt"
+                            "🗑 Delete prompt", "crimson", elem_id="vc_delete_prompt"
                         )
                     prompt_library_status = gr.Markdown(
                         "<span class='vc-help'>Personal prompt library ready.</span>",
@@ -2288,7 +2277,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "trigger_word", trigger_word, "ohwx", section="prompt",
                             description="Concept trigger token used by templates and post-processing.", kind="str",
                         )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             language = gr.Textbox(value="English", label="Caption language", info="Requested caption language.")
                             controls["language"] = ctx.reg(
                                 "language", language, "English", section="prompt",
@@ -2304,7 +2293,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 "target_language", target_language, "English", section="prompt",
                                 description="Target language for translation tasks.", kind="str",
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             caption_length = gr.Dropdown(
                                 choices=["short", "medium", "detailed", "very detailed"],
                                 value="detailed",
@@ -2341,7 +2330,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "extra_instructions", extra_instructions, "", section="prompt",
                             description="Additional task instructions inserted into prompt templates.", kind="str",
                         )
-                    reset_prompts = action_button("↺ Reset prompts to preset", "purple", size="md")
+                    reset_prompts = action_button("↺ Reset prompts to preset", "purple")
 
                 schema = {item.name: item for item in initial_spec.param_schema}
                 with gr.Accordion("3. Generation", open=True):
@@ -2353,7 +2342,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "temperature", temperature, float(schema["temperature"].default), section="generation",
                         description=schema["temperature"].description, kind="float", minimum=0, maximum=2,
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         top_p = gr.Slider(0, 1, value=float(schema["top_p"].default), step=0.01, label="Top-p", info=schema["top_p"].description)
                         controls["top_p"] = ctx.reg(
                             "top_p", top_p, float(schema["top_p"].default), section="generation",
@@ -2422,7 +2411,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         ),
                         kind="int", minimum=1024, maximum=_GLOBAL_MAX_CONTEXT,
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         do_sample = gr.Checkbox(
                             value=bool(schema["do_sample"].default),
                             label="Sample tokens",
@@ -2489,7 +2478,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=380):
                 with gr.Accordion("4. Preprocessing", open=True):
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         fps = gr.Number(
                             value=initial_spec.limits.default_fps,
                             minimum=0.25,
@@ -2515,7 +2504,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "max_frames", max_frames, initial_spec.limits.max_frames or 768, section="preprocessing",
                             description="Maximum decoded frames supplied to the processor; zero disables visual frames for audio workflows.", kind="int", minimum=0, maximum=_GLOBAL_MAX_FRAMES,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         resolution_preset = gr.Dropdown(
                             choices=[
                                 ("TimeChat default · 297,920", "297920"),
@@ -2626,7 +2615,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         kind="float", minimum=0.1, maximum=50.0,
                     )
                     preview_sampled_frames = action_button(
-                        "🖼 Preview sampled frames", "aqua", size="md",
+                        "🖼 Preview sampled frames", "aqua",
                         elem_id="vc_preview_sampled_frames",
                     )
                     sampled_frame_status = gr.Markdown(
@@ -2644,7 +2633,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         buttons=["fullscreen"],
                         elem_id="vc_sampled_frame_gallery",
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         normalize_clip = gr.Checkbox(
                             value=False,
                             label="Normalize clip",
@@ -2686,7 +2675,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "auto_reject_enabled", auto_reject, False, section="preprocessing",
                             description="Enable clip quality rejection before caption generation.", kind="bool",
                         )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             reject_min_duration = gr.Number(value=0, minimum=0, step=0.1, label="Minimum duration (s)", info="Reject clips shorter than this; zero disables.")
                             controls["reject_min_duration_s"] = ctx.reg(
                                 "reject_min_duration_s", reject_min_duration, 0, section="preprocessing",
@@ -2715,7 +2704,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="Luma level at or below which a pixel counts as black during rejection.",
                                 kind="int", minimum=0, maximum=255,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             reject_static = gr.Number(value=-1, step=0.1, label="Minimum motion score", info="Reject at or below this frame-difference score; -1 disables.")
                             controls["reject_max_static_score"] = ctx.reg(
                                 "reject_max_static_score", reject_static, -1, section="preprocessing",
@@ -2747,7 +2736,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 ),
                                 kind="int", minimum=4, maximum=32,
                             )
-                        with gr.Row(elem_classes=["vc-compact-row"]):
+                        with gr.Row():
                             reject_audio = gr.Checkbox(value=False, label="Require audio", info="Reject video clips without an audio stream.")
                             controls["reject_require_audio"] = ctx.reg(
                                 "reject_require_audio", reject_audio, False, section="preprocessing",
@@ -2778,7 +2767,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     token_budget = gr.Markdown("<span class='vc-help'>Upload media to estimate the live token budget.</span>")
             with gr.Column(scale=1, min_width=380):
                 with gr.Accordion("5. Scene detection & splitting", open=True):
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         scene_enabled = gr.Checkbox(
                             value=True,
                             label="Enable scene detection",
@@ -2798,7 +2787,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "segment_mode", segment_mode, "scenes", section="splitting",
                             description="Segmentation planning mode.", choices=["whole", "scenes", "fixed", "trainer"], kind="str",
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         detector = gr.Dropdown(
                             choices=[("Content", "content"), ("Adaptive", "adaptive"), ("Threshold / fades", "threshold")],
                             value="content",
@@ -2814,7 +2803,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "scene_threshold", threshold, 27, section="splitting",
                             description="Scene-change detection sensitivity threshold.", kind="float", minimum=0, maximum=100,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         scene_min = gr.Number(value=2, minimum=0, step=0.1, label="Minimum scene (s)", info="Minimum detector scene duration.")
                         controls["scene_min_len_s"] = ctx.reg(
                             "scene_min_len_s", scene_min, 2, section="splitting",
@@ -2830,7 +2819,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "merge_below_s", merge_below, 2, section="splitting",
                             description="Duration threshold used when merging short scenes.", kind="float", minimum=0,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         merge_short = gr.Checkbox(value=True, label="Merge short scenes", info="Combine detected scenes shorter than the merge threshold.")
                         controls["merge_short_scenes"] = ctx.reg(
                             "merge_short_scenes", merge_short, True, section="splitting",
@@ -2861,7 +2850,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "scene_downscale", downscale, 0, section="splitting",
                             description="Explicit scene-analysis downscale factor; zero is automatic.", kind="int", minimum=0, maximum=16,
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         fixed_chunk = gr.Number(value=30, minimum=0.1, step=0.5, label="Fixed chunk (s)", info="Chunk duration for Fixed mode and custom trainer fallback.")
                         controls["fixed_chunk_s"] = ctx.reg(
                             "fixed_chunk_s", fixed_chunk, 30, section="splitting",
@@ -2877,12 +2866,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "split_mode", split_mode, "copy", section="splitting",
                             description="Physical clip cutting method.", choices=["copy", "precise"], kind="str",
                         )
-                    gr.Markdown("**Re-encode quality**", elem_classes=["vc-section-title"])
+                    gr.Markdown("**Re-encode quality**")
                     gr.Markdown(
                         "Used for Precise re-encode splits and Normalize clip.",
                         elem_classes=["vc-help"],
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         encode_codec = gr.Dropdown(
                             choices=["libx264", "h264_nvenc", "libx265", "hevc_nvenc"],
                             value="libx264",
@@ -2938,7 +2927,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             description="AAC bitrate for re-encoded clip audio.",
                             kind="str", choices=["96k", "128k", "192k", "256k", "320k"],
                         )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         max_clip = gr.Number(value=120, minimum=0, step=1, label="Model limit override (s)", info="Zero uses the selected model's computed duration ceiling.")
                         controls["max_clip_duration_s"] = ctx.reg(
                             "max_clip_duration_s", max_clip, 120, section="splitting",
@@ -2969,7 +2958,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "save_clips", save_clips, False, section="output",
                         description="Persist materialized split clips in the output dataset.", kind="bool",
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         context_carry_over = gr.Checkbox(
                             value=False,
                             label="Carry previous chunk context",
@@ -3037,7 +3026,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         f"Model-limit auto-split ceiling: **{initial_model_limit:.1f} s** at the current FPS, pixel, audio, and output-token budget.",
                         elem_classes=["vc-help"],
                     )
-                    detect_now = action_button("◫ Detect scenes now (preview)", "indigo", size="md")
+                    detect_now = action_button("◫ Detect scenes now (preview)", "indigo")
                     scene_status = gr.Markdown("<span class='vc-help'>Preview uses the first selected video.</span>")
                     scene_table = gr.Dataframe(
                         headers=["#", "Start", "End", "Duration", "Warning"],
@@ -3051,7 +3040,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
             with gr.Column(scale=1, min_width=380):
                 with gr.Accordion("6. Post-processing", open=True):
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         caption_prefix = gr.Textbox(value="", label="Prefix", info="Text prepended to the final model caption.")
                         controls["caption_prefix"] = ctx.reg(
                             "caption_prefix", caption_prefix, "", section="postprocessing",
@@ -3095,7 +3084,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "collapse_whitespace", collapse, False, section="postprocessing",
                         description="Collapse model-caption whitespace before adding prefix and suffix.", kind="bool",
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         dedupe_repeated_sentences = gr.Checkbox(
                             value=True,
                             label="Remove repeated sentences",
@@ -3161,7 +3150,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "output_formats", formats, ["txt", "json"], section="output",
                         description="Caption and dataset file formats written for every item.",
                     )
-                    with gr.Row(elem_classes=["vc-compact-row"]):
+                    with gr.Row():
                         subtitle_min_cue_s = gr.Number(
                             value=0.5,
                             minimum=0.0,

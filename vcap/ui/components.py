@@ -97,53 +97,50 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
     # The shipped default, never the last-used marker: a launch always starts
     # from the same configuration, and Load last values restores the other one.
     initial = ctx.preset_store.default_startup_name()
-    # A column, not a row: the status line reads better on its own full-width
-    # line than squeezed into the last flex slot of a seven-control strip.
-    with gr.Column(elem_classes=["vc-preset-bar"]):
-        with gr.Row(elem_classes=["vc-compact-row"]):
-            dropdown = gr.Dropdown(
-                choices=choices,
-                value=initial,
-                label="Universal preset",
-                info="Selecting a preset applies it immediately. Defaults are marked with a star and are read-only.",
-                scale=4,
-                min_width=260,
-            )
-            save_as = gr.Textbox(
-                label="Save as",
-                placeholder="My caption workflow",
-                info="Name for a new or existing user preset.",
-                scale=3,
-                min_width=220,
-            )
-            save = action_button("💾 Save", "green", size="md", scale=1, min_width=92)
-            load = action_button("📥 Load", "blue", size="md", scale=1, min_width=92)
-            delete = action_button("🗑️ Delete", "rose", size="md", scale=1, min_width=96)
-            reset = action_button("↺ Reset", "gold", size="md", scale=1, min_width=92)
-            load_last = action_button(
-                "⟲ Load Last Values",
-                "teal",
-                size="md",
-                scale=2,
-                min_width=186,
-                elem_id="vc_load_last_values",
-            )
-            toggle_accordions = action_button(
-                "⇕ Open / Close All",
-                "indigo",
-                size="md",
-                scale=2,
-                min_width=168,
-                elem_id="vc_toggle_accordions",
-            )
-        status = gr.Markdown(
-            "<span class='vc-ok'>Ready.</span>",
-            elem_classes=["vc-status"],
+    # The status line sits under the strip on its own full-width line rather
+    # than squeezed into the last flex slot of an eight-control row.
+    with gr.Row(elem_classes=["vc-preset-bar"]):
+        dropdown = gr.Dropdown(
+            choices=choices,
+            value=initial,
+            label="Universal preset",
+            info="Selecting a preset applies it immediately. Defaults are marked with a star and are read-only.",
+            scale=4,
+            min_width=260,
         )
+        save_as = gr.Textbox(
+            label="Save as",
+            placeholder="My caption workflow",
+            info="Name for a new or existing user preset.",
+            scale=3,
+            min_width=220,
+        )
+        save = action_button("💾 Save", "green", scale=1, min_width=92)
+        load = action_button("📥 Load", "blue", scale=1, min_width=92)
+        delete = action_button("🗑️ Delete", "rose", scale=1, min_width=96)
+        reset = action_button("↺ Reset", "gold", scale=1, min_width=92)
+        load_last = action_button(
+            "⟲ Load Last Values",
+            "teal",
+            scale=2,
+            min_width=186,
+            elem_id="vc_load_last_values",
+        )
+        toggle_accordions = action_button(
+            "⇕ Open / Close All",
+            "indigo",
+            scale=2,
+            min_width=168,
+            elem_id="vc_toggle_accordions",
+        )
+    status = gr.Markdown(
+        "<span class='vc-ok'>Ready.</span>",
+        elem_classes=["vc-status"],
+    )
     with gr.Row(
         visible=False,
         elem_id="vc_preset_delete_confirmation",
-        elem_classes=["vc-confirm-bar", "vc-compact-row"],
+        elem_classes=["vc-confirm-bar"],
     ) as delete_confirmation:
         delete_question = gr.Markdown("Delete the selected user preset?")
         # scale=0 sizes each button to its label so the question keeps the
@@ -151,7 +148,6 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
         delete_yes = action_button(
             "✔ Yes, delete",
             "red",
-            size="sm",
             scale=0,
             min_width=132,
             variant="stop",
@@ -160,7 +156,6 @@ def preset_bar(ctx: "UiContext") -> PresetBarHandles:
         delete_keep = action_button(
             "✖ Keep preset",
             "slate",
-            size="sm",
             scale=0,
             min_width=140,
             elem_id="vc_preset_delete_keep",
@@ -845,17 +840,20 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         input_duration=duration_state,
     )
 
-    with gr.Group(elem_classes=["vc-card"]):
-        gr.Markdown("### Input", elem_classes=["vc-section-title"])
+    with gr.Column():
+        gr.Markdown("### Input")
         with gr.Tabs(selected="upload", elem_id="vc-input-tabs") as input_tabs:
             with gr.Tab("📤 Upload files", id="upload") as upload_tab:
-                files = gr.File(
-                    file_count="multiple",
-                    file_types=["video", "audio", "image", ".txt"],
-                    type="filepath",
-                    label="Files",
-                    height=118,
-                )
+                # Inside a group Gradio draws the drop zone with its bold dashed
+                # outline, the same look as the reference-voice field in IndexTTS.
+                with gr.Group():
+                    files = gr.File(
+                        file_count="multiple",
+                        file_types=["video", "audio", "image", ".txt"],
+                        type="filepath",
+                        label="Files",
+                        height=118,
+                    )
                 ctx.reg(
                     "input_files",
                     files,
@@ -894,12 +892,13 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     in_preset=False,
                     kind="str",
                 )
-                zip_upload = gr.File(
-                    label="…or upload a ZIP archive of media",
-                    file_types=[".zip"],
-                    type="filepath",
-                    elem_id="vc_batch_zip_upload",
-                )
+                with gr.Group():
+                    zip_upload = gr.File(
+                        label="…or upload a ZIP archive of media",
+                        file_types=[".zip"],
+                        type="filepath",
+                        elem_id="vc_batch_zip_upload",
+                    )
                 gr.Markdown(
                     "The archive is extracted safely below Outputs/uploaded_batches, then scanned with "
                     "the folder options below.",
@@ -919,7 +918,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     in_preset=False,
                     kind="str",
                 )
-                with gr.Row(elem_classes=["vc-compact-row"]):
+                with gr.Row():
                     include_kinds = gr.CheckboxGroup(
                         choices=[
                             ("Video", "video"),
@@ -964,7 +963,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                         ),
                         kind="str",
                     )
-                with gr.Row(elem_classes=["vc-compact-row"]):
+                with gr.Row():
                     recursive = gr.Checkbox(
                         value=False,
                         label="Scan subfolders",
@@ -1008,7 +1007,7 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                         kind="int",
                         minimum=0,
                     )
-                    rescan = action_button("↻ Rescan", "cyan", size="md")
+                    rescan = action_button("↻ Rescan", "cyan")
                 scan_summary = gr.Markdown(
                     "<span class='vc-help'>Choose a folder for a light extension scan.</span>",
                     elem_classes=["vc-status"],
@@ -1022,7 +1021,6 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                 visible=False,
                 height=390,
                 buttons=["download"],
-                elem_classes=["vc-preview"],
             )
             audio = gr.Audio(
                 label="Audio preview and trim",
@@ -1032,21 +1030,20 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                 editable=True,
                 visible=False,
                 buttons=["download"],
-                elem_classes=["vc-preview"],
             )
             image = gr.Image(
                 label="Image preview",
                 type="filepath",
                 interactive=True,
                 visible=False,
+                height=390,
                 buttons=["download", "fullscreen"],
-                elem_classes=["vc-preview"],
             )
         info = gr.Markdown(
             "<span class='vc-help'>Choose a file to see its media details.</span>",
             elem_classes=["vc-status"],
         )
-        gallery = gr.HTML(_input_gallery([]), elem_classes=["vc-scroll-result"])
+        gallery = gr.HTML(_input_gallery([]))
 
     preview_outputs = [video, audio, image, info, gallery, modality_state, duration_state]
 
@@ -1384,12 +1381,12 @@ def log_panel(ctx: "UiContext") -> LogPanelHandles:
     """Build revision-polled live logs and a Torch-free resource meter."""
 
     initial_lines, initial_revision = ctx.app_log.tail_snapshot(300)
-    with gr.Group(elem_classes=["vc-card"]):
-        with gr.Row(elem_classes=["vc-compact-row"]):
-            gr.Markdown("### Live log", elem_classes=["vc-section-title"])
+    with gr.Column():
+        with gr.Row():
+            gr.Markdown("### Live log")
             # scale=0 keeps the button at its label width instead of taking the
             # half of the row that Gradio's default flex share would hand it.
-            clear = action_button("⌫ Clear", "orange", size="md", scale=0, min_width=112)
+            clear = action_button("⌫ Clear", "orange", scale=0, min_width=112)
         log = gr.Textbox(
             value=newest_first("\n".join(initial_lines)),
             label="Application log (newest first)",
@@ -1471,9 +1468,9 @@ def progress_panel(ctx: "UiContext") -> ProgressPanelHandles:
     """Build stable progress, status, ETA, and throughput outputs."""
 
     del ctx
-    with gr.Group(elem_classes=["vc-card"]):
+    with gr.Column():
         bars = gr.HTML(render_progress_html(0.0, "Ready", "Waiting for a caption job."))
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             status = gr.Markdown("**Status:** Ready", scale=5)
             eta = gr.Markdown("**ETA:** —", scale=2)
             tokens = gr.Markdown("**Speed:** — · **Context:** —", scale=2)
@@ -1502,7 +1499,7 @@ def replace_words_editor() -> ReplaceWordsHandles:
         elem_classes=["vc-mono"],
     )
     chips = gr.HTML(replace_pairs_to_html_chips([]))
-    with gr.Row(elem_classes=["vc-compact-row"]):
+    with gr.Row():
         case_insensitive = gr.Checkbox(
             value=True,
             label="Ignore case",

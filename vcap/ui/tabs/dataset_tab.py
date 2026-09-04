@@ -264,7 +264,7 @@ def build(ctx: "UiContext") -> None:
     initial_suggestion, initial_target_seconds = trainer_clip_suggestion("wan", 16.0, 81)
 
     with gr.Accordion("Clip fitness checker", open=True):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             fitness_folder = gr.Textbox(
                 value=str(ctx.outputs_dir), label="Source folder",
                 info="Video clips are scanned recursively for trainer compatibility.", scale=5,
@@ -286,7 +286,7 @@ def build(ctx: "UiContext") -> None:
                 info="Minimum frame count used only by the Custom target.", visible=False,
             )
         fitness_suggestion = gr.Markdown(initial_suggestion, elem_classes=["vc-status"])
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             plan_output_dir = gr.Textbox(
                 value=str(ctx.outputs_dir / "clip_fitness"),
                 label="Plan output directory",
@@ -302,8 +302,8 @@ def build(ctx: "UiContext") -> None:
                 value="keep_ar", label="Resize policy",
                 info="Choose aspect-preserving resize, padding, crop, or area matching.",
             )
-            analyze = action_button("Analyze", "blue", size="md")
-            write_plan = action_button("Write plan JSON", "amber", size="md")
+            analyze = action_button("Analyze", "blue")
+            write_plan = action_button("Write plan JSON", "amber")
         fitness_table = gr.Dataframe(
             value=[], headers=_FITNESS_HEADERS,
             datatype=["str", "number", "number", "number", "str", "str"],
@@ -314,7 +314,7 @@ def build(ctx: "UiContext") -> None:
         fitness_summary = gr.Markdown("No clips analyzed.", elem_classes=["vc-status"])
 
     with gr.Accordion("Kohya / Musubi TOML generator", open=True):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             dataset_root = gr.Textbox(
                 value=str(ctx.outputs_dir), label="Dataset root",
                 info="Root or parent of direct-media dataset folders.", scale=5,
@@ -331,13 +331,13 @@ def build(ctx: "UiContext") -> None:
                 value=1, minimum=1, precision=0, label="Repeats",
                 info="Default repeats unless the folder has an N_name prefix.",
             )
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             resolution_w = gr.Number(value=1280, minimum=16, precision=0, label="Width", info="Training resolution width.")
             resolution_h = gr.Number(value=720, minimum=16, precision=0, label="Height", info="Training resolution height.")
             batch_size = gr.Number(value=1, minimum=1, precision=0, label="Batch size", info="Dataset batch size in the TOML.")
             enable_bucket = gr.Checkbox(value=True, label="Enable bucket", info="Enable Musubi aspect-ratio buckets.")
             no_upscale = gr.Checkbox(value=False, label="No upscale", info="Prevent smaller media from being enlarged.")
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             target_frames = gr.Textbox(value="81", label="Target frames", info="Comma-separated video frame buckets.")
             frame_extraction = gr.Dropdown(
                 choices=["head", "chunk", "slide", "uniform", "full"], value="head",
@@ -347,23 +347,23 @@ def build(ctx: "UiContext") -> None:
             frame_sample = gr.Number(value=1, minimum=1, precision=0, label="Frame sample", info="Sampling interval passed to Musubi.")
             max_frames = gr.Number(value=129, minimum=1, precision=0, label="Max frames", info="Maximum decoded frames per source video.")
             source_fps = gr.Number(value=16.0, minimum=0.01, step=0.01, label="Source FPS", info="Expected source/training frame rate.")
-        with gr.Row(elem_classes=["vc-compact-row"]):
-            wan_defaults = action_button("Wan 81f defaults", "cyan", size="md")
-            ltx_defaults = action_button("LTX 121f 25fps", "violet", size="md")
-            minimax_defaults = action_button("MiniMax H3 124f", "orange", size="md")
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
+            wan_defaults = action_button("Wan 81f defaults", "cyan")
+            ltx_defaults = action_button("LTX 121f 25fps", "violet")
+            minimax_defaults = action_button("MiniMax H3 124f", "orange")
+        with gr.Row():
             toml_output = gr.Textbox(
                 value=str(ctx.outputs_dir / "dataset_config.toml"), label="Output path",
                 info="Destination for the generated UTF-8 TOML.", scale=5,
             )
-            generate_toml = action_button("Generate", "emerald", size="md")
-            open_toml_folder = action_button("Open folder", "teal", size="md")
+            generate_toml = action_button("Generate", "emerald")
+            open_toml_folder = action_button("Open folder", "teal")
         # Gradio 6.26 rejects language="toml"; plain Code preserves formatting.
         toml_code = gr.Code(value="", language=None, lines=18, label="Generated TOML", buttons=["copy", "download"])
         toml_status = gr.Markdown("", elem_classes=["vc-status"])
 
     with gr.Accordion("Sub-split tool", open=False):
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             split_folder = gr.Textbox(
                 value=str(ctx.outputs_dir), label="Video folder",
                 info="Videos are scanned recursively and written into separate clip folders.", scale=5,
@@ -372,7 +372,7 @@ def build(ctx: "UiContext") -> None:
                 value=str(ctx.outputs_dir / "sub_split"), label="Output root",
                 info="Each source uses a collision-safe <stem> directory.", scale=5,
             )
-        with gr.Row(elem_classes=["vc-compact-row"]):
+        with gr.Row():
             target_seconds = gr.Number(
                 value=initial_target_seconds, minimum=0.1, step=0.1, label="Target seconds",
                 info="Maximum duration of each fixed-length segment.",
@@ -386,7 +386,7 @@ def build(ctx: "UiContext") -> None:
                 value="copy", label="Cut mode",
                 info="Stream copy falls back to precise encoding when timing is inexact.",
             )
-            run_split = action_button("Run sub-split", "rose", size="md")
+            run_split = action_button("Run sub-split", "rose")
         split_progress = gr.HTML(render_progress_html(0.0, "Ready", "Waiting for a video folder."))
         split_log = gr.Textbox(
             value="", label="Sub-split log", lines=10, max_lines=14,

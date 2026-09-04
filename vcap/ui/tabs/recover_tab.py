@@ -295,9 +295,10 @@ def build(ctx: "UiContext") -> None:
     choices, newest = refresh_recent_run_choices(ctx.outputs_dir)
     with gr.Row(equal_height=False):
         with gr.Column(scale=4, min_width=360):
-            metadata_file = gr.File(
-                label="Metadata file", file_types=[".json"], type="filepath",
-            )
+            with gr.Group():
+                metadata_file = gr.File(
+                    label="Metadata file", file_types=[".json"], type="filepath",
+                )
             metadata_path = gr.Textbox(
                 value=newest or "", label="Metadata path",
                 info="Enter metadata.json or a single/batch run folder containing it.",
@@ -306,12 +307,12 @@ def build(ctx: "UiContext") -> None:
                 choices=choices, value=newest,
                 label="Recent run", info="Recent metadata discovered below the outputs directory.",
             )
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                refresh = action_button("Refresh", "blue", size="md")
-                load = action_button("Load", "cyan", size="md")
-            with gr.Row(elem_classes=["vc-compact-row"]):
-                apply_all = action_button("Apply to UI", "emerald", size="md")
-                apply_model_prompt = action_button("Apply model + prompt only", "violet", size="md")
+            with gr.Row():
+                refresh = action_button("Refresh", "blue")
+                load = action_button("Load", "cyan")
+            with gr.Row():
+                apply_all = action_button("Apply to UI", "emerald")
+                apply_model_prompt = action_button("Apply model + prompt only", "violet")
             restore_paths = gr.Checkbox(
                 value=False,
                 label="Also restore input/output paths",

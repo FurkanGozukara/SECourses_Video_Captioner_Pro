@@ -12,6 +12,18 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.4.1",
+        "2026-09-04",
+        """
+### Stock Origin theme and a leaner interface
+
+- The interface now uses the stock Gradio 6 **Origin** theme exactly as shipped, the same theme as the SECourses IndexTTS app: no design token is overridden, and the page width follows Gradio's own responsive limits instead of a custom cap.
+- The application stylesheet shrank to what a theme cannot express: the multi-hue action buttons (now the IndexTTS recipe: 44 px tall, one weight, one glow, vertically centred in their row), the app's own markup (file tiles, progress and VRAM meters, find/replace chips, status words), and the header rule, preset-strip alignment, and confirmation bar.
+- A **🌗 Light / dark theme** button sits at the top right of the header, as in IndexTTS: it flips the theme instantly in the browser and keeps the Global Settings radio in sync.
+- Removed the bordered card boxes around Input, Result, Live log, progress, and Chat media (each is now a heading over native Gradio blocks), the sticky tab bar, the custom scrollbar, the per-row alignment classes, and the per-button size arguments; media previews use the components' own `height`.
+""".strip(),
+    ),
+    (
         "v1.4.0",
         "2026-09-02",
         """
@@ -158,7 +170,6 @@ Built by **SECourses** for local, dataset-focused audiovisual captioning and med
 
 [Support SECourses on Patreon](https://www.patreon.com/SECourses) · [GitHub repository](https://github.com/FurkanGozukara/SECourses_Video_Captioner_Pro)
 """.strip(),
-        elem_classes=["vc-card"],
     )
 
 
