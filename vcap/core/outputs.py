@@ -230,6 +230,50 @@ def _transcription_preview(folder: Path, payload: Mapping[str, Any] | None) -> s
     return ""
 
 
+def _caption_preview(folder: Path, payload: Mapping[str, Any] | None) -> str:
+    """Preview a caption from its run folder or metadata-recorded split path."""
+
+    preview = _history_preview(folder)
+    if preview or not isinstance(payload, Mapping):
+        return preview
+    items = payload.get("items_results")
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        outputs = item.get("outputs")
+        if isinstance(outputs, Mapping):
+            candidates = [
+                outputs.get("merged_caption"),
+                outputs.get("txt"),
+                outputs.get("video_caption"),
+                outputs.get("audio_caption"),
+            ]
+            for raw in candidates:
+                if not raw:
+                    continue
+                path = Path(str(raw))
+                if not path.is_absolute():
+                    path = folder / path
+                try:
+                    text = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+                except (OSError, UnicodeError):
+                    text = ""
+                if text:
+                    return text[:160]
+        segments = item.get("segments")
+        if isinstance(segments, list):
+            text = " ".join(
+                str(segment.get("caption") or "").strip()
+                for segment in segments
+                if isinstance(segment, Mapping) and segment.get("caption")
+            ).strip()
+            if text:
+                return text[:160]
+    return ""
+
+
 def list_recent_runs(
     outputs_root: str | os.PathLike[str],
     limit: int = 30,
@@ -287,7 +331,7 @@ def list_recent_runs(
                     if is_regeneration
                     else _transcription_preview(folder, payload)
                     if kind == "transcribe"
-                    else _history_preview(folder)
+                    else _caption_preview(folder, payload)
                 ),
                 metadata_path=(
                     str(data_path.resolve(strict=False)) if data_path is not None else None

@@ -9,6 +9,7 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Use TimeChat for audiovisual video, AVoCaDO for visual or audiovisual video, Qwen3-Omni Instruct or Thinking for video, audio, images, and text, and the prompt-free Qwen3-Omni Captioner for one audio file up to 30 seconds.
 - Run single inputs or recursive mixed-media folders through the same pipeline, mirror batch subfolders, skip completed files, continue after per-item failures, and write versioned metadata plus compact batch summaries.
 - Transcribe video or audio with faster-whisper in the dedicated Transcribe tab, stream timestamped segments, export SRT/VTT/TXT/LRC/TSV/JSON, or run Whisper before captioning and inject clip-local speech through `{{TRANSCRIPT}}`.
+- Turn folders of pre-cut clips into ready-to-train datasets with separate `video_caption/` and `audio_caption/` parts plus an optional merged caption beside each clip; reuse existing video captions without loading the main model.
 - Trim media, sample video by target FPS, uniform timestamps, keyframes, or adaptive visual change, detect scenes, enforce model duration limits, sub-split with overlap, and optionally reject short, black, static, blurry, or silent clips.
 - Carry the last 60 words from one generated segment into the next for long AVoCaDO and Qwen3 Instruct/Thinking jobs, while keeping TimeChat and Captioner prompt behavior model-native.
 - Stop generation at the model EOS token and record `finish_reason`, token counts, prefill/decode timing, tokens per second, processing time, and peak VRAM in run results and metadata.
@@ -21,6 +22,22 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Download and verify BF16, INT8 ConvRot, INT4 ConvRot W4A8, and all six Qwen3-Omni GGUF Q4/Q8 variants with resumable progress; GGUF runs through a private `llama-server` that fits itself to device memory, while 63.4 GB Qwen3 BF16 checkpoints run through pinned-RAM block swap on smaller GPUs.
 - Tune every backend value from the interface: seed, repetition guard (`no_repeat_ngram_size` and repeated-sentence removal), maximum caption characters and join separator, subtitle cue minimum and line wrapping, context carry words and wrapper prompt, re-encode codec/CRF/preset/audio bitrate (also used by trimming), rejection thresholds (black luma, silence RMS, analysis frames), adaptive sampling sensitivity, total pixel cap, OOM retries and degrade factor, planner slack and pinned RAM budget, the summary stage token limit, and the full llama.cpp option set (frames, JPEG quality, threads, batch sizes, flash attention, cache reuse, tier-context bypass, min-p, repeat window, presence/frequency penalties, fit headroom, startup/idle timeouts, extra arguments). Every clamp the backend still applies is logged.
 - Work faster after a run: Copy caption, Retry failed items, Results ZIP, Open in Caption Editor, Unload model, and a Run history panel that opens, edits, or recovers the settings of any earlier run. Folder batches accept a ZIP upload (extracted below `outputs/uploaded_batches`) and media-kind/file-name filters; a personal prompt library stores named system/user prompt pairs; System & Models can delete model files (with confirmation and on-disk size) and check for updates; Global Settings adds the logs directory and an FFmpeg path.
+
+## Dataset clip captions (video + audio)
+
+Open **Processing Pipeline > 8. Audio captions & dataset clip layout** to create a video-caption part and an audio-caption part for every input clip. A typical next-to-source batch produces:
+
+```text
+dataset/
+  myVideo.mp4
+  myVideo.txt
+  video_caption/myVideo.txt
+  audio_caption/myVideo.txt
+```
+
+The merged `myVideo.txt` is rendered from a configurable template and can be disabled when separate parts are preferred. Whisper supplies speech as plain text, one segment per line, or clip-local timestamped lines. Qwen3-Omni Captioner supplies a prompt-free sound description; audio longer than its 30-second limit is extracted at 16 kHz mono, captioned in windows of at most 30 seconds, and joined in order. Scene, fixed, and trainer splits use the same layout inside each segment directory, so saved clips are immediately paired with merged captions.
+
+Use **Dataset clips - video + audio captions (Qwen3-Omni + Whisper)** for generated video plus speech captions, **Dataset clips - add Whisper audio captions to existing captions** to append audio information without loading the main caption model, or **Dataset clips - video + sound captions (Qwen3-Omni + Captioner)** for Whisper speech plus sound descriptions. Existing mode first preserves a clean caption in `video_caption/`, which keeps repeated overwrite runs idempotent. See [Dataset clip captions](docs/DATASET_CLIPS.md) for paths, templates, skip rules, and batch examples.
 
 ## Requirements
 

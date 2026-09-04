@@ -24,6 +24,10 @@ import gradio as gr
 from vcap import TEMP_DIR
 from vcap.core.clip_fitness import TRAINER_TARGETS
 from vcap.core.captions_post import to_srt
+from vcap.core.dataset_captions import (
+    DEFAULT_AUDIO_CAPTION_TEMPLATE,
+    DEFAULT_CAPTION_MERGE_TEMPLATE,
+)
 from vcap.core.media import probe_media, read_video_frames
 from vcap.core.paths import normalize_path, open_in_file_manager, reveal_in_file_manager
 from vcap.core.preprocess import (
@@ -235,6 +239,23 @@ def _display(value: object) -> str:
 
 def _variant_choices() -> list[tuple[str, str]]:
     return [(_display(label), key) for label, key in all_variant_choices()]
+
+
+def _audio_captioner_choices() -> list[tuple[str, str]]:
+    """Return Captioner variants with lightweight local download state."""
+
+    choices = [("Auto-match the selected model precision/backend", "auto")]
+    spec = MODEL_SPECS["qwen3_omni_captioner"]
+    for variant in spec.variants:
+        ready, _ = variant_is_ready(variant.key)
+        state = " ✓ downloaded" if ready else ""
+        choices.append(
+            (
+                f"{spec.label} — {variant.label} ({variant_size_gb(variant.key):.1f} GB){state}",
+                variant.key,
+            )
+        )
+    return choices
 
 
 def validate_model_variant(
@@ -759,6 +780,8 @@ def resolve_caption_inputs_at_start(
                 settings.get("batch_limit_items", 0),
                 settings.get("batch_include_kinds"),
                 str(settings.get("batch_name_filter") or ""),
+                save_next_to_source=bool(settings.get("batch_save_next_to_source", False)),
+                include_caption_coverage=True,
             )
             return selected
     return list(dict.fromkeys(str(value) for value in (cached or []) if str(value).strip()))
@@ -1432,6 +1455,7 @@ class CaptionTabHandles:
     srt: gr.Textbox
     reasoning: gr.Textbox
     reasoning_tab: gr.Tab
+    files: gr.File
     clips: gr.Gallery
     last_outputs_state: gr.State
     job_done_hook: gr.HTML
@@ -1477,7 +1501,17 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=5, min_width=500):
-                media = media_input_block(ctx)
+                media = media_input_block(
+                    ctx,
+                    save_next_to_source_key="batch_save_next_to_source",
+                    save_next_to_source_label="Save outputs next to the source files",
+                    save_next_to_source_info=(
+                        "Batch caption files, split-layout folders, transcript sidecars, segment folders, "
+                        "and saved clips are written beside each source. Metadata, run_log.txt, and .work "
+                        "remain in the numbered batch run directory."
+                    ),
+                    include_caption_coverage=True,
+                )
 
                 with gr.Accordion("Trim range", open=False):
                     with gr.Row():
@@ -1541,6 +1575,13 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 buttons=["copy"],
                                 interactive=False,
                                 elem_classes=["vc-mono"],
+                            )
+                        with gr.Tab("Files"):
+                            result_files = gr.File(
+                                label="Caption outputs",
+                                file_count="multiple",
+                                interactive=False,
+                                elem_id="vc_caption_result_files",
                             )
                         with gr.Tab("Clips"):
                             clips = gr.Gallery(
@@ -2343,6 +2384,11 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         elem_id="vc_prompt_library_status",
                     )
                     with gr.Accordion("Template variables", open=False):
+                        gr.Markdown(
+                            "Prompt templates may also use `{{TRANSCRIPT}}`; it is filled with clip-local "
+                            "Whisper speech after the ordinary variables are rendered.",
+                            elem_classes=["vc-help"],
+                        )
                         trigger_word = gr.Textbox(
                             value="ohwx",
                             label="Trigger word",
@@ -3427,6 +3473,197 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         elem_classes=["vc-help"],
                     )
 
+                with gr.Accordion(
+                    "8. Audio captions & dataset clip layout",
+                    open=False,
+                    elem_id="vc_audio_caption_layout",
+                ):
+                    audio_caption_layout_hint = gr.Markdown(
+                        "<span class='vc-help'>Audio captions are off; the current single-caption layout is unchanged.</span>",
+                        elem_classes=["vc-status"],
+                        elem_id="vc_audio_caption_layout_hint",
+                    )
+                    audio_caption_source = gr.Dropdown(
+                        choices=[
+                            ("Off (single caption file, current behaviour)", "none"),
+                            ("Whisper speech transcript", "whisper"),
+                            ("Qwen3-Omni Captioner sound description", "captioner"),
+                            ("Whisper transcript + Captioner description", "both"),
+                        ],
+                        value="none",
+                        label="Audio caption source",
+                        info=(
+                            "Select what produces each clip's audio caption. Any choice except Off writes "
+                            "video_caption/ and audio_caption/ dataset folders."
+                        ),
+                        elem_id="vc_audio_caption_source",
+                    )
+                    controls["audio_caption_source"] = ctx.reg(
+                        "audio_caption_source",
+                        audio_caption_source,
+                        "none",
+                        section="audio_captions",
+                        description="Source used to produce the audio caption for each clip.",
+                        choices=["none", "whisper", "captioner", "both"],
+                        kind="str",
+                    )
+                    video_caption_source = gr.Radio(
+                        choices=[
+                            ("Generate with the selected model", "generate"),
+                            ("Reuse existing caption files (skip the caption model)", "existing"),
+                        ],
+                        value="generate",
+                        label="Video caption source",
+                        info=(
+                            "Existing mode reads a clean caption from video_caption/<name>.txt, then <name>.txt, "
+                            "then beside the source, and never loads the selected main caption model."
+                        ),
+                        interactive=False,
+                        elem_id="vc_video_caption_source",
+                    )
+                    controls["video_caption_source"] = ctx.reg(
+                        "video_caption_source",
+                        video_caption_source,
+                        "generate",
+                        section="audio_captions",
+                        description="Generate video captions or reuse existing caption sidecars without loading the main model.",
+                        choices=["generate", "existing"],
+                        kind="str",
+                    )
+                    audio_caption_model_key = gr.Dropdown(
+                        choices=_audio_captioner_choices(),
+                        value="auto",
+                        label="Sound-caption model",
+                        info=(
+                            "Qwen3-Omni Captioner variant used for sound descriptions. Auto matches the selected "
+                            "main model precision/backend and uses the VRAM tier for 7B BF16 models."
+                        ),
+                        interactive=False,
+                        elem_id="vc_audio_caption_model_key",
+                    )
+                    controls["audio_caption_model_key"] = ctx.reg(
+                        "audio_caption_model_key",
+                        audio_caption_model_key,
+                        "auto",
+                        section="audio_captions",
+                        description="Qwen3-Omni Captioner variant for prompt-free sound descriptions; auto matches the main model.",
+                        choices=[value for _, value in _audio_captioner_choices()],
+                        kind="str",
+                    )
+                    audio_caption_transcript_style = gr.Radio(
+                        choices=[
+                            ("Plain text (one paragraph)", "plain"),
+                            ("One segment per line", "lines"),
+                            ("Timestamped lines [mm:ss.s - mm:ss.s]", "timestamped"),
+                        ],
+                        value="plain",
+                        label="Whisper transcript style",
+                        info="Controls how clip-local Whisper segments are rendered in audio_caption/<name>.txt.",
+                        interactive=False,
+                        elem_id="vc_audio_caption_transcript_style",
+                    )
+                    controls["audio_caption_transcript_style"] = ctx.reg(
+                        "audio_caption_transcript_style",
+                        audio_caption_transcript_style,
+                        "plain",
+                        section="audio_captions",
+                        description="Rendering style for the clip-local Whisper transcript in audio captions.",
+                        choices=["plain", "lines", "timestamped"],
+                        kind="str",
+                    )
+                    audio_caption_template = gr.Textbox(
+                        value=DEFAULT_AUDIO_CAPTION_TEMPLATE,
+                        label="Audio caption template",
+                        info="Tokens: {{TRANSCRIPT}}, {{SOUND_CAPTION}}, {{FILENAME}}. Empty parts collapse cleanly.",
+                        lines=3,
+                        max_lines=4,
+                        interactive=False,
+                        elem_classes=["vc-mono"],
+                        elem_id="vc_audio_caption_template",
+                    )
+                    controls["audio_caption_template"] = ctx.reg(
+                        "audio_caption_template",
+                        audio_caption_template,
+                        DEFAULT_AUDIO_CAPTION_TEMPLATE,
+                        section="audio_captions",
+                        description="Template used to compose each audio_caption text file.",
+                        kind="str",
+                    )
+                    caption_write_merged = gr.Checkbox(
+                        value=True,
+                        label="Write merged caption beside each clip",
+                        info="Write <stem>.txt beside the clip; off leaves only video_caption/ and audio_caption/ parts.",
+                        interactive=False,
+                        elem_id="vc_caption_write_merged",
+                    )
+                    controls["caption_write_merged"] = ctx.reg(
+                        "caption_write_merged",
+                        caption_write_merged,
+                        True,
+                        section="audio_captions",
+                        description="Write a merged caption beside every clip in split-layout runs.",
+                        kind="bool",
+                    )
+                    caption_merge_template = gr.Textbox(
+                        value=DEFAULT_CAPTION_MERGE_TEMPLATE,
+                        label="Merged caption template",
+                        info=(
+                            "Tokens: {{VIDEO_CAPTION}}, {{AUDIO_CAPTION}}, {{TRANSCRIPT}}, "
+                            "{{SOUND_CAPTION}}, {{FILENAME}}."
+                        ),
+                        lines=3,
+                        max_lines=6,
+                        interactive=False,
+                        elem_classes=["vc-mono"],
+                        elem_id="vc_caption_merge_template",
+                    )
+                    controls["caption_merge_template"] = ctx.reg(
+                        "caption_merge_template",
+                        caption_merge_template,
+                        DEFAULT_CAPTION_MERGE_TEMPLATE,
+                        section="audio_captions",
+                        description="Template used to compose merged per-clip captions.",
+                        kind="str",
+                    )
+                    with gr.Row():
+                        audio_caption_empty_policy = gr.Radio(
+                            choices=[
+                                ("Skip the audio caption (merged file = video caption only)", "skip"),
+                                ("Write a placeholder", "placeholder"),
+                            ],
+                            value="skip",
+                            label="Empty-audio policy",
+                            info="Controls output when Whisper and the sound Captioner both return no text.",
+                            interactive=False,
+                            scale=3,
+                            elem_id="vc_audio_caption_empty_policy",
+                        )
+                        controls["audio_caption_empty_policy"] = ctx.reg(
+                            "audio_caption_empty_policy",
+                            audio_caption_empty_policy,
+                            "skip",
+                            section="audio_captions",
+                            description="Skip an empty audio caption or write a placeholder.",
+                            choices=["skip", "placeholder"],
+                            kind="str",
+                        )
+                        audio_caption_empty_text = gr.Textbox(
+                            value="No speech.",
+                            label="Empty-audio placeholder",
+                            info="Text written only when the empty-audio policy is Write a placeholder.",
+                            interactive=False,
+                            scale=2,
+                            elem_id="vc_audio_caption_empty_text",
+                        )
+                        controls["audio_caption_empty_text"] = ctx.reg(
+                            "audio_caption_empty_text",
+                            audio_caption_empty_text,
+                            "No speech.",
+                            section="audio_captions",
+                            description="Placeholder written when an audio caption is empty.",
+                            kind="str",
+                        )
+
     handles = CaptionTabHandles(
         media=media,
         progress=progress,
@@ -3463,6 +3700,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         srt=srt,
         reasoning=reasoning,
         reasoning_tab=reasoning_tab,
+        files=result_files,
         clips=clips,
         last_outputs_state=last_outputs_state,
         job_done_hook=job_done_hook,
@@ -3470,6 +3708,18 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     ctx.caption_handles = handles
 
     # Lightweight local interactions can be wired immediately.
+    last_outputs_state.change(
+        lambda value: [
+            path
+            for path in dict(value or {}).get("files", [])
+            if path and Path(str(path)).is_file()
+        ],
+        inputs=last_outputs_state,
+        outputs=result_files,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
     gpu_picker.change(
         lambda value: int(value or 0),
         inputs=gpu_picker,
@@ -3497,6 +3747,104 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         queue=False,
         show_progress="hidden",
         api_visibility="private",
+    )
+
+    def audio_caption_control_state(
+        source: str,
+        write_merged: bool = True,
+        empty_policy: str = "skip",
+    ) -> tuple[Any, ...]:
+        selected = str(source or "none").casefold()
+        active = selected != "none"
+        uses_captioner = selected in {"captioner", "both"}
+        uses_whisper = selected in {"whisper", "both"}
+        if active:
+            merged = "merged `<name>.txt` next to the clip" if write_merged else "separate parts only"
+            hint = (
+                "<span class='vc-ok'>Per clip: `video_caption/<name>.txt`, "
+                f"`audio_caption/<name>.txt`, {merged}.</span>"
+            )
+        else:
+            hint = "<span class='vc-help'>Audio captions are off; the current single-caption layout is unchanged.</span>"
+        return (
+            gr.update(interactive=active),
+            gr.update(interactive=uses_captioner, choices=_audio_captioner_choices()),
+            gr.update(interactive=uses_whisper),
+            gr.update(interactive=active),
+            gr.update(interactive=active),
+            gr.update(interactive=active and bool(write_merged)),
+            gr.update(interactive=active),
+            gr.update(interactive=active and str(empty_policy) == "placeholder"),
+            hint,
+        )
+
+    audio_caption_state_inputs = [
+        audio_caption_source,
+        caption_write_merged,
+        audio_caption_empty_policy,
+    ]
+    audio_caption_state_outputs = [
+        video_caption_source,
+        audio_caption_model_key,
+        audio_caption_transcript_style,
+        audio_caption_template,
+        caption_write_merged,
+        caption_merge_template,
+        audio_caption_empty_policy,
+        audio_caption_empty_text,
+        audio_caption_layout_hint,
+    ]
+    for event in (
+        audio_caption_source.change,
+        caption_write_merged.change,
+        audio_caption_empty_policy.change,
+    ):
+        event(
+            audio_caption_control_state,
+            inputs=audio_caption_state_inputs,
+            outputs=audio_caption_state_outputs,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    ctx.states["audio_caption_control_handler"] = audio_caption_control_state
+
+    audio_adapters = ctx.states.setdefault("preset_value_adapters", {})
+    audio_adapters["video_caption_source"] = lambda settings: gr.update(
+        value=settings.get("video_caption_source", "generate"),
+        interactive=str(settings.get("audio_caption_source", "none")) != "none",
+    )
+    audio_adapters["audio_caption_model_key"] = lambda settings: gr.update(
+        value=settings.get("audio_caption_model_key", "auto"),
+        choices=_audio_captioner_choices(),
+        interactive=str(settings.get("audio_caption_source", "none")) in {"captioner", "both"},
+    )
+    audio_adapters["audio_caption_transcript_style"] = lambda settings: gr.update(
+        value=settings.get("audio_caption_transcript_style", "plain"),
+        interactive=str(settings.get("audio_caption_source", "none")) in {"whisper", "both"},
+    )
+    for key in (
+        "audio_caption_template",
+        "caption_write_merged",
+        "audio_caption_empty_policy",
+    ):
+        audio_adapters[key] = lambda settings, selected_key=key: gr.update(
+            value=settings.get(selected_key),
+            interactive=str(settings.get("audio_caption_source", "none")) != "none",
+        )
+    audio_adapters["caption_merge_template"] = lambda settings: gr.update(
+        value=settings.get("caption_merge_template", DEFAULT_CAPTION_MERGE_TEMPLATE),
+        interactive=(
+            str(settings.get("audio_caption_source", "none")) != "none"
+            and bool(settings.get("caption_write_merged", True))
+        ),
+    )
+    audio_adapters["audio_caption_empty_text"] = lambda settings: gr.update(
+        value=settings.get("audio_caption_empty_text", "No speech."),
+        interactive=(
+            str(settings.get("audio_caption_source", "none")) != "none"
+            and str(settings.get("audio_caption_empty_policy", "skip")) == "placeholder"
+        ),
     )
     compile_probe_timer.tick(
         _probe_compile_in_child,
@@ -4988,7 +5336,11 @@ def _merge_live_outputs(state: dict[str, Any], data: Mapping[str, Any] | None, s
         changed = True
     if str(status or "").casefold() == "done":
         outputs = payload.get("outputs") or {}
-        caption_path = outputs.get("txt") if isinstance(outputs, Mapping) else None
+        caption_path = (
+            outputs.get("merged_caption") or outputs.get("txt") or outputs.get("video_caption")
+            if isinstance(outputs, Mapping)
+            else None
+        )
         if caption_path and state.get("caption_path") != str(caption_path):
             state["caption_path"] = str(caption_path)
             changed = True
@@ -5001,10 +5353,15 @@ def _merge_live_outputs(state: dict[str, Any], data: Mapping[str, Any] | None, s
 
 def _result_payload(result: JobResult) -> tuple[str, Any, str, str, list[Any], dict[str, Any]]:
     completed = [item for item in result.items if item.status == "done"]
-    if not completed:
-        return "", None, "", "", [], {"run_dir": result.run_dir}
-    item = completed[-1]
-    caption_path = item.outputs.get("txt")
+    displayable = completed or [item for item in result.items if item.outputs]
+    if not displayable:
+        return "", None, "", "", [], {"run_dir": result.run_dir, "files": []}
+    item = displayable[-1]
+    caption_path = (
+        item.outputs.get("merged_caption")
+        or item.outputs.get("txt")
+        or item.outputs.get("video_caption")
+    )
     json_path = item.outputs.get("json")
     srt_path = item.outputs.get("srt")
     reasoning_path = item.outputs.get("reasoning")
@@ -5045,11 +5402,23 @@ def _result_payload(result: JobResult) -> tuple[str, Any, str, str, list[Any], d
                         f"Clip {record.get('index', len(gallery) + 1)} · {float(record.get('start_s', 0)):.2f}–{float(record.get('end_s', 0)):.2f}s",
                     )
                 )
+    output_files: list[str] = []
+    for result_item in result.items:
+        candidates = list(result_item.outputs.values())
+        for record in result_item.segments:
+            record_outputs = record.get("outputs") if isinstance(record, Mapping) else None
+            if isinstance(record_outputs, Mapping):
+                candidates.extend(record_outputs.values())
+        for candidate in candidates:
+            path = str(candidate or "")
+            if path and Path(path).is_file() and path not in output_files:
+                output_files.append(path)
     state = {
         "run_dir": result.run_dir,
         "metadata_path": result.metadata_path,
         "caption_path": caption_path,
         "clip_path": clip_paths[-1] if clip_paths else None,
+        "files": output_files,
     }
     return caption, structured, srt, reasoning, gallery, state
 
@@ -5057,12 +5426,37 @@ def _result_payload(result: JobResult) -> tuple[str, Any, str, str, list[Any], d
 def _result_summary(result: JobResult) -> tuple[str, str, str, str]:
     """Return terminal label, message, status class, and ETA text."""
 
+    part_detail = ""
+    for item in reversed(result.items):
+        parts: list[str] = []
+        for label, raw in (
+            ("video", item.video_caption_path),
+            ("audio", item.audio_caption_path),
+            ("merged", item.merged_caption_path),
+        ):
+            if not raw:
+                continue
+            path = Path(raw)
+            display = f"{path.parent.name}/{path.name}" if label != "merged" else path.name
+            parts.append(f"{label}: {display}")
+        if parts:
+            part_detail = "; files: " + ", ".join(parts)
+            break
     counts = result.counts
     done = int(counts.get("done", 0))
     skipped = int(counts.get("skipped", 0))
     failed = int(counts.get("failed", 0))
     unsupported = int(counts.get("unsupported", 0))
     cancelled = int(counts.get("cancelled", 0))
+    audio_captions = int(counts.get("audio_captions", 0))
+    no_speech = int(counts.get("no_speech", 0))
+    audio_detail = (
+        f", audio captions: {audio_captions}"
+        if "audio_captions" in counts
+        else ""
+    )
+    if no_speech:
+        audio_detail += f", no speech: {no_speech}"
     if cancelled:
         message = (
             f"Cancelled: {cancelled} cancelled, {done} done, {skipped} skipped, "
@@ -5070,6 +5464,7 @@ def _result_summary(result: JobResult) -> tuple[str, str, str, str]:
         )
         if unsupported:
             message += f", {unsupported} unsupported"
+        message += audio_detail + part_detail
         return (
             "Cancelled",
             f"{message} in {result.elapsed:.1f}s",
@@ -5079,6 +5474,7 @@ def _result_summary(result: JobResult) -> tuple[str, str, str, str]:
     message = f"Complete: {done} done, {skipped} skipped, {failed} failed"
     if unsupported:
         message += f", {unsupported} unsupported"
+    message += audio_detail + part_detail
     return (
         "Complete",
         f"{message} in {result.elapsed:.1f}s",
@@ -5194,13 +5590,24 @@ def wire(ctx: "UiContext") -> None:
                 settings["batch_output_folder"] = prior_batch_folder
             if retry_kind == "batch" and retry_state.get("source_root"):
                 settings["batch_input_folder"] = str(retry_state["source_root"])
+            if retry_kind == "batch":
+                settings["batch_save_next_to_source"] = bool(
+                    retry_state.get("batch_save_next_to_source", False)
+                )
         token = CancelToken()
         ctx.activate_cancel(token)
         ctx.states["caption_job_token"] = token
         items: list[InputItem] = [InputItem(path=value) for value in resolved]
         if not items:
             family = variant_to_family(str(settings.get("model_key", _INITIAL_VARIANT)))
-            if retry_state is not None or "text" not in MODEL_SPECS[family].capabilities:
+            if (
+                retry_state is not None
+                or "text" not in MODEL_SPECS[family].capabilities
+                or (
+                    str(settings.get("audio_caption_source", "none")) != "none"
+                    and str(settings.get("video_caption_source", "generate")) == "existing"
+                )
+            ):
                 message = (
                     "No failed items are available to retry."
                     if retry_state is not None
@@ -5292,6 +5699,7 @@ def wire(ctx: "UiContext") -> None:
                 else settings.get("batch_include_kinds")
             ),
             "name_filter": str(settings.get("batch_name_filter") or ""),
+            "save_next_to_source": bool(settings.get("batch_save_next_to_source", False)),
         }
         if output_kind == "batch" and str(settings.get("batch_input_folder") or "").strip():
             output_kwargs["source_root"] = str(normalize_path(settings["batch_input_folder"]))
@@ -5492,6 +5900,9 @@ def wire(ctx: "UiContext") -> None:
             final_caption, structured, srt_text, reasoning_text, gallery, state = _result_payload(result)
             state = {**state, **{key: value for key, value in live_outputs.items() if not state.get(key)}}
             state["editor_dir"] = (
+                str(output.source_root)
+                if output_kind == "batch" and output.save_next_to_source and output.source_root
+                else
                 str(output.batch_output_dir)
                 if output_kind == "batch" and output.batch_output_dir
                 else str(result.run_dir)
@@ -5505,7 +5916,11 @@ def wire(ctx: "UiContext") -> None:
                 str(output.batch_output_dir) if output.batch_output_dir else None
             )
             state["source_root"] = str(output.source_root) if getattr(output, "source_root", None) else None
+            state["batch_save_next_to_source"] = bool(output.save_next_to_source)
             state["archive_source"] = (
+                str(output.source_root)
+                if output_kind == "batch" and output.save_next_to_source and output.source_root
+                else
                 str(output.batch_output_dir)
                 if output_kind == "batch" and output.batch_output_dir
                 else str(result.run_dir)

@@ -397,12 +397,29 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
     # Only Thinking presets spell out the caption-side reasoning switch.
     optional_keys = {"enable_thinking"}
     preset_files = sorted((Path(__file__).parents[1] / "presets_default").glob("*.json"))
-    assert len(preset_files) == 16
+    assert len(preset_files) == 19
 
     whisper_preset_names = {
         "Transcribe - Whisper best quality (large-v1).json",
         "Transcribe - Whisper large-v3 turbo (fast).json",
         "Caption + Whisper transcript (Qwen3-Omni Instruct).json",
+    }
+    dataset_preset_names = {
+        "Dataset clips - video + audio captions (Qwen3-Omni + Whisper).json",
+        "Dataset clips - add Whisper audio captions to existing captions.json",
+        "Dataset clips - video + sound captions (Qwen3-Omni + Captioner).json",
+    }
+    dataset_keys = {
+        "audio_caption_source",
+        "video_caption_source",
+        "audio_caption_model_key",
+        "audio_caption_transcript_style",
+        "audio_caption_template",
+        "caption_write_merged",
+        "caption_merge_template",
+        "audio_caption_empty_policy",
+        "audio_caption_empty_text",
+        "batch_save_next_to_source",
     }
 
     for preset_file in preset_files:
@@ -410,7 +427,10 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
         assert payload["_meta"]["format"] == "secourses_vcap_preset"
         assert payload["_meta"]["version"] == 1
         keys = set(payload["settings"])
-        if preset_file.name in whisper_preset_names:
+        if preset_file.name in dataset_preset_names:
+            assert required_keys | dataset_keys <= keys, preset_file.name
+            assert {"whisper_model", "transcript_enabled", "transcript_formats"} <= keys
+        elif preset_file.name in whisper_preset_names:
             assert required_keys <= keys, preset_file.name
             assert {"whisper_model", "whisper_formats", "transcript_enabled"} <= keys
         else:

@@ -28,6 +28,10 @@ from vcap.core.captions_post import (
     finalize_caption,
     parse_replace_pairs,
 )
+from vcap.core.dataset_captions import (
+    DEFAULT_CAPTION_MERGE_TEMPLATE,
+    render_caption_template,
+)
 from vcap.core.export import export_dataset, read_flags, write_flags
 from vcap.core.media import make_thumbnail, preview_safe_media, probe_media
 from vcap.core.outputs import OutputWriter
@@ -83,6 +87,10 @@ class EditorItem(TypedDict, total=False):
     caption: str
     caption_field: str | None
     caption_formats: list[str]
+    video_caption_path: str | None
+    audio_caption_path: str | None
+    video_caption: str
+    audio_caption: str
     kind: str
     duration: float | None
     chars: int
@@ -137,6 +145,7 @@ def _scan_directories(root: Path, recursive: bool) -> list[Path]:
             child
             for child in root.iterdir()
             if child.is_dir()
+            and child.name.casefold() not in {"video_caption", "audio_caption"}
             and (
                 (_RUN_DIR_RE.match(child.name) and (child / "metadata.json").is_file())
                 or _contains_caption_sidecars(child)
@@ -175,6 +184,15 @@ def _walk_caption_files(root: Path, recursive: bool) -> list[Path]:
                 try:
                     suffix = path.suffix.casefold()
                     if not path.is_file() or path.name.startswith(".") or suffix not in CAPTION_EXTENSIONS:
+                        continue
+                    try:
+                        relative_parts = path.relative_to(root).parts[:-1]
+                    except ValueError:
+                        relative_parts = path.parts[:-1]
+                    if any(
+                        str(part).casefold() in {"video_caption", "audio_caption"}
+                        for part in relative_parts
+                    ):
                         continue
                     if path.name.casefold() in _IGNORED_CAPTION_NAMES:
                         continue
@@ -630,6 +648,12 @@ def _item_from_pair(
         "flag": None,
         "status": status,
     }
+    video_part = caption_path.parent / "video_caption" / f"{caption_path.stem}.txt"
+    audio_part = caption_path.parent / "audio_caption" / f"{caption_path.stem}.txt"
+    item["video_caption_path"] = str(video_part) if video_part.is_file() else None
+    item["audio_caption_path"] = str(audio_part) if audio_part.is_file() else None
+    item["video_caption"] = _read_caption(video_part)[0] if video_part.is_file() else ""
+    item["audio_caption"] = _read_caption(audio_part)[0] if audio_part.is_file() else ""
     key = _flag_key(root, item)
     raw_flag = flags.get(key) if key else None
     if isinstance(raw_flag, Mapping):
@@ -957,6 +981,18 @@ def _selection_payload(
     state["dirty"], state["draft_caption"] = False, None
     token_limit = _state_token_limit(state)
     return video, audio, image, placeholder, str(item.get("caption") or ""), _stats_markdown(item, token_limit)
+
+
+def caption_parts_payload(state: EditorState | Mapping[str, Any] | None) -> tuple[str, str]:
+    """Return the selected item's read-only video and audio caption parts."""
+
+    current = dict(state or {})
+    items = list(current.get("items") or [])
+    selected = current.get("selected_index")
+    if selected is None or not (0 <= int(selected) < len(items)):
+        return "", ""
+    item = items[int(selected)]
+    return str(item.get("video_caption") or ""), str(item.get("audio_caption") or "")
 
 
 def _thumbnail_identity(path: Path) -> str:
@@ -1375,6 +1411,8 @@ def build_editor_regeneration_spec(
         trim_end_s=trim_end,
         segment_mode="whole",
         scene_detect_enabled=False,
+        audio_caption_source="none",
+        video_caption_source="generate",
     )
     override_prompt = str(override or "").strip()
     if override_prompt:
@@ -1402,6 +1440,38 @@ def build_editor_regeneration_spec(
             "continue_on_error": True,
         },
     )
+
+
+def rebuild_caption_parts_after_regeneration(
+    settings: Mapping[str, Any],
+    item: Mapping[str, Any],
+    generated_video_caption: str,
+) -> str:
+    """Update the clean video part and rebuild a merged editor caption."""
+
+    raw_video_path = item.get("video_caption_path")
+    if not raw_video_path:
+        return str(generated_video_caption)
+    video_path = Path(str(raw_video_path))
+    caption_path = Path(str(item["caption_path"]))
+    video_text = str(generated_video_caption).strip()
+    _write_caption(video_path, video_text)
+    raw_audio_path = item.get("audio_caption_path")
+    audio_text = ""
+    if raw_audio_path and Path(str(raw_audio_path)).is_file():
+        audio_text = _read_caption(Path(str(raw_audio_path)))[0]
+    merged = render_caption_template(
+        str(settings.get("caption_merge_template") or DEFAULT_CAPTION_MERGE_TEMPLATE),
+        {
+            "VIDEO_CAPTION": video_text,
+            "AUDIO_CAPTION": audio_text,
+            "TRANSCRIPT": "",
+            "SOUND_CAPTION": "",
+            "FILENAME": caption_path.stem,
+        },
+    )
+    _write_caption(caption_path, merged, item.get("caption_field"))
+    return merged
 
 
 def build(ctx: "UiContext") -> None:
@@ -1512,6 +1582,27 @@ def build(ctx: "UiContext") -> None:
                 label="Caption", lines=12, max_lines=18, buttons=["copy"],
                 info="Edits are saved after a short pause when autosave is enabled.",
             )
+            with gr.Accordion(
+                "Caption parts (read-only)",
+                open=False,
+                elem_id="vc_editor_caption_parts",
+            ):
+                video_caption_part = gr.Textbox(
+                    label="Video caption",
+                    lines=5,
+                    max_lines=10,
+                    interactive=False,
+                    elem_classes=["vc-mono"],
+                    elem_id="vc_editor_video_caption_part",
+                )
+                audio_caption_part = gr.Textbox(
+                    label="Audio caption",
+                    lines=5,
+                    max_lines=10,
+                    interactive=False,
+                    elem_classes=["vc-mono"],
+                    elem_id="vc_editor_audio_caption_part",
+                )
             stats = gr.Markdown(_stats_markdown(None))
             with gr.Row():
                 autosave = gr.Checkbox(
@@ -1535,6 +1626,15 @@ def build(ctx: "UiContext") -> None:
     hk_prev_alias = gr.Button("Editor previous alias", elem_id="hk_prev", visible="hidden")
     hk_next_alias = gr.Button("Editor next alias", elem_id="hk_next", visible="hidden")
     hk_save_alias = gr.Button("Editor save alias", elem_id="hk_save", visible="hidden")
+
+    state.change(
+        caption_parts_payload,
+        inputs=state,
+        outputs=[video_caption_part, audio_caption_part],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
 
     with gr.Accordion("🔁 Regenerate selected", open=False) as regeneration_accordion:
         variants = all_variant_choices()
@@ -2684,6 +2784,17 @@ def build(ctx: "UiContext") -> None:
         except OSError:
             old_raw = None
         old_field = item.get("caption_field")
+        old_video_raw: str | None = None
+        video_part_path = (
+            Path(str(item["video_caption_path"]))
+            if item.get("video_caption_path")
+            else None
+        )
+        if video_part_path is not None:
+            try:
+                old_video_raw = video_part_path.read_text(encoding="utf-8")
+            except OSError:
+                old_video_raw = None
         try:
             settings = registry.values_to_dict(runtime_values)
         except ValueError as exc:
@@ -2732,7 +2843,14 @@ def build(ctx: "UiContext") -> None:
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
             return
         try:
-            new, field = _read_caption(caption_path)
+            generated, field = _read_caption(caption_path)
+            new = rebuild_caption_parts_after_regeneration(settings, item, generated)
+            if video_part_path is not None:
+                item["video_caption"] = generated
+                ctx.app_log.log(
+                    f"Updated {video_part_path} and rebuilt {caption_path.name} with its audio caption.",
+                    scope="editor",
+                )
             item["caption_field"] = field or item.get("caption_field")
             _refresh_item(item, new)
             next_state["dirty"] = False
@@ -2742,6 +2860,8 @@ def build(ctx: "UiContext") -> None:
                 "old": old,
                 "raw": old_raw,
                 "field": old_field,
+                "video_caption_path": str(video_part_path) if video_part_path is not None else None,
+                "video_raw": old_video_raw,
             }
             message = f"Regenerated {caption_path.name}. Review the diff, then keep or revert."
             ctx.app_log.log(message, scope="editor")
@@ -2771,10 +2891,20 @@ def build(ctx: "UiContext") -> None:
                 OutputWriter().write_text(path, str(backup["raw"]))
             else:
                 _write_caption(path, old, backup.get("field"))
+            video_path_value = backup.get("video_caption_path")
+            if video_path_value and backup.get("video_raw") is not None:
+                OutputWriter().write_text(
+                    Path(str(video_path_value)),
+                    str(backup["video_raw"]),
+                )
             for candidate in next_state.get("items") or []:
                 if str(candidate.get("caption_path")) == str(path):
                     _refresh_item(candidate, old)
                     candidate["caption_field"] = backup.get("field")
+                    if video_path_value and Path(str(video_path_value)).is_file():
+                        candidate["video_caption"] = _read_caption(
+                            Path(str(video_path_value))
+                        )[0]
                     break
             selected = next_state.get("selected_index")
             selected_item = next_state["items"][int(selected)] if selected is not None else None
@@ -2886,6 +3016,7 @@ __all__ = [
     "EditorItem",
     "EditorState",
     "build",
+    "caption_parts_payload",
     "editor_export_handler",
     "editor_filter_handler",
     "editor_flag_handler",
@@ -2899,6 +3030,7 @@ __all__ = [
     "paginate_items",
     "pagination_math",
     "preview_find_replace",
+    "rebuild_caption_parts_after_regeneration",
     "regeneration_prompt_choices",
     "resolve_regeneration_prompt_choices",
     "resolve_media_from_metadata",

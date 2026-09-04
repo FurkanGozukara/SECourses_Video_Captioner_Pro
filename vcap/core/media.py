@@ -662,6 +662,7 @@ def extract_audio(
     mono: bool = True,
     start: float | None = None,
     end: float | None = None,
+    cancel_token: object | None = None,
 ) -> Path:
     """Extract PCM WAV audio with optional time bounds."""
 
@@ -690,7 +691,11 @@ def extract_audio(
             str(target),
         ]
     )
-    run_ffmpeg(arguments, total_duration=(float(end) - float(start or 0)) if end is not None else None)
+    run_ffmpeg(
+        arguments,
+        total_duration=(float(end) - float(start or 0)) if end is not None else None,
+        cancel_token=cancel_token,
+    )
     return target
 
 

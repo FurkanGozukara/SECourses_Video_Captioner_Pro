@@ -447,12 +447,19 @@ def write_caption_outputs(
     segments: Iterable[Segment | Sequence[Any]] | None = None,
     reasoning: str | None = None,
     max_line_chars: int = 0,
+    always_include_txt: bool = True,
 ) -> dict[str, Path]:
-    """Write requested caption formats atomically; plain text is always included."""
+    """Write requested caption formats atomically.
+
+    Plain text remains mandatory by default. Split dataset-caption runs disable
+    that one implicit write until the merge phase creates the canonical files.
+    """
 
     requested = [str(value).casefold().lstrip(".") for value in formats]
-    if "txt" not in requested:
+    if always_include_txt and "txt" not in requested:
         requested.insert(0, "txt")
+    if not always_include_txt:
+        requested = [value for value in requested if value != "txt"]
     requested = list(dict.fromkeys(requested))
     writer = OutputWriter()
     paths = writer.caption_output_paths(out_dir, stem, requested)

@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
 from vcap import OUTPUTS_DIR
+from vcap.core.dataset_captions import (
+    DEFAULT_AUDIO_CAPTION_TEMPLATE,
+    DEFAULT_CAPTION_MERGE_TEMPLATE,
+)
 
 
 DEFAULT_SUMMARY_PROMPT = (
@@ -28,6 +32,10 @@ _AUDIO_BITRATES = frozenset({"96k", "128k", "192k", "256k", "320k"})
 _GGUF_FLASH_ATTN = frozenset({"auto", "on", "off"})
 _MEDIA_KINDS = ("video", "audio", "image", "text")
 _TRANSCRIPT_FORMATS = frozenset({"srt", "vtt", "txt", "lrc", "tsv", "json"})
+_AUDIO_CAPTION_SOURCES = frozenset({"none", "whisper", "captioner", "both"})
+_VIDEO_CAPTION_SOURCES = frozenset({"generate", "existing"})
+_AUDIO_TRANSCRIPT_STYLES = frozenset({"plain", "lines", "timestamped"})
+_AUDIO_EMPTY_POLICIES = frozenset({"skip", "placeholder"})
 DEFAULT_TRANSCRIPT_PROMPT_WRAPPER = (
     "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n"
     "{{TRANSCRIPT}}"
@@ -488,6 +496,7 @@ class OutputSpec:
     limit_items: int = 0
     include_kinds: tuple[str, ...] = _MEDIA_KINDS
     name_filter: str = ""
+    save_next_to_source: bool = False
 
     def __post_init__(self) -> None:
         selected = str(self.kind).casefold()
@@ -502,6 +511,11 @@ class OutputSpec:
         object.__setattr__(self, "limit_items", max(0, int(self.limit_items)))
         object.__setattr__(self, "include_kinds", _media_kinds(self.include_kinds))
         object.__setattr__(self, "name_filter", str(self.name_filter or "").strip())
+        object.__setattr__(
+            self,
+            "save_next_to_source",
+            _bool(self.save_next_to_source, False),
+        )
 
 
 @dataclass(frozen=True)
@@ -634,6 +648,70 @@ class TranscriptSpec:
 
 
 @dataclass(frozen=True)
+class AudioCaptionSpec:
+    """Audio-caption source, rendering, and split-layout policy."""
+
+    source: Literal["none", "whisper", "captioner", "both"] = "none"
+    video_source: Literal["generate", "existing"] = "generate"
+    model_key: str = "auto"
+    transcript_style: Literal["plain", "lines", "timestamped"] = "plain"
+    template: str = DEFAULT_AUDIO_CAPTION_TEMPLATE
+    write_merged: bool = True
+    merge_template: str = DEFAULT_CAPTION_MERGE_TEMPLATE
+    empty_policy: Literal["skip", "placeholder"] = "skip"
+    empty_text: str = "No speech."
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", _choice(self.source, _AUDIO_CAPTION_SOURCES, "none"))
+        object.__setattr__(
+            self,
+            "video_source",
+            _choice(self.video_source, _VIDEO_CAPTION_SOURCES, "generate"),
+        )
+        object.__setattr__(self, "model_key", str(self.model_key or "auto"))
+        object.__setattr__(
+            self,
+            "transcript_style",
+            _choice(self.transcript_style, _AUDIO_TRANSCRIPT_STYLES, "plain"),
+        )
+        object.__setattr__(
+            self,
+            "template",
+            DEFAULT_AUDIO_CAPTION_TEMPLATE if self.template is None else str(self.template),
+        )
+        object.__setattr__(self, "write_merged", _bool(self.write_merged, True))
+        object.__setattr__(
+            self,
+            "merge_template",
+            DEFAULT_CAPTION_MERGE_TEMPLATE
+            if self.merge_template is None
+            else str(self.merge_template),
+        )
+        object.__setattr__(
+            self,
+            "empty_policy",
+            _choice(self.empty_policy, _AUDIO_EMPTY_POLICIES, "skip"),
+        )
+        object.__setattr__(
+            self,
+            "empty_text",
+            "No speech." if self.empty_text is None else str(self.empty_text),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.source != "none"
+
+    @property
+    def needs_whisper(self) -> bool:
+        return self.source in {"whisper", "both"}
+
+    @property
+    def needs_captioner(self) -> bool:
+        return self.source in {"captioner", "both"}
+
+
+@dataclass(frozen=True)
 class JobSpec:
     """Complete immutable input to the unified single/batch pipeline."""
 
@@ -647,6 +725,7 @@ class JobSpec:
     post: PostSpec = field(default_factory=PostSpec)
     runtime: RuntimeSpec = field(default_factory=RuntimeSpec)
     transcript: TranscriptSpec = field(default_factory=TranscriptSpec)
+    audio_caption: AudioCaptionSpec = field(default_factory=AudioCaptionSpec)
     context_carry_over: bool = False
     context_carry_words: int = 60
     context_carry_prompt: str = DEFAULT_CONTEXT_CARRY_PROMPT
@@ -1119,6 +1198,14 @@ class JobSpec:
             name_filter=str(
                 _setting(source, "batch_name_filter", default=output.name_filter) or ""
             ).strip(),
+            save_next_to_source=_bool(
+                _setting(
+                    source,
+                    "batch_save_next_to_source",
+                    default=output.save_next_to_source,
+                ),
+                output.save_next_to_source,
+            ),
         )
         gpu_index = max(0, _int(_setting(source, "gpu_index", default=0), 0))
         runtime = RuntimeSpec(
@@ -1248,6 +1335,36 @@ class JobSpec:
             ),
             whisper=whisper_settings,
         )
+        audio_caption = AudioCaptionSpec(
+            source=str(_setting(source, "audio_caption_source", default="none")),  # type: ignore[arg-type]
+            video_source=str(_setting(source, "video_caption_source", default="generate")),  # type: ignore[arg-type]
+            model_key=str(_setting(source, "audio_caption_model_key", default="auto") or "auto"),
+            transcript_style=str(
+                _setting(source, "audio_caption_transcript_style", default="plain")
+            ),  # type: ignore[arg-type]
+            template=(
+                DEFAULT_AUDIO_CAPTION_TEMPLATE
+                if _setting(source, "audio_caption_template", default=None) is None
+                else str(_setting(source, "audio_caption_template"))
+            ),
+            write_merged=_bool(
+                _setting(source, "caption_write_merged", default=True),
+                True,
+            ),
+            merge_template=(
+                DEFAULT_CAPTION_MERGE_TEMPLATE
+                if _setting(source, "caption_merge_template", default=None) is None
+                else str(_setting(source, "caption_merge_template"))
+            ),
+            empty_policy=str(
+                _setting(source, "audio_caption_empty_policy", default="skip")
+            ),  # type: ignore[arg-type]
+            empty_text=(
+                "No speech."
+                if _setting(source, "audio_caption_empty_text", default=None) is None
+                else str(_setting(source, "audio_caption_empty_text"))
+            ),
+        )
         return cls(
             inputs=[item if isinstance(item, InputItem) else InputItem(**item) for item in inputs],
             output=resolved_output,
@@ -1259,6 +1376,7 @@ class JobSpec:
             post=post,
             runtime=runtime,
             transcript=transcript,
+            audio_caption=audio_caption,
             context_carry_over=_bool(_setting(source, "context_carry_over", default=False), False),
             context_carry_words=max(
                 10,
@@ -1313,6 +1431,7 @@ class JobSpec:
         output_data = dict(data.get("output") or {})
         runtime_data = dict(data.get("runtime") or {})
         transcript_data = dict(data.get("transcript") or {})
+        audio_caption_data = dict(data.get("audio_caption") or {})
         return cls(
             inputs=[item if isinstance(item, InputItem) else InputItem(**dict(item)) for item in data.get("inputs", [])],
             output=OutputSpec(**output_data),
@@ -1324,6 +1443,7 @@ class JobSpec:
             post=PostSpec(**post_data),
             runtime=RuntimeSpec(**runtime_data),
             transcript=TranscriptSpec(**transcript_data),
+            audio_caption=AudioCaptionSpec(**audio_caption_data),
             context_carry_over=_bool(data.get("context_carry_over"), False),
             context_carry_words=max(
                 10,
@@ -1368,6 +1488,12 @@ class ItemResult:
     summary_usage: dict[str, Any] = field(default_factory=dict)
     summary_timing: dict[str, Any] = field(default_factory=dict)
     transcript: dict[str, Any] | None = None
+    video_caption_path: str | None = None
+    audio_caption_path: str | None = None
+    merged_caption_path: str | None = None
+    audio_caption_source: str = "none"
+    sound_caption_model: str | None = None
+    audio_windows: int = 0
 
     def __getitem__(self, key: str) -> Any:
         """Allow lightweight mapping-style access in UI table adapters."""
@@ -1375,7 +1501,25 @@ class ItemResult:
         return getattr(self, key)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        data = asdict(self)
+        if (
+            self.audio_caption_source == "none"
+            and self.video_caption_path is None
+            and self.audio_caption_path is None
+            and self.merged_caption_path is None
+            and self.sound_caption_model is None
+            and self.audio_windows == 0
+        ):
+            for key in (
+                "video_caption_path",
+                "audio_caption_path",
+                "merged_caption_path",
+                "audio_caption_source",
+                "sound_caption_model",
+                "audio_windows",
+            ):
+                data.pop(key, None)
+        return _json_safe(data)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ItemResult":
@@ -1414,6 +1558,7 @@ class JobResult:
 
 
 __all__ = [
+    "AudioCaptionSpec",
     "DEFAULT_CONTEXT_CARRY_PROMPT",
     "DEFAULT_SUMMARY_PROMPT",
     "DEFAULT_TRANSCRIPT_PROMPT_WRAPPER",

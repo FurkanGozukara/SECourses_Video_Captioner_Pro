@@ -25,6 +25,13 @@ from vcap.core.captions_post import (
     finalize_caption,
     write_caption_outputs,
 )
+from vcap.core.dataset_captions import (
+    caption_unit_paths,
+    render_caption_template,
+    render_transcript,
+    resolve_captioner_variant,
+    transcript_segments,
+)
 from vcap.core.logs import get_log
 from vcap.core.media import (
     MediaInfo,
@@ -46,13 +53,42 @@ from vcap.core.scene_split import SceneDetectParams, SceneRange, plan_segments, 
 from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, ModelSpec, variant_to_family
 
-from .job import InputItem, ItemResult, JobResult, JobSpec, TranscriptSpec
+from .job import InputItem, ItemResult, JobResult, JobSpec, ModelChoice, TranscriptSpec
 
 
 _TOTAL_STEPS = 8
 _FAKE_LOCK = threading.RLock()
 _FAKE_CAPTIONER: "_FakeCaptioner | None" = None
 _FAKE_VARIANT: str | None = None
+
+
+def _split_layout(spec: JobSpec) -> bool:
+    return bool(spec.audio_caption.enabled)
+
+
+def _needs_whisper(spec: JobSpec) -> bool:
+    return bool(spec.transcript.enabled or spec.audio_caption.needs_whisper)
+
+
+def _captioner_vram_tier(spec: JobSpec) -> float:
+    selected = str(spec.model.vram_preset or "auto").strip().casefold()
+    if selected != "auto":
+        try:
+            return float(selected)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(gpu.resource_snapshot(spec.runtime.gpu_index).get("vram_total_gb", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _sound_captioner_variant(spec: JobSpec) -> str:
+    return resolve_captioner_variant(
+        spec.audio_caption.model_key,
+        spec.model.variant_key,
+        vram_tier=_captioner_vram_tier(spec),
+    )
 
 
 class _NullSink:
@@ -403,7 +439,12 @@ def _record_value(value: Any) -> dict[str, Any]:
         return dict(attributes) if isinstance(attributes, Mapping) else {"value": str(value)}
 
 
-def _status_counts(items: Iterable[ItemResult]) -> dict[str, int]:
+def _status_counts(
+    items: Iterable[ItemResult],
+    *,
+    include_audio: bool = False,
+) -> dict[str, int]:
+    item_list = list(items)
     result = {
         "total": 0,
         "done": 0,
@@ -412,9 +453,24 @@ def _status_counts(items: Iterable[ItemResult]) -> dict[str, int]:
         "unsupported": 0,
         "cancelled": 0,
     }
-    for item in items:
+    audio_paths: set[str] = set()
+    for item in item_list:
         result["total"] += 1
         result[item.status] = result.get(item.status, 0) + 1
+        if item.audio_caption_path:
+            audio_paths.add(str(item.audio_caption_path))
+        for segment in item.segments:
+            outputs = segment.get("outputs") if isinstance(segment, Mapping) else None
+            if isinstance(outputs, Mapping) and outputs.get("audio_caption"):
+                audio_paths.add(str(outputs["audio_caption"]))
+    if include_audio:
+        result["audio_captions"] = len(audio_paths)
+        result["no_speech"] = sum(
+            1
+            for item in item_list
+            for segment in item.segments
+            if isinstance(segment, Mapping) and bool(segment.get("no_speech"))
+        )
     return result
 
 
@@ -564,7 +620,11 @@ def _assign_batch_outputs(spec: JobSpec, resolved: list[_ResolvedInput]) -> Path
         seen[key] = seen.get(key, 0) + 1
         suffix = f"_{seen[key]:04d}" if seen[key] > 1 else ""
         entry.stem = f"{base}{suffix}"
-        entry.out_dir = batch_root / parent
+        entry.out_dir = (
+            entry.path.parent
+            if spec.output.save_next_to_source and entry.path is not None
+            else batch_root / parent
+        )
     return batch_root
 
 
@@ -616,6 +676,26 @@ def _probe_and_classify(spec: JobSpec, resolved: list[_ResolvedInput], model: Mo
                 entry.kind = "unknown"
                 entry.message = f"Unsupported or unreadable input: {entry.info.error or entry.path}"
                 continue
+        if spec.audio_caption.enabled and spec.audio_caption.video_source == "existing":
+            if entry.info is None:
+                entry.status = "unsupported"
+                entry.kind = "text"
+                entry.message = "Existing-caption audio passes require a video or audio file."
+                continue
+            if entry.info.kind not in {"video", "video_no_audio", "audio"}:
+                entry.status = "unsupported"
+                entry.kind = entry.info.kind
+                entry.message = "Existing-caption audio passes support video and audio inputs only."
+                continue
+            entry.kind = "video" if entry.info.has_video else "audio"
+            entry.capability = (
+                "video_audio"
+                if entry.info.has_video and entry.info.has_audio
+                else "video"
+                if entry.info.has_video
+                else "audio"
+            )
+            continue
         capability, kind = _required_capability(entry.info, entry.item, spec, model)
         entry.capability, entry.kind = capability, kind
         if capability == "audio" and kind == "video" and entry.info is not None and not entry.info.has_audio:
@@ -636,10 +716,24 @@ def _apply_batch_skip(spec: JobSpec, resolved: list[_ResolvedInput]) -> None:
     for entry in resolved:
         if entry.status != "pending" or entry.out_dir is None:
             continue
-        target = entry.out_dir / f"{entry.stem}.txt"
-        if target.is_file():
+        paths = caption_unit_paths(entry.out_dir, entry.stem)
+        targets: list[Path]
+        if not _split_layout(spec):
+            targets = [paths.merged]
+        elif spec.audio_caption.video_source == "existing":
+            targets = [paths.audio]
+            has_video_caption = paths.video.is_file() or paths.merged.is_file()
+            if entry.path is not None:
+                has_video_caption = has_video_caption or entry.path.with_suffix(".txt").is_file()
+            if has_video_caption and spec.audio_caption.write_merged:
+                targets.append(paths.merged)
+        elif spec.audio_caption.write_merged:
+            targets = [paths.merged]
+        else:
+            targets = [paths.video, paths.audio]
+        if targets and all(target.is_file() for target in targets):
             entry.status = "skipped"
-            entry.message = f"Caption already exists: {target}"
+            entry.message = f"Caption output already exists: {targets[-1]}"
 
 
 def _apply_batch_limit(spec: JobSpec, resolved: list[_ResolvedInput]) -> None:
@@ -698,7 +792,7 @@ def _metadata_transcript_summary(
     spec: JobSpec,
     items: Sequence[ItemResult],
 ) -> dict[str, Any] | None:
-    if not spec.transcript.enabled:
+    if not _needs_whisper(spec):
         return None
     records: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -780,12 +874,17 @@ def _write_batch_summary(
     items: Sequence[ItemResult],
     elapsed: float,
     limit_items: int = 0,
+    *,
+    include_audio: bool = False,
 ) -> Path:
-    counts = _status_counts(items)
+    counts = _status_counts(items, include_audio=include_audio)
+    count_keys = ["total", "done", "skipped", "failed", "unsupported", "cancelled"]
+    if include_audio:
+        count_keys.extend(["audio_captions", "no_speech"])
     summary = {
         "counts": {
             key: int(counts.get(key, 0))
-            for key in ("total", "done", "skipped", "failed", "unsupported", "cancelled")
+            for key in count_keys
         },
         "limit_items": max(0, int(limit_items)),
         "processing_time_seconds": max(0.0, float(elapsed)),
@@ -845,7 +944,10 @@ def _write_metadata(
     name = str(spec.internal.get("metadata_name") or "metadata.json")
     target = run_dir / sanitize_filename(name)
     builder = MetadataBuilder()
-    metadata_extra = {"counts": _status_counts(items), **dict(extra or {})}
+    metadata_extra = {
+        "counts": _status_counts(items, include_audio=_split_layout(spec)),
+        **dict(extra or {}),
+    }
     transcript_summary = _metadata_transcript_summary(spec, items)
     if transcript_summary is not None:
         metadata_extra.setdefault("transcript", transcript_summary)
@@ -871,7 +973,13 @@ def _write_metadata(
         builder.data.update(explicit_metadata)
     builder.write(target)
     if spec.output.kind == "batch" and target.name.casefold() == "metadata.json":
-        _write_batch_summary(run_dir, items, elapsed, spec.output.limit_items)
+        _write_batch_summary(
+            run_dir,
+            items,
+            elapsed,
+            spec.output.limit_items,
+            include_audio=_split_layout(spec),
+        )
     return target
 
 
@@ -2393,7 +2501,7 @@ def _process_item(
         transcript_result: Any | None = None
         transcript_data: dict[str, Any] | None = None
         transcript_outputs: dict[str, str] = {}
-        if spec.transcript.enabled and entry.kind in {"video", "audio"} and source is not None:
+        if _needs_whisper(spec) and entry.kind in {"video", "audio"} and source is not None:
             try:
                 transcript_result, transcript_data, transcript_outputs = _run_item_transcript(
                     spec,
@@ -2449,6 +2557,12 @@ def _process_item(
                 "end_s": trim_offset + segment.end_s,
                 "media_path": str(segment.path) if segment.path is not None else None,
             }
+            if _split_layout(spec):
+                record.update(
+                    media_start=segment.media_start,
+                    media_end=segment.media_end,
+                    persistent_clip=bool(segment.persistent_clip),
+                )
             if spec.split.auto_reject and segment.path is not None:
                 emitter.progress(
                     entry.tracker_index,
@@ -2605,17 +2719,22 @@ def _process_item(
                 spec,
                 getattr(caption_result, "structured", None),
             )
-            clip_transcript_data = (
-                {
+            if transcript_data is not None:
+                clip_transcript_data: dict[str, Any] | None = {
                     "start_s": trim_offset + segment.start_s,
                     "end_s": trim_offset + segment.end_s,
                     "text": clip_transcript,
                     "word_count": clip_word_count,
                     "injected": transcript_injected,
                 }
-                if transcript_data is not None
-                else None
-            )
+                if _split_layout(spec):
+                    clip_transcript_data["segments"] = transcript_segments(
+                        transcript_result,
+                        segment.start_s,
+                        segment.end_s,
+                    )
+            else:
+                clip_transcript_data = None
             final_structured = _structured_with_transcript(
                 final_structured,
                 clip_transcript_data,
@@ -2662,6 +2781,7 @@ def _process_item(
                     segments=local_cues,
                     reasoning=reasoning,
                     max_line_chars=spec.post.subtitle_max_line_chars,
+                    always_include_txt=not _split_layout(spec),
                 )
             peak = max(peak, float(getattr(caption_result, "peak_vram_gb", 0.0) or 0.0))
             timing = getattr(caption_result, "timing", None)
@@ -2770,12 +2890,19 @@ def _process_item(
             segments=combined_cues,
             reasoning="\n\n".join(combined_reasoning),
             max_line_chars=spec.post.subtitle_max_line_chars,
+            always_include_txt=not _split_layout(spec),
         )
         if summary_path is not None:
             combined_paths["summary"] = summary_path
         combined_paths.update({key: Path(value) for key, value in transcript_outputs.items()})
         elapsed = time.perf_counter() - started
-        emitter.progress(entry.tracker_index, entry.result_index, "Item complete", 1.0, step_index=8)
+        emitter.progress(
+            entry.tracker_index,
+            entry.result_index,
+            "Video caption complete" if _split_layout(spec) else "Item complete",
+            0.86 if _split_layout(spec) else 1.0,
+            step_index=6 if _split_layout(spec) else 8,
+        )
         return ItemResult(
             index=entry.result_index,
             path=str(entry.path or entry.item.path),
@@ -2793,7 +2920,646 @@ def _process_item(
             transcript=transcript_data,
         )
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if not spec.audio_caption.needs_captioner:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _existing_video_caption(
+    spec: JobSpec,
+    entry: _ResolvedInput,
+    emitter: _Emitter,
+) -> tuple[str, Path | None]:
+    """Read or bootstrap the clean video-caption source for existing mode."""
+
+    assert entry.out_dir is not None
+    paths = caption_unit_paths(entry.out_dir, entry.stem)
+    candidates = [paths.video, paths.merged]
+    if entry.path is not None:
+        candidates.append(entry.path.with_suffix(".txt"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        identity = os.path.normcase(str(candidate.resolve(strict=False)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if not candidate.is_file():
+            continue
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+        if candidate != paths.video:
+            OutputWriter().write_text(paths.video, text)
+            emitter.log(
+                f"Copied existing video caption from {candidate} to {paths.video}",
+                scope="dataset_captions",
+            )
+        return text.rstrip("\r\n"), paths.video
+    return "", None
+
+
+def _process_existing_item(
+    spec: JobSpec,
+    entry: _ResolvedInput,
+    run_dir: Path,
+    emitter: _Emitter,
+    cancel: CancelToken,
+) -> ItemResult:
+    """Prepare one unsplit existing-caption unit without loading the main model."""
+
+    started = time.perf_counter()
+    assert entry.out_dir is not None and entry.path is not None and entry.info is not None
+    entry.out_dir.mkdir(parents=True, exist_ok=True)
+    _check_cancel(cancel)
+    transcript_result: Any | None = None
+    transcript_data: dict[str, Any] | None = None
+    transcript_outputs: dict[str, str] = {}
+    if _needs_whisper(spec) and entry.info.kind in {"video", "video_no_audio", "audio"}:
+        try:
+            transcript_result, transcript_data, transcript_outputs = _run_item_transcript(
+                spec,
+                entry,
+                entry.path,
+                run_dir,
+                emitter,
+                cancel,
+            )
+        except CancelledError:
+            raise
+        except Exception as exc:
+            transcript_data = {"error": f"{type(exc).__name__}: {exc}"}
+            emitter.log(
+                f"Transcript failed; continuing without speech text: {type(exc).__name__}: {exc}",
+                level="warning",
+                scope="transcript",
+            )
+    video_caption, video_path = _existing_video_caption(spec, entry, emitter)
+    duration = float(entry.info.duration or 0.0)
+    clip_transcript = render_transcript(
+        transcript_result,
+        "plain",
+        start_s=0.0,
+        end_s=duration or None,
+    )
+    clip_transcript_data = (
+        {
+            "start_s": 0.0,
+            "end_s": duration,
+            "text": clip_transcript,
+            "word_count": len(clip_transcript.split()),
+            "injected": False,
+            "segments": transcript_segments(transcript_result, 0.0, duration or None),
+        }
+        if transcript_data is not None
+        else None
+    )
+    record = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": duration,
+        "media_path": str(entry.path),
+        "media_start": 0.0,
+        "media_end": duration or None,
+        "persistent_clip": False,
+        "status": "done",
+        "caption": video_caption,
+        "structured": _structured_with_transcript(None, transcript_data),
+        "outputs": {},
+        "transcript": clip_transcript_data,
+        "existing_video_missing": video_path is None,
+    }
+    outputs = dict(transcript_outputs)
+    if video_path is not None:
+        outputs["video_caption"] = str(video_path)
+    elapsed = time.perf_counter() - started
+    message = (
+        f"Existing video caption loaded for {entry.path.name}."
+        if video_path is not None
+        else f"No existing video caption for {entry.path.name}; audio caption will be saved separately"
+    )
+    return ItemResult(
+        index=entry.result_index,
+        path=str(entry.path),
+        kind=entry.kind,
+        status="done",
+        message=message,
+        outputs=outputs,
+        segments=[record],
+        elapsed=elapsed,
+        gpu_index=spec.runtime.gpu_index,
+        transcript=transcript_data,
+        video_caption_path=str(video_path) if video_path is not None else None,
+        audio_caption_source=spec.audio_caption.source,
+    )
+
+
+def _finalize_sound_text(spec: JobSpec, text: str) -> str:
+    """Apply caption cleanup without video-caption prefix/suffix/trigger injection."""
+
+    return finalize_caption(
+        text,
+        replace_pairs=spec.post.replace_pairs,
+        replace_opts={
+            "regex": spec.post.replace_regex,
+            "case_insensitive": spec.post.replace_case_insensitive,
+            "whole_words": spec.post.replace_whole_words,
+        },
+        collapse_whitespace=spec.post.collapse_whitespace,
+        trigger_mode="none",
+        max_length=spec.post.max_caption_chars,
+        dedupe_repeated_sentences=spec.post.dedupe_repeated_sentences,
+        join_separator=spec.post.join_separator,
+    )
+
+
+def _caption_sound_windows(
+    spec: JobSpec,
+    session: _ModelSession,
+    media_path: Path,
+    start_s: float | None,
+    end_s: float | None,
+    work_dir: Path,
+    emitter: _Emitter,
+    cancel: CancelToken,
+    *,
+    unit_label: str,
+) -> tuple[str, int]:
+    """Caption one audio timeline in prompt-free windows no longer than 30 seconds."""
+
+    info = probe_media(media_path)
+    if not info.has_audio:
+        emitter.log(f"{unit_label}: no audio track; sound caption is empty", scope="sound_captions")
+        return "", 0
+    duration = float(info.duration or 0.0)
+    begin = max(0.0, float(start_s or 0.0))
+    finish = duration if end_s is None else min(duration or float(end_s), max(begin, float(end_s)))
+    if finish <= begin:
+        emitter.log(f"{unit_label}: empty audio window; sound caption is empty", scope="sound_captions")
+        return "", 0
+    windows: list[tuple[float, float]] = []
+    cursor = begin
+    while cursor < finish - 1e-6:
+        window_end = min(finish, cursor + 30.0)
+        windows.append((cursor, window_end))
+        cursor = window_end
+    emitter.log(
+        f"{unit_label}: {len(windows)} Captioner audio window(s), maximum 30 s each",
+        scope="sound_captions",
+    )
+    from vcap.models.base import Callbacks, MediaInput, PromptSpec as ModelPromptSpec
+
+    captioner = session.ensure()
+    captioner_model = MODEL_SPECS["qwen3_omni_captioner"]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    texts: list[str] = []
+    for index, (window_start, window_end) in enumerate(windows, start=1):
+        _check_cancel(cancel)
+        audio_path = work_dir / f"audio_{index:04d}.wav"
+        extract_audio(
+            media_path,
+            audio_path,
+            sample_rate=16_000,
+            mono=True,
+            start=window_start,
+            end=window_end,
+            cancel_token=cancel,
+        )
+        result = captioner.caption(
+            MediaInput(path=audio_path, kind="audio"),
+            prompt=ModelPromptSpec(),
+            gen=_model_gen(spec),
+            pre=_model_pre(
+                replace(spec, preprocess=replace(spec.preprocess, max_frames=0, use_audio_in_video=False)),
+                captioner_model,
+            ),
+            cb=Callbacks(cancel=cancel),
+        )
+        if isinstance(result, str):
+            value = result
+        else:
+            if getattr(result, "cancelled", False):
+                raise CancelledError("Sound caption generation cancelled")
+            value = str(getattr(result, "text", "") or "")
+        if value.strip():
+            texts.append(value.strip())
+    return _finalize_sound_text(spec, " ".join(texts)), len(windows)
+
+
+def _record_output_location(
+    entry: _ResolvedInput,
+    record: Mapping[str, Any],
+    record_count: int,
+) -> tuple[Path, str] | None:
+    if record_count <= 1 and not bool(record.get("persistent_clip")):
+        return None
+    media_path = Path(str(record.get("media_path") or ""))
+    if bool(record.get("persistent_clip")) and media_path.name:
+        return media_path.parent, media_path.stem
+    assert entry.out_dir is not None
+    return entry.out_dir / f"{entry.stem}_segments", f"clip_{int(record.get('index', 1)):04d}"
+
+
+def _combined_video_caption(records: Sequence[Mapping[str, Any]]) -> str:
+    if len(records) == 1:
+        return str(records[0].get("caption") or "")
+    return "\n\n".join(
+        f"[{_time_label(float(record.get('start_s', 0.0) or 0.0))} - "
+        f"{_time_label(float(record.get('end_s', 0.0) or 0.0))}]\n"
+        f"{str(record.get('caption') or '')}"
+        for record in records
+    )
+
+
+def _combined_sound_caption(records: Sequence[Mapping[str, Any]]) -> str:
+    populated = [record for record in records if str(record.get("sound_caption") or "").strip()]
+    if not populated:
+        return ""
+    if len(records) == 1:
+        return str(populated[0].get("sound_caption") or "").strip()
+    return "\n\n".join(
+        f"[{_time_label(float(record.get('start_s', 0.0) or 0.0))} - "
+        f"{_time_label(float(record.get('end_s', 0.0) or 0.0))}]\n"
+        f"{str(record.get('sound_caption') or '').strip()}"
+        for record in populated
+    )
+
+
+def _caption_parts_structured(
+    structured: Any,
+    *,
+    video_caption: str,
+    audio_caption: str,
+    merged_caption: str,
+) -> dict[str, Any]:
+    if isinstance(structured, Mapping):
+        value = dict(structured)
+    elif isinstance(structured, list):
+        value = {"segments": structured}
+    elif structured is None:
+        value = {}
+    else:
+        value = {"caption": structured}
+    value.update(
+        video_caption=video_caption,
+        audio_caption=audio_caption,
+        merged_caption=merged_caption,
+    )
+    return value
+
+
+def _existing_structured_output(outputs: Mapping[str, str], fallback: Any) -> Any:
+    raw = outputs.get("json")
+    if raw:
+        try:
+            with Path(raw).open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    return fallback
+
+
+def _write_text_caption(path: Path, text: str) -> Path:
+    payload = str(text)
+    return OutputWriter().write_text(
+        path,
+        payload + ("\n" if payload and not payload.endswith("\n") else ""),
+    )
+
+
+def _render_and_write_unit(
+    spec: JobSpec,
+    out_dir: Path,
+    stem: str,
+    filename: str,
+    video_caption: str,
+    transcript_text: str,
+    sound_caption: str,
+    structured: Any,
+    outputs: dict[str, str],
+    emitter: _Emitter,
+    *,
+    allow_merged: bool = True,
+) -> tuple[str, str, bool]:
+    """Render and atomically write one split-layout caption unit."""
+
+    paths = caption_unit_paths(out_dir, stem)
+    if video_caption or allow_merged:
+        outputs["video_caption"] = str(_write_text_caption(paths.video, video_caption))
+    has_audio = bool(transcript_text.strip() or sound_caption.strip())
+    audio_caption = ""
+    no_speech = not has_audio
+    if has_audio:
+        audio_caption = render_caption_template(
+            spec.audio_caption.template,
+            {
+                "TRANSCRIPT": transcript_text,
+                "SOUND_CAPTION": sound_caption,
+                "FILENAME": filename,
+            },
+        )
+    elif spec.audio_caption.empty_policy == "placeholder":
+        audio_caption = spec.audio_caption.empty_text.strip()
+    if audio_caption:
+        outputs["audio_caption"] = str(_write_text_caption(paths.audio, audio_caption))
+    else:
+        outputs.pop("audio_caption", None)
+        if spec.output.overwrite:
+            try:
+                paths.audio.unlink(missing_ok=True)
+            except OSError as exc:
+                emitter.log(f"Could not remove stale audio caption {paths.audio}: {exc}", "warning", "dataset_captions")
+        emitter.log(
+            (
+                f"No speech detected in {filename}; merged caption is the video caption only"
+                if no_speech
+                else f"Audio caption template rendered empty for {filename}; merged caption uses video only"
+            ),
+            scope="dataset_captions",
+        )
+    merged_caption = render_caption_template(
+        spec.audio_caption.merge_template,
+        {
+            "VIDEO_CAPTION": video_caption,
+            "AUDIO_CAPTION": audio_caption,
+            "TRANSCRIPT": transcript_text,
+            "SOUND_CAPTION": sound_caption,
+            "FILENAME": filename,
+        },
+    )
+    if not audio_caption:
+        merged_caption = video_caption
+    if spec.audio_caption.write_merged and allow_merged:
+        outputs["merged_caption"] = str(_write_text_caption(paths.merged, merged_caption))
+        outputs["txt"] = outputs["merged_caption"]
+    else:
+        outputs.pop("merged_caption", None)
+        outputs.pop("txt", None)
+    if "json" in spec.post.formats:
+        json_path = out_dir / f"{sanitize_filename(str(stem) or 'caption')}.json"
+        value = _caption_parts_structured(
+            structured,
+            video_caption=video_caption,
+            audio_caption=audio_caption,
+            merged_caption=merged_caption if allow_merged else "",
+        )
+        outputs["json"] = str(OutputWriter().write_json(json_path, value, pretty=True))
+    return audio_caption, merged_caption, no_speech
+
+
+def _run_sound_caption_phase(
+    spec: JobSpec,
+    resolved: Sequence[_ResolvedInput],
+    results: dict[int, ItemResult],
+    main_session: _ModelSession,
+    emitter: _Emitter,
+    cancel: CancelToken,
+    run_dir: Path,
+) -> tuple[_ModelSession | None, bool]:
+    """Run prompt-free Captioner inference for every completed produced unit."""
+
+    if not spec.audio_caption.needs_captioner:
+        return None, False
+    variant = _sound_captioner_variant(spec)
+    captioner_limit = MODEL_SPECS["qwen3_omni_captioner"].limits.max_new_tokens_cap
+    sound_tokens = min(int(spec.generation.max_new_tokens), int(captioner_limit))
+    if sound_tokens != spec.generation.max_new_tokens:
+        emitter.log(
+            f"Sound-caption max_new_tokens clamped from {spec.generation.max_new_tokens} "
+            f"to the Captioner limit {sound_tokens}.",
+            "warning",
+            "sound_captions",
+        )
+    sound_spec = replace(
+        spec,
+        model=replace(spec.model, variant_key=variant),
+        generation=replace(spec.generation, max_new_tokens=sound_tokens),
+        preprocess=replace(spec.preprocess, max_frames=0, use_audio_in_video=False),
+    )
+    sound_session = main_session if variant == spec.model.variant_key else _ModelSession(sound_spec, emitter, cancel)
+    units: list[tuple[_ResolvedInput, ItemResult, dict[str, Any]]] = []
+    entries = {entry.result_index: entry for entry in resolved}
+    for result in sorted(results.values(), key=lambda item: item.index):
+        entry = entries.get(result.index)
+        if entry is None or result.status != "done":
+            continue
+        for record in result.segments:
+            if record.get("status") == "done" and record.get("media_path"):
+                units.append((entry, result, record))
+    emitter.log(f"Phase: sound captions ({len(units)} unit(s)) with {variant}", scope="sound_captions")
+    cancelled = False
+    for position, (entry, result, record) in enumerate(units, start=1):
+        if _is_cancelled(cancel):
+            cancelled = True
+            break
+        emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
+        emitter.progress(
+            entry.tracker_index,
+            entry.result_index,
+            f"Sound captions {position}/{len(units)}",
+            0.86 + 0.08 * position / max(1, len(units)),
+            step_index=7,
+            data={"phase": "sound_captions", "phase_index": position, "phase_total": len(units)},
+        )
+        media_path = Path(str(record["media_path"]))
+        unit_work = run_dir / ".work" / "sound_captions" / f"{entry.result_index:04d}_{int(record.get('index', 1)):04d}"
+        result.sound_caption_model = variant
+        try:
+            sound, windows = _caption_sound_windows(
+                sound_spec,
+                sound_session,
+                media_path,
+                record.get("media_start"),
+                record.get("media_end"),
+                unit_work,
+                emitter,
+                cancel,
+                unit_label=media_path.name,
+            )
+            record["sound_caption"] = sound
+            record["audio_windows"] = windows
+            result.audio_windows += windows
+        except CancelledError:
+            cancelled = True
+            break
+        except Exception as exc:
+            record["sound_caption"] = ""
+            record["audio_windows"] = 0
+            record["sound_caption_error"] = f"{type(exc).__name__}: {exc}"
+            emitter.log(
+                f"Sound caption failed for {media_path.name}; continuing: {type(exc).__name__}: {exc}",
+                "error",
+                "sound_captions",
+            )
+        finally:
+            sound_session.sample_shared_gpu_memory()
+            shutil.rmtree(unit_work, ignore_errors=True)
+    if (
+        sound_session is not main_session
+        and spec.runtime.keep_model_loaded
+        and sound_session.captioner is not None
+    ):
+        emitter.log(
+            f"Captioner remains loaded; the next caption run reloads {spec.model.variant_key}",
+            scope="models",
+        )
+    return sound_session, cancelled
+
+
+def _run_merge_phase(
+    spec: JobSpec,
+    resolved: Sequence[_ResolvedInput],
+    results: dict[int, ItemResult],
+    emitter: _Emitter,
+    cancel: CancelToken,
+) -> bool:
+    """Write split caption parts, merged files, and augmented JSON outputs."""
+
+    entries = {entry.result_index: entry for entry in resolved}
+    eligible = [result for result in results.values() if result.status == "done"]
+    emitter.log(f"Phase: merging captions ({len(eligible)} item(s))", scope="dataset_captions")
+    cancelled = False
+    for position, result in enumerate(sorted(eligible, key=lambda item: item.index), start=1):
+        if _is_cancelled(cancel):
+            cancelled = True
+            result.status = "cancelled"
+            result.message = "Cancelled before merging captions."
+            continue
+        entry = entries.get(result.index)
+        if entry is None or entry.out_dir is None:
+            continue
+        emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
+        emitter.progress(
+            entry.tracker_index,
+            entry.result_index,
+            f"Merging captions {position}/{len(eligible)}",
+            0.94 + 0.06 * position / max(1, len(eligible)),
+            step_index=8,
+            data={"phase": "merge", "phase_index": position, "phase_total": len(eligible)},
+        )
+        records = [record for record in result.segments if record.get("status") == "done"]
+        try:
+            for record in records:
+                location = _record_output_location(entry, record, len(result.segments))
+                if location is None:
+                    continue
+                segment_dir, segment_stem = location
+                transcript_data = record.get("transcript")
+                transcript_text = (
+                    render_transcript(transcript_data, spec.audio_caption.transcript_style)
+                    if spec.audio_caption.needs_whisper
+                    else ""
+                )
+                media_path = Path(str(record.get("media_path") or segment_stem))
+                segment_outputs = dict(record.get("outputs") or {})
+                audio_text, merged_text, no_speech = _render_and_write_unit(
+                    spec,
+                    segment_dir,
+                    segment_stem,
+                    media_path.stem,
+                    str(record.get("caption") or ""),
+                    transcript_text,
+                    str(record.get("sound_caption") or ""),
+                    record.get("structured"),
+                    segment_outputs,
+                    emitter,
+                    allow_merged=not bool(record.get("existing_video_missing")),
+                )
+                record.update(
+                    outputs=segment_outputs,
+                    audio_caption=audio_text,
+                    merged_caption=merged_text,
+                    no_speech=no_speech,
+                    audio_caption_source=spec.audio_caption.source,
+                    sound_caption_model=result.sound_caption_model,
+                )
+            video_caption = _combined_video_caption(records)
+            transcript_text = (
+                render_transcript(result.transcript, spec.audio_caption.transcript_style)
+                if spec.audio_caption.needs_whisper
+                else ""
+            )
+            sound_caption = _combined_sound_caption(records)
+            existing_missing = bool(records) and all(bool(record.get("existing_video_missing")) for record in records)
+            outputs = dict(result.outputs)
+            combined_structured = _existing_structured_output(
+                outputs,
+                (
+                    records[0].get("structured")
+                    if len(records) == 1
+                    else [record.get("structured") for record in records]
+                ),
+            )
+            audio_text, merged_text, no_speech = _render_and_write_unit(
+                spec,
+                entry.out_dir,
+                entry.stem,
+                entry.path.stem if entry.path is not None else entry.stem,
+                video_caption,
+                transcript_text,
+                sound_caption,
+                combined_structured,
+                outputs,
+                emitter,
+                allow_merged=not existing_missing,
+            )
+            paths = caption_unit_paths(entry.out_dir, entry.stem)
+            result.outputs = outputs
+            result.video_caption_path = outputs.get("video_caption")
+            result.audio_caption_path = outputs.get("audio_caption")
+            result.merged_caption_path = outputs.get("merged_caption")
+            result.audio_caption_source = spec.audio_caption.source
+            if existing_missing:
+                result.message = f"No existing video caption for {entry.path.name if entry.path else entry.stem}; audio caption saved separately"
+            else:
+                result.message = (
+                    f"Captioned {len(records)} segment(s); audio caption saved"
+                    if audio_text
+                    else f"Captioned {len(records)} segment(s); merged caption uses video only"
+                )
+            if no_speech:
+                for record in records:
+                    record.setdefault("no_speech", True)
+            del paths, merged_text
+        except CancelledError:
+            cancelled = True
+            result.status = "cancelled"
+            result.message = "Cancelled while merging captions."
+        except Exception as exc:
+            result.status = "failed"
+            result.message = f"Could not merge caption parts: {type(exc).__name__}: {exc}"
+            result.traceback_tail = _traceback_tail()
+            emitter.log(result.message, "error", "dataset_captions")
+    return cancelled
+
+
+def _cleanup_item_work_dirs(spec: JobSpec, run_dir: Path, results: Iterable[ItemResult]) -> None:
+    worker_tag = sanitize_filename(str(spec.internal.get("worker_id") or "main"))
+    for result in results:
+        shutil.rmtree(run_dir / ".work" / f"{worker_tag}_{result.index:04d}", ignore_errors=True)
+    shutil.rmtree(run_dir / ".work" / "sound_captions", ignore_errors=True)
+
+
+def _populate_split_result_paths(
+    spec: JobSpec,
+    resolved: Sequence[_ResolvedInput],
+    results: Mapping[int, ItemResult],
+) -> None:
+    """Record all split artifacts that exist, including skipped batch items."""
+
+    by_index = {entry.result_index: entry for entry in resolved}
+    for result in results.values():
+        result.audio_caption_source = spec.audio_caption.source
+        entry = by_index.get(result.index)
+        if entry is None or entry.out_dir is None:
+            continue
+        paths = caption_unit_paths(entry.out_dir, entry.stem)
+        if paths.video.is_file():
+            result.video_caption_path = str(paths.video)
+            result.outputs.setdefault("video_caption", str(paths.video))
+        if paths.audio.is_file():
+            result.audio_caption_path = str(paths.audio)
+            result.outputs.setdefault("audio_caption", str(paths.audio))
+        if spec.audio_caption.write_merged and paths.merged.is_file():
+            result.merged_caption_path = str(paths.merged)
+            result.outputs.setdefault("merged_caption", str(paths.merged))
+            result.outputs.setdefault("txt", str(paths.merged))
 
 
 def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToken) -> JobResult:
@@ -2819,6 +3585,8 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     peak_vram = 0.0
     metadata_path = run_dir / str(spec.internal.get("metadata_name") or "metadata.json")
     session = _ModelSession(spec, emitter, cancel)
+    sound_session: _ModelSession | None = None
+    finished_indices: set[int] = set()
     with RunLog(run_dir):
         emitter.log(
             f"Starting {spec.output.kind} job with {len(resolved)} resolved input(s) using "
@@ -2826,18 +3594,37 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
         )
         for message in filter_messages:
             emitter.log(message, scope="inputs")
+        if _split_layout(spec):
+            emitter.log("Phase: captions", scope="dataset_captions")
+        if spec.audio_caption.needs_whisper and not spec.transcript.enabled:
+            emitter.log(
+                "Whisper transcript enabled by the audio caption setting",
+                scope="transcript",
+            )
+        existing_mode = bool(
+            _split_layout(spec) and spec.audio_caption.video_source == "existing"
+        )
+        scene_detection_on = str(
+            spec.settings.get("scene_detect_enabled", "")
+        ).strip().casefold() in {"1", "true", "yes", "on"}
+        if existing_mode and (spec.split.mode != "whole" or scene_detection_on):
+            emitter.log(
+                "Scene splitting is ignored when existing video captions are reused; input files are the caption units.",
+                "warning",
+                "segments",
+            )
         if spec.output.kind == "batch" and (
             spec.preprocess.trim_start_s > 1e-9 or spec.preprocess.trim_end_s is not None
         ):
             emitter.log("Trim range is ignored for folder batches", "warning", "preprocess")
-        if model_error:
+        if model_error and not existing_mode:
             for entry in resolved:
                 entry.status = "failed"
                 entry.kind = "unknown"
                 entry.message = f"Unknown model variant: {spec.model.variant_key}"
         else:
             _probe_and_classify(spec, resolved, model)
-            if not spec.internal.get("suppress_job_contract_logs"):
+            if not existing_mode and not spec.internal.get("suppress_job_contract_logs"):
                 _log_job_generation_contracts(spec, model, resolved, emitter)
             _apply_batch_skip(spec, resolved)
             _apply_batch_limit(spec, resolved)
@@ -2862,9 +3649,10 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             results[entry.result_index] = result
             emitter.log(entry.message, "warning" if entry.status == "unsupported" else "info")
             emitter.finish(entry.tracker_index, entry.result_index, entry.status, entry.message, 0.0)
+            finished_indices.add(entry.result_index)
 
         if not actionable:
-            emitter.log("Nothing requires captioning; the model was not loaded.")
+            emitter.log("Nothing requires captioning; no caption model was loaded.")
         cancelled_job = False
         for position, entry in enumerate(actionable):
             if cancelled_job or _is_cancelled(cancel):
@@ -2885,22 +3673,29 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     result.message,
                     0.0,
                 )
+                finished_indices.add(entry.result_index)
                 continue
             emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
             item_started = time.perf_counter()
             try:
-                result = _process_item(spec, entry, run_dir, model, session, emitter, cancel)
+                result = (
+                    _process_existing_item(spec, entry, run_dir, emitter, cancel)
+                    if existing_mode
+                    else _process_item(spec, entry, run_dir, model, session, emitter, cancel)
+                )
                 results[entry.result_index] = result
                 peak_vram = max(peak_vram, result.peak_vram_gb)
-                emitter.finish(
-                    entry.tracker_index,
-                    entry.result_index,
-                    result.status,
-                    result.message,
-                    result.elapsed,
-                    outputs=result.outputs,
-                    clip_path=_last_saved_clip(result),
-                )
+                if not _split_layout(spec):
+                    emitter.finish(
+                        entry.tracker_index,
+                        entry.result_index,
+                        result.status,
+                        result.message,
+                        result.elapsed,
+                        outputs=result.outputs,
+                        clip_path=_last_saved_clip(result),
+                    )
+                    finished_indices.add(entry.result_index)
             except CancelledError as exc:
                 cancelled_job = True
                 elapsed = time.perf_counter() - item_started
@@ -2922,6 +3717,7 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     result.message,
                     elapsed,
                 )
+                finished_indices.add(entry.result_index)
             except Exception as exc:
                 elapsed = time.perf_counter() - item_started
                 tail = _traceback_tail()
@@ -2945,29 +3741,82 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
                     message,
                     elapsed,
                 )
+                finished_indices.add(entry.result_index)
             finally:
                 session.sample_shared_gpu_memory()
 
+        if _split_layout(spec):
+            sound_session, sound_cancelled = _run_sound_caption_phase(
+                spec,
+                resolved,
+                results,
+                session,
+                emitter,
+                cancel,
+                run_dir,
+            )
+            cancelled_job = cancelled_job or sound_cancelled
+            merge_cancelled = _run_merge_phase(
+                spec,
+                resolved,
+                results,
+                emitter,
+                cancel,
+            )
+            cancelled_job = cancelled_job or merge_cancelled
+            by_result_index = {entry.result_index: entry for entry in resolved}
+            for result in sorted(results.values(), key=lambda item: item.index):
+                if result.index in finished_indices:
+                    continue
+                entry = by_result_index.get(result.index)
+                if entry is None:
+                    continue
+                emitter.start_item(entry.tracker_index, entry.stem, entry.result_index)
+                emitter.finish(
+                    entry.tracker_index,
+                    entry.result_index,
+                    result.status,
+                    result.message,
+                    result.elapsed,
+                    outputs=result.outputs,
+                    clip_path=_last_saved_clip(result),
+                )
+                finished_indices.add(result.index)
+            _populate_split_result_paths(spec, resolved, results)
+            _cleanup_item_work_dirs(spec, run_dir, results.values())
+
         if not spec.runtime.keep_model_loaded:
-            session.unload()
+            final_session = (
+                sound_session
+                if sound_session is not None and sound_session.captioner is not None
+                else session
+            )
+            final_session.unload()
             emitter.log("Model unloaded at the end of the job.", scope="models")
         ordered = sorted(results.values(), key=lambda item: item.index)
         elapsed = time.perf_counter() - started
         try:
+            active_session = sound_session or session
             metadata_path = _write_metadata(
                 spec,
                 ordered,
                 run_dir,
                 elapsed,
-                max(peak_vram, session.peak_vram_gb),
+                max(peak_vram, session.peak_vram_gb, active_session.peak_vram_gb),
                 load_report=session.load_report,
-                shared_gpu_memory_peak_gb=session.shared_gpu_memory_peak_gb,
-                shared_gpu_memory_excess_peak_gb=session.shared_gpu_memory_excess_peak_gb,
+                shared_gpu_memory_peak_gb=max(
+                    session.shared_gpu_memory_peak_gb,
+                    active_session.shared_gpu_memory_peak_gb,
+                ),
+                shared_gpu_memory_excess_peak_gb=max(
+                    session.shared_gpu_memory_excess_peak_gb,
+                    active_session.shared_gpu_memory_excess_peak_gb,
+                ),
             )
         except Exception as exc:
             emitter.log(f"Could not write metadata: {exc}", "error", "metadata")
             raise
-        counts = _status_counts(ordered)
+        counts = _status_counts(ordered, include_audio=_split_layout(spec))
         emitter.log(
             "Job finished: "
             + ", ".join(f"{key}={value}" for key, value in counts.items() if key != "total")
@@ -3314,6 +4163,12 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             )
         )
     result_items.sort(key=lambda item: item.index)
+    if _split_layout(spec):
+        _populate_split_result_paths(
+            spec,
+            expanded,
+            {item.index: item for item in result_items},
+        )
     elapsed = time.perf_counter() - started
     metadata = _write_metadata(
         spec,
@@ -3325,7 +4180,7 @@ def _run_multi_gpu(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
     )
     return JobResult(
         result_items,
-        _status_counts(result_items),
+        _status_counts(result_items, include_audio=_split_layout(spec)),
         str(run_dir),
         str(metadata),
         elapsed,

@@ -71,6 +71,8 @@ MEDIA_EXTENSIONS: dict[str, set[str]] = {
     "text": {".txt", ".md"},
 }
 
+_CAPTION_PART_DIRECTORIES = frozenset({"video_caption", "audio_caption"})
+
 
 def _expand_percent_vars(value: str) -> str:
     """Expand Windows-style percent variables even when running on POSIX."""
@@ -207,7 +209,11 @@ def list_media_files(
                         if entry.is_file(follow_symlinks=True):
                             if item.suffix.casefold() in allowed:
                                 found.append(item)
-                        elif recursive and entry.is_dir(follow_symlinks=False):
+                        elif (
+                            recursive
+                            and entry.is_dir(follow_symlinks=False)
+                            and item.name.casefold() not in _CAPTION_PART_DIRECTORIES
+                        ):
                             scan(item)
                     except (OSError, PermissionError):
                         continue

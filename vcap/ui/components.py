@@ -712,6 +712,7 @@ def _folder_scan(
     save_next_to_source: bool = False,
     existing_item_noun: str = "captioned",
     existing_files_label: str = "captions",
+    include_caption_coverage: bool = False,
 ) -> tuple[list[str], str]:
     raw = str(folder or "").strip()
     if not raw:
@@ -754,6 +755,7 @@ def _folder_scan(
         return [], f"<span class='vc-err'>Invalid output folder: {html.escape(str(exc))}</span>"
     counts = {"video": 0, "audio": 0, "image": 0, "text": 0}
     existing = 0
+    audio_captioned = 0
     extension = str(existing_extension or ".txt").strip().casefold()
     if not extension.startswith("."):
         extension = "." + extension
@@ -771,6 +773,19 @@ def _folder_scan(
         )
         if caption_path is not None and caption_path.is_file():
             existing += 1
+        if include_caption_coverage:
+            caption_parent = (
+                path.parent
+                if save_next_to_source
+                else output_root / relative.parent
+                if output_root is not None
+                else None
+            )
+            if (
+                caption_parent is not None
+                and (caption_parent / "audio_caption" / f"{path.stem}.txt").is_file()
+            ):
+                audio_captioned += 1
     overwrite_hint = (
         f"Overwrite is on; existing {existing_files_label} will be replaced."
         if overwrite
@@ -783,8 +798,16 @@ def _folder_scan(
         "text": f"📄 {counts['text']} texts",
     }
     summary = " · ".join(count_labels[kind] for kind in selected_kinds)
+    if include_caption_coverage:
+        summary += (
+            f" · {len(found)} media files · {existing} already captioned (<stem>.txt)"
+            f" · {audio_captioned} with audio captions (audio_caption/)"
+        )
     location = "next to source files" if save_next_to_source else "in output folder"
-    summary += f" · {existing} already {existing_item_noun} {location}. {overwrite_hint}"
+    if include_caption_coverage:
+        summary += f" · outputs {location}. {overwrite_hint}"
+    else:
+        summary += f" · {existing} already {existing_item_noun} {location}. {overwrite_hint}"
     limit = max(0, int(limit_items or 0))
     if limit:
         summary += f" · limiting to first {limit}"
@@ -930,6 +953,11 @@ def media_input_block(
     show_archive_upload: bool = True,
     show_kind_filters: bool = True,
     save_next_to_source_key: str | None = None,
+    save_next_to_source_label: str = "Save transcripts next to the source files",
+    save_next_to_source_info: str = (
+        "Write each transcript beside its source instead of mirroring it below the batch output folder."
+    ),
+    include_caption_coverage: bool = False,
     default_existing_extension: str = ".txt",
     existing_item_noun: str = "captioned",
     existing_files_label: str = "captions",
@@ -1151,20 +1179,15 @@ def media_input_block(
                 if save_next_to_source_key:
                     save_next_to_source = gr.Checkbox(
                         value=False,
-                        label="Save transcripts next to the source files",
-                        info=(
-                            "Write each transcript beside its source instead of mirroring it below "
-                            "the batch output folder."
-                        ),
+                        label=save_next_to_source_label,
+                        info=save_next_to_source_info,
                     )
                     ctx.reg(
                         save_next_to_source_key,
                         save_next_to_source,
                         False,
                         section=section,
-                        description=(
-                            "Write batch transcripts beside their source files instead of the batch output folder."
-                        ),
+                        description=save_next_to_source_info,
                         kind="bool",
                     )
                 scan_summary = gr.Markdown(
@@ -1238,6 +1261,7 @@ def media_input_block(
             save_next_value,
             existing_item_noun,
             existing_files_label,
+            include_caption_coverage,
         )
         return (*_preview_updates(selected), selected, summary)
 
@@ -1316,7 +1340,14 @@ def media_input_block(
     if save_next_to_source is not None:
         scan_triggers.append(save_next_to_source.change)
         save_next_to_source.change(
-            lambda enabled: gr.update(interactive=not bool(enabled)),
+            lambda enabled: gr.update(
+                interactive=not bool(enabled),
+                info=(
+                    "Disabled while outputs are saved beside each source file."
+                    if enabled
+                    else output_folder_info
+                ),
+            ),
             inputs=save_next_to_source,
             outputs=output_folder,
             queue=False,
@@ -1341,6 +1372,7 @@ def media_input_block(
         limit_value: int | float,
         kinds_value: list[str] | None,
         name_filter_value: str,
+        save_next_value: bool = False,
     ) -> tuple[Any, ...]:
         raw = getattr(uploaded, "name", uploaded)
         if not raw:
@@ -1397,6 +1429,8 @@ def media_input_block(
                 limit_value,
                 kinds_value,
                 name_filter_value,
+                save_next_to_source=save_next_value,
+                include_caption_coverage=include_caption_coverage,
             )
             files = int(getattr(report, "files", 0) or 0)
             total_bytes = int(getattr(report, "total_bytes", 0) or 0)
@@ -1447,6 +1481,7 @@ def media_input_block(
                 limit_items,
                 include_kinds,
                 name_filter,
+                *([save_next_to_source] if save_next_to_source is not None else []),
             ],
             outputs=[folder, recursive, *folder_outputs],
             show_progress="minimal",

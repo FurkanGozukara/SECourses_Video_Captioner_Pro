@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.6.0",
+        "2026-09-04",
+        """
+### Dataset clip video and audio captions
+
+- Added a split dataset layout that writes clean video captions to `video_caption/`, Whisper and/or Qwen3-Omni sound captions to `audio_caption/`, and an optional merged `<clip>.txt` beside every source or produced segment clip.
+- Folder batches can save all media-facing artifacts beside their source files while keeping run metadata and work files in the numbered batch run directory; existing captions can be reused without loading the main caption model.
+- Added configurable audio and merge templates, no-speech handling, 30-second sound-caption windowing, JSON metadata fields, Caption Editor part previews and merge-aware regeneration, coverage scanning, and three shipped dataset presets.
+""".strip(),
+    ),
+    (
         "v1.5.0",
         "2026-09-04",
         """
