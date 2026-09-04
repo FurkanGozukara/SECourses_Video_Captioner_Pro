@@ -8,6 +8,7 @@ import zipfile
 import gradio as gr
 
 from vcap.core.logs import get_log
+from vcap.core.media import MediaInfo
 from vcap.core.presets import PresetStore
 from vcap.core.registry import SettingsRegistry
 from vcap.pipeline.chat import ChatResponse
@@ -15,6 +16,7 @@ from vcap.pipeline.client import PipelineClient
 from vcap.ui import components
 from vcap.ui.app import UiContext, build_app
 from vcap.ui.components import input_mode_from_tab, media_input_block
+from vcap.ui.tabs import editor_tab
 from vcap.ui.tabs.caption_tab import validate_model_variant
 
 
@@ -175,6 +177,147 @@ def test_zip_upload_descends_wrapper_folder_and_can_enable_recursive_scan(
         )
     finally:
         ctx.pipeline.shutdown()
+
+
+def test_non_playable_video_uses_a_poster_without_assigning_gradio_video(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "vp9_opus.mp4"
+    source.write_bytes(b"video")
+    info = MediaInfo(
+        source,
+        "video",
+        duration=1680.0,
+        width=1920,
+        height=1080,
+        fps=30.0,
+        has_video=True,
+        has_audio=True,
+        video_codec="vp9",
+        audio_codec="opus",
+        container="mp4",
+    )
+    calls: list[tuple[Path, Path]] = []
+
+    def fake_thumbnail(path: Path, target: Path, **_kwargs):
+        calls.append((Path(path), Path(target)))
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        Path(target).write_bytes(b"png")
+        return Path(target)
+
+    monkeypatch.setattr(components, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(components, "probe_media", lambda _path: info)
+    monkeypatch.setattr(components.processing_utils, "video_is_playable", lambda _path: False)
+    monkeypatch.setattr(components, "make_thumbnail", fake_thumbnail)
+
+    video, audio, image, detail, gallery, modality, duration = components._preview_updates(
+        [str(source)]
+    )
+
+    assert video["value"] is None and video["visible"] is False
+    assert audio["value"] is None and audio["visible"] is False
+    poster = Path(image["value"])
+    assert image["visible"] is True and poster.is_file()
+    assert calls and calls[0][0] == source
+    assert "Preview shows the first frame: mp4/vp9/opus is not browser-playable" in detail
+    assert "Trim range still works." in detail
+    assert source.name in gallery
+    assert modality == "video_audio" and duration == 1680.0
+    assert components._resolved_after_preview_edit(image["value"], [str(source)], "upload") == [
+        str(source)
+    ]
+
+
+def test_poster_failure_keeps_probe_and_state_updates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "hevc.mkv"
+    source.write_bytes(b"video")
+    info = MediaInfo(
+        source,
+        "video_no_audio",
+        duration=12.5,
+        width=1280,
+        height=720,
+        fps=24.0,
+        has_video=True,
+        video_codec="hevc",
+        container="matroska",
+    )
+    monkeypatch.setattr(components, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(components, "probe_media", lambda _path: info)
+    monkeypatch.setattr(components.processing_utils, "video_is_playable", lambda _path: False)
+    monkeypatch.setattr(
+        components,
+        "make_thumbnail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("poster failed")),
+    )
+
+    video, _audio, image, detail, gallery, modality, duration = components._preview_updates(
+        [str(source)]
+    )
+
+    assert video["value"] is None and image["value"] is None
+    assert "**hevc.mkv**" in detail and "poster failed" in detail
+    assert source.name in gallery
+    assert modality == "video" and duration == 12.5
+
+
+def test_audio_probe_line_omits_video_geometry_and_frame_rate(tmp_path: Path) -> None:
+    source = tmp_path / "speech.mp3"
+    info = MediaInfo(
+        source,
+        "audio",
+        duration=62.0,
+        has_audio=True,
+        audio_sample_rate=48000,
+        audio_channels=2,
+        audio_codec="mp3",
+        container="mp3",
+    )
+
+    rendered = components._media_info_markdown(info)
+
+    assert "n/a" not in rendered
+    assert "48000 Hz" in rendered and "2 ch" in rendered
+
+
+def test_editor_routes_a_video_poster_to_the_image_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "vp9.mp4"
+    source.write_bytes(b"video")
+    poster = tmp_path / "vp9_poster.png"
+    poster.write_bytes(b"poster")
+    info = MediaInfo(
+        source,
+        "video",
+        duration=10.0,
+        has_video=True,
+        has_audio=True,
+        video_codec="vp9",
+        audio_codec="opus",
+        container="mp4",
+    )
+    monkeypatch.setattr(editor_tab, "probe_media", lambda _path: info)
+    monkeypatch.setattr(editor_tab, "preview_safe_media", lambda _path, _cache: poster)
+    state = {
+        "items": [{"media_path": str(source), "caption": "caption", "status": "done"}],
+        "selected_index": 0,
+    }
+
+    video, _audio, image, placeholder, caption, _stats = editor_tab._selection_payload(
+        state,
+        tmp_path / "cache",
+    )
+
+    assert video["value"] is None and video["visible"] is False
+    assert image["value"] == str(poster) and image["visible"] is True
+    assert placeholder["visible"] is True and "first frame" in placeholder["value"]
+    assert caption == "caption"
 
 
 def test_short_chat_stream_finishes_with_authoritative_usage() -> None:

@@ -15,6 +15,7 @@ from .job import (
     PromptSpec,
     RuntimeSpec,
     SplitSpec,
+    TranscriptSpec,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "PromptSpec",
     "RuntimeSpec",
     "SplitSpec",
+    "TranscriptSpec",
 ]

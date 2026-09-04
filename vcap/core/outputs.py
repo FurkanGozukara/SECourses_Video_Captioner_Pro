@@ -83,7 +83,11 @@ def _history_model_key(payload: Mapping[str, Any] | None) -> str:
         return ""
     model_info = payload.get("model_info")
     if isinstance(model_info, Mapping):
-        value = model_info.get("variant_key") or model_info.get("model_key")
+        value = (
+            model_info.get("variant_key")
+            or model_info.get("model_key")
+            or model_info.get("alias")
+        )
         if value:
             return str(value)
     metadata = payload.get("metadata")
@@ -91,9 +95,17 @@ def _history_model_key(payload: Mapping[str, Any] | None) -> str:
         return str(metadata["model_key"])
     settings = payload.get("settings")
     if isinstance(settings, Mapping):
-        value = settings.get("model_key") or settings.get("variant_key")
+        value = (
+            settings.get("model_key")
+            or settings.get("variant_key")
+            or settings.get("whisper_model")
+        )
         if value:
             return str(value)
+    extra = payload.get("extra")
+    params = extra.get("params") if isinstance(extra, Mapping) else None
+    if isinstance(params, Mapping) and params.get("model"):
+        return str(params["model"])
     return str(payload.get("model_key") or payload.get("variant_key") or "")
 
 
@@ -131,9 +143,22 @@ def _history_items_and_counts(payload: Mapping[str, Any] | None) -> tuple[int, d
     return max(0, items), counts
 
 
-def _history_kind(folder: Path, payload: Mapping[str, Any] | None, chat_marker: bool) -> str:
+def _history_kind(
+    folder: Path,
+    payload: Mapping[str, Any] | None,
+    chat_marker: bool,
+    regeneration_marker: bool = False,
+) -> str:
+    if regeneration_marker:
+        return "regenerate"
     if chat_marker or "_chat_" in f"_{folder.name.casefold()}_":
         return "chat"
+    extra = payload.get("extra") if isinstance(payload, Mapping) else None
+    recorded_kind = str(extra.get("kind") or "").casefold() if isinstance(extra, Mapping) else ""
+    if recorded_kind in {"whisper_transcription", "transcribe", "transcription"}:
+        return "transcribe"
+    if folder.name.casefold().endswith("_whisper") and payload is not None:
+        return "transcribe"
     if folder.name.casefold().startswith("batch_"):
         return "batch"
     settings = payload.get("settings") if isinstance(payload, Mapping) else None
@@ -144,6 +169,65 @@ def _history_kind(folder: Path, payload: Mapping[str, Any] | None, chat_marker: 
         if str(selected).casefold() in {"single", "batch"}:
             return str(selected).casefold()
     return "single" if payload is not None else "other"
+
+
+def _regeneration_item_preview(payload: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return ""
+    values = payload.get("items_results")
+    if not isinstance(values, list):
+        return ""
+    names: list[str] = []
+    for item in values:
+        if not isinstance(item, Mapping):
+            continue
+        outputs = item.get("outputs")
+        raw_values = list(outputs.values()) if isinstance(outputs, Mapping) else []
+        raw_values.extend([item.get("caption_path"), item.get("path")])
+        raw = next((str(value) for value in raw_values if value), "")
+        if raw:
+            path = Path(raw)
+            label = f"{path.parent.name}/{path.name}" if path.parent.name.casefold().endswith("_segments") else path.name
+            if label not in names:
+                names.append(label)
+    return ", ".join(names[:3])
+
+
+def _transcription_preview(folder: Path, payload: Mapping[str, Any] | None) -> str:
+    preview = _history_preview(folder)
+    if preview or not isinstance(payload, Mapping):
+        return preview
+    items = payload.get("items_results")
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        result = item.get("result")
+        if isinstance(result, Mapping) and str(result.get("text") or "").strip():
+            return str(result["text"]).strip()[:160]
+        raw_files = item.get("files")
+        candidates = list(raw_files) if isinstance(raw_files, (list, tuple)) else []
+        outputs = item.get("outputs")
+        if isinstance(outputs, Mapping):
+            candidates.extend(outputs.values())
+        for raw in candidates:
+            path = Path(str(raw))
+            if not path.is_absolute():
+                path = folder / path
+            try:
+                if path.suffix.casefold() == ".txt" and path.is_file():
+                    text = path.read_text(encoding="utf-8").strip()
+                elif path.suffix.casefold() == ".json" and path.is_file():
+                    document = _history_json(path)
+                    text = str(document.get("text") or "").strip() if document else ""
+                else:
+                    continue
+            except (OSError, UnicodeError):
+                continue
+            if text:
+                return text[:160]
+    return ""
 
 
 def list_recent_runs(
@@ -163,17 +247,28 @@ def list_recent_runs(
     summaries: list[RunSummary] = []
     for folder in folders:
         metadata = folder / "metadata.json"
+        regeneration = folder / "editor_regeneration_metadata.json"
         chat = folder / "chat.json"
         run_log = folder / "run_log.txt"
         try:
-            markers = [path for path in (metadata, chat, run_log) if path.is_file()]
+            markers = [path for path in (metadata, regeneration, chat, run_log) if path.is_file()]
         except OSError:
             continue
         if not markers:
             continue
-        data_path = metadata if metadata in markers else chat if chat in markers else None
+        is_regeneration = regeneration in markers and metadata not in markers
+        data_path = (
+            metadata
+            if metadata in markers
+            else regeneration
+            if regeneration in markers
+            else chat
+            if chat in markers
+            else None
+        )
         payload = _history_json(data_path) if data_path is not None else None
         items, counts = _history_items_and_counts(payload)
+        kind = _history_kind(folder, payload, chat in markers, is_regeneration)
         try:
             created = float(folder.stat().st_mtime)
         except OSError:
@@ -182,12 +277,18 @@ def list_recent_runs(
             RunSummary(
                 run_dir=str(folder.resolve(strict=False)),
                 name=folder.name,
-                kind=_history_kind(folder, payload, chat in markers),
+                kind=kind,
                 model_key=_history_model_key(payload),
                 created=created,
                 items=items,
                 counts=counts,
-                preview=_history_preview(folder),
+                preview=(
+                    _regeneration_item_preview(payload)
+                    if is_regeneration
+                    else _transcription_preview(folder, payload)
+                    if kind == "transcribe"
+                    else _history_preview(folder)
+                ),
                 metadata_path=(
                     str(data_path.resolve(strict=False)) if data_path is not None else None
                 ),

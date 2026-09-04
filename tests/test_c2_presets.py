@@ -211,9 +211,10 @@ def test_universal_preset_dropdown_applies_selection_immediately(tmp_path: Path)
         deleted = demo.fns[confirm[0]["id"]].fn(pending[0])
         assert deleted[0:2] == (3.0, 0.9)
         assert deleted[2]["value"] == "Balanced"
-        assert "Deleted Mine; loaded Balanced." in deleted[3]
-        assert deleted[4]["name"] == "Balanced"
-        assert deleted[5]["visible"] is False and deleted[6] == {}
+        assert deleted[3] == ""
+        assert "Deleted Mine; loaded Balanced." in deleted[4]
+        assert deleted[5]["name"] == "Balanced"
+        assert deleted[6]["visible"] is False and deleted[7] == {}
         assert not ctx.preset_store.exists("Mine")
 
         protected = demo.fns[delete[0]["id"]].fn("Balanced")

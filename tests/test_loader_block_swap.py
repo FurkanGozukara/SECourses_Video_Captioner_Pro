@@ -295,7 +295,7 @@ def test_loader_wires_block_swap_budget_and_report(
     assert loaded.model._vcap_last_token_logits is True
 
 
-def test_model_cache_reuses_plan_that_covers_hint_and_keys_last_token_logits(
+def test_model_cache_reuses_across_budget_and_last_token_call_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vcap.models import loader
@@ -316,8 +316,8 @@ def test_model_cache_reuses_plan_that_covers_hint_and_keys_last_token_logits(
         created.append(value)
         return value
 
-    # One "GiB per frame" keeps the arithmetic obvious: the plan made for 8 frames
-    # covers any later job needing 8 or fewer, and must be rebuilt for 9.
+    # Budget-only changes and last-token projection are per-call concerns and
+    # must not churn an otherwise identical resident model.
     monkeypatch.setattr(
         loader,
         "estimate_activation_bytes",
@@ -334,10 +334,11 @@ def test_model_cache_reuses_plan_that_covers_hint_and_keys_last_token_logits(
     assert cache.load("variant", budget_hint=BudgetHint(max_frames=6), last_token_logits=True) is first
     assert len(created) == 1
     second = cache.load("variant", budget_hint=BudgetHint(max_frames=9), last_token_logits=True)
-    assert second is not first
-    assert len(created) == 2
-    cache.load("variant", budget_hint=BudgetHint(max_frames=9), last_token_logits=False)
-    assert len(created) == 3
+    assert second is first
+    assert len(created) == 1
+    assert cache.load("variant", budget_hint=BudgetHint(max_frames=9), last_token_logits=False) is first
+    assert len(created) == 1
+    assert first.model._vcap_last_token_logits is False
 
 
 def test_model_cache_reuses_loads_without_a_plan(monkeypatch: pytest.MonkeyPatch) -> None:

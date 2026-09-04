@@ -1450,67 +1450,45 @@ def preview_safe_media(path: str | os.PathLike[str], cache_dir: str | os.PathLik
     if info.has_video:
         if _browser_video(info):
             return source
-        target = cache / f"{identity}_preview.mp4"
-        if target.is_file() and target.stat().st_size:
-            return target
-        temporary = target.with_name(f".{target.stem}.{os.getpid()}.{threading.get_ident()}.mp4")
         can_copy_video = (info.video_codec or "").casefold() in {"h264", "av1"}
-        try:
-            if can_copy_video:
-                try:
-                    audio_codec = (info.audio_codec or "").casefold()
-                    run_ffmpeg(
-                        [
-                            "-y",
-                            "-i",
-                            str(source),
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "0:a?",
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "copy" if audio_codec in {"", "aac", "mp3"} else "aac",
-                            "-movflags",
-                            "+faststart",
-                            str(temporary),
-                        ]
-                    )
-                except MediaError:
-                    temporary.unlink(missing_ok=True)
-                    can_copy_video = False
-            if not can_copy_video:
-                run_ffmpeg(
-                    [
-                        "-y",
-                        "-i",
-                        str(source),
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "0:a?",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-crf",
-                        "23",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-movflags",
-                        "+faststart",
-                        str(temporary),
-                    ]
-                )
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return target
+        if can_copy_video:
+            target = cache / f"{identity}_preview.mp4"
+            if target.is_file() and target.stat().st_size:
+                return target
+            temporary = target.with_name(
+                f".{target.stem}.{os.getpid()}.{threading.get_ident()}.mp4"
+            )
+            audio_codec = (info.audio_codec or "").casefold()
+            command = [
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+            ]
+            if info.has_audio and audio_codec in {"aac", "mp3"}:
+                command.extend(["-map", "0:a:0?", "-c:a", "copy"])
+            else:
+                command.append("-an")
+            command.extend(["-movflags", "+faststart", str(temporary)])
+            from .logs import get_log
+
+            get_log().log("Preparing preview…", scope="preview")
+            try:
+                run_ffmpeg(command)
+                os.replace(temporary, target)
+                return target
+            except MediaError:
+                temporary.unlink(missing_ok=True)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        poster = cache / f"{identity}_preview.png"
+        if poster.is_file() and poster.stat().st_size:
+            return poster
+        return make_thumbnail(source, poster, at_seconds=0.0, width=960)
 
     return source
 

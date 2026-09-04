@@ -21,6 +21,8 @@ from .registry import MODELS_DIR, get_variant, resolve_model_dir, variant_is_rea
 
 
 ProgressCallback = Callable[..., None]
+_DISK_USAGE_CACHE: dict[str, int] = {}
+_DISK_USAGE_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -48,13 +50,31 @@ def _variant_folder(variant_key: str, *, require_inside: bool) -> Path:
     return folder
 
 
+def invalidate_variant_disk_usage(variant_key: str | None = None) -> None:
+    """Invalidate cached recursive size totals after a disk-changing action."""
+
+    with _DISK_USAGE_CACHE_LOCK:
+        if variant_key is None:
+            _DISK_USAGE_CACHE.clear()
+        else:
+            _DISK_USAGE_CACHE.pop(str(variant_key), None)
+
+
 def variant_disk_usage(variant_key: str) -> int:
     """Return bytes used by a variant folder, including partial downloads."""
 
-    folder = _variant_folder(variant_key, require_inside=False)
+    key = str(variant_key)
+    with _DISK_USAGE_CACHE_LOCK:
+        cached = _DISK_USAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    folder = _variant_folder(key, require_inside=False)
     try:
         if not folder.exists() or not folder.is_dir():
-            return 0
+            total = 0
+            with _DISK_USAGE_CACHE_LOCK:
+                _DISK_USAGE_CACHE[key] = total
+            return total
     except OSError:
         return 0
     total = 0
@@ -73,6 +93,8 @@ def variant_disk_usage(variant_key: str) -> int:
                     total += max(0, int(entry.stat(follow_symlinks=False).st_size))
             except OSError:
                 continue
+    with _DISK_USAGE_CACHE_LOCK:
+        _DISK_USAGE_CACHE[key] = total
     return total
 
 
@@ -80,6 +102,7 @@ def delete_variant_files(variant_key: str) -> DeleteReport:
     """Delete one variant folder without following links or leaving partial files."""
 
     key = str(variant_key)
+    invalidate_variant_disk_usage(key)
     folder = _variant_folder(key, require_inside=True)
     errors: list[str] = []
     files_removed = 0
@@ -139,6 +162,7 @@ def delete_variant_files(variant_key: str) -> DeleteReport:
             folder.rmdir()
         except OSError as exc:
             errors.append(f"{folder}: {exc}")
+    invalidate_variant_disk_usage(key)
     return DeleteReport(key, str(folder), files_removed, bytes_freed, errors)
 
 
@@ -271,6 +295,7 @@ def ensure_model(
     variant = get_variant(variant_key)
     ready, detail = variant_is_ready(variant_key)
     if ready:
+        invalidate_variant_disk_usage(variant_key)
         _emit(
             progress_cb,
             f"{variant_key}: {detail}",
@@ -287,6 +312,7 @@ def ensure_model(
             _emit(progress_cb, message)
             return False, message
         ready, detail = variant_is_ready(variant.key)
+        invalidate_variant_disk_usage(variant.key)
         message = f"{variant.key}: {detail}"
         _emit(
             progress_cb,
@@ -371,15 +397,18 @@ def ensure_model(
         kill_process_tree(process.pid)
         return_code = -1
     if cancelled:
+        invalidate_variant_disk_usage(variant_key)
         message = "model download cancelled"
         _emit(progress_cb, message)
         return False, message
     if return_code != 0:
+        invalidate_variant_disk_usage(variant_key)
         message = f"model downloader exited with code {return_code}"
         _emit(progress_cb, message)
         return False, message
 
     ready, detail = variant_is_ready(variant_key)
+    invalidate_variant_disk_usage(variant_key)
     message = f"{variant_key}: {detail}"
     _emit(progress_cb, message)
     return ready, message
@@ -390,5 +419,6 @@ __all__ = [
     "delete_variant_files",
     "ensure_model",
     "format_status_line",
+    "invalidate_variant_disk_usage",
     "variant_disk_usage",
 ]

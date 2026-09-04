@@ -8,6 +8,7 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 
 - Use TimeChat for audiovisual video, AVoCaDO for visual or audiovisual video, Qwen3-Omni Instruct or Thinking for video, audio, images, and text, and the prompt-free Qwen3-Omni Captioner for one audio file up to 30 seconds.
 - Run single inputs or recursive mixed-media folders through the same pipeline, mirror batch subfolders, skip completed files, continue after per-item failures, and write versioned metadata plus compact batch summaries.
+- Transcribe video or audio with faster-whisper in the dedicated Transcribe tab, stream timestamped segments, export SRT/VTT/TXT/LRC/TSV/JSON, or run Whisper before captioning and inject clip-local speech through `{{TRANSCRIPT}}`.
 - Trim media, sample video by target FPS, uniform timestamps, keyframes, or adaptive visual change, detect scenes, enforce model duration limits, sub-split with overlap, and optionally reject short, black, static, blurry, or silent clips.
 - Carry the last 60 words from one generated segment into the next for long AVoCaDO and Qwen3 Instruct/Thinking jobs, while keeping TimeChat and Captioner prompt behavior model-native.
 - Stop generation at the model EOS token and record `finish_reason`, token counts, prefill/decode timing, tokens per second, processing time, and peak VRAM in run results and metadata.
@@ -32,6 +33,36 @@ Local, dataset-focused audiovisual captioning and media preparation for NVIDIA G
 - Linux GGUF users: the CUDA toolkit with `nvcc`, CMake, and a C++ toolchain are required. The pinned llama.cpp release has no prebuilt Ubuntu CUDA archive, so the cloud installers build it automatically.
 
 Model downloads range from about 6.5 GB to 63.4 GB per variant. Leave additional disk space for the virtual environment, resumable partial files, outputs, and temporary media.
+
+## Speech transcription (Whisper)
+
+The **🎙️ Transcribe** tab accepts uploaded video/audio, a local file path, or a recursive folder batch. It streams segments while the worker runs, then presents plain text, SRT, segment confidence, JSON, and downloadable output files. Batch transcripts can mirror the source tree below `outputs/batch_transcripts` or be saved beside each source. Model download/verification, cancellation, retry, ZIP export, run metadata, live logs, and Caption Editor handoff use the same interaction patterns as caption runs.
+
+The Processing Pipeline tab also has **7. Speech transcript (Whisper)**. Enabling it transcribes each video or audio item once before caption generation, writes the selected transcript sidecars beside the caption, and makes the overlapping speech available as `{{TRANSCRIPT}}` for every clip prompt. With prompt injection enabled, a wrapper is appended automatically when the selected prompt does not contain that variable.
+
+The shipped **Transcribe - Whisper best quality (large-v1)** preset reproduces the proven large-v1 defaults: float16, beam/best-of 5, temperature 0, repetition penalty 1.2, 30-second chunks, word timestamps with normalization, VAD off, and all six outputs. The turbo preset changes only the model alias. Models download automatically on first use and interrupted downloads are resumable.
+
+| Alias | Hugging Face repository | Download size | Note |
+|---|---|---:|---|
+| `large-v1` | `Systran/faster-whisper-large-v1` | 3.09 GB | Best-quality large-v1 default |
+| `large-v3` | `Systran/faster-whisper-large-v3` | 3.09 GB | Latest full multilingual model |
+| `large-v3-turbo` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | 1.62 GB | Fast multilingual large-v3 variant |
+| `large-v2` | `Systran/faster-whisper-large-v2` | 3.09 GB | Previous full multilingual model |
+| `distil-large-v3.5` | `distil-whisper/distil-large-v3.5-ct2` | 1.52 GB | Distilled multilingual large-v3.5 |
+| `distil-large-v3` | `Systran/faster-distil-whisper-large-v3` | 1.52 GB | Distilled multilingual large-v3 |
+| `distil-large-v2` | `Systran/faster-distil-whisper-large-v2` | 1.52 GB | Distilled multilingual large-v2 |
+| `medium` | `Systran/faster-whisper-medium` | 1.53 GB | Balanced multilingual model |
+| `medium.en` | `Systran/faster-whisper-medium.en` | 1.53 GB | English-only medium model |
+| `distil-medium.en` | `Systran/faster-distil-whisper-medium.en` | 792.1 MB | Fast distilled English medium model |
+| `small` | `Systran/faster-whisper-small` | 486.2 MB | Compact multilingual model |
+| `small.en` | `Systran/faster-whisper-small.en` | 486.1 MB | Compact English-only model |
+| `distil-small.en` | `Systran/faster-distil-whisper-small.en` | 335.5 MB | Fast distilled English small model |
+| `base` | `Systran/faster-whisper-base` | 147.9 MB | Small multilingual model |
+| `base.en` | `Systran/faster-whisper-base.en` | 147.8 MB | Small English-only model |
+| `tiny` | `Systran/faster-whisper-tiny` | 78.2 MB | Smallest multilingual model |
+| `tiny.en` | `Systran/faster-whisper-tiny.en` | 78.1 MB | Smallest English-only model |
+
+Whisper runs in a separate CTranslate2 process and discovers the CUDA 12 cuBLAS/cuDNN libraries installed in the active environment. `Device: auto` tries CUDA and falls back to CPU/int8 when the runtime is unavailable; forcing `cuda` surfaces the runtime error instead. This CUDA runtime is independent of the PyTorch CUDA 13 runtime used by caption models.
 
 ## Installation
 
@@ -130,6 +161,8 @@ Dark is the default. The **🌗 Light / dark theme** button at the top right of 
 
 **Open / Close All** in the preset bar expands or collapses every section of the tab you are looking at, including sections nested inside others; it runs entirely in the browser and never touches the server. **⟲ Load Last Values**, immediately to its left, applies the preset this machine used last.
 
+The top-level order is Caption, Processing Pipeline, Transcribe, Chat, Caption Editor, Dataset & Export, Global Settings, Recover Settings, System & Models, and Changelog. Transcribe mirrors Caption's two-column workflow: inputs, streamed result, actions, progress, item tracker, live log, and resource meter stay on the left; model, language, decoding, timestamp/output, and VAD settings stay in numbered accordions on the right.
+
 ## Keyboard Shortcuts
 
 Shortcuts are scoped to the active tab.
@@ -139,6 +172,8 @@ Shortcuts are scoped to the active tab.
 | Any tab | `F4` | Open or close every section of the visible tab (same as **Open / Close All**). |
 | Caption, Processing Pipeline | `F9` | Start captioning. |
 | Caption, Processing Pipeline | `Esc` | Arm cancellation for six seconds; press again to confirm while a caption job is active. |
+| Transcribe | `F9` | Start speech transcription. |
+| Transcribe | `Esc` | Open the confirmation bar for an active transcription. |
 | Caption Editor | `←` / `→` | Previous / next item when focus is outside a text field. |
 | Caption Editor | `Ctrl+S` | Save the current caption, including while editing its textbox. |
 | Caption Editor | `Ctrl+Enter` | Approve the current item. |
@@ -146,7 +181,7 @@ Shortcuts are scoped to the active tab.
 
 ## Console and UI Progress
 
-Captioning, preprocessing, model downloads, and model loading report through both the terminal and Gradio. Running status includes processed/total counts, elapsed item and job time, remaining items, ETA when available, and generation tokens per second; console status is rate-limited while the UI continues to refresh.
+Captioning, Whisper transcription, preprocessing, model downloads, and model loading report through both the terminal and Gradio. Running status includes processed/total counts, elapsed item and job time, remaining items, ETA when available, and generation or realtime speed; console status is rate-limited while the UI continues to refresh.
 
 ## Model Variants
 
@@ -199,6 +234,8 @@ Fresh measurements below are three-generation means on physical GPU 0, an RTX 50
 - [Qwen3-Omni GGUF backend](docs/GGUF_BACKEND.md)
 - [Quantization quality report](docs/QUANT_REPORT.md)
 - [Consolidated benchmarks](docs/BENCHMARKS.md)
+- [Whisper speech transcription backend](docs/WHISPER.md)
+- [QA verification log v1.5.0](docs/QA_VERIFICATION_v1.5.0.md)
 
 ## Troubleshooting
 

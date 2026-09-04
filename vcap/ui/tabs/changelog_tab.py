@@ -12,6 +12,21 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.5.0",
+        "2026-09-04",
+        """
+### Whisper speech transcription, and every feature re-verified in Chrome
+
+- New **🎙️ Transcribe** tab: faster-whisper (CTranslate2) transcription for single files, file paths, and recursive folder batches, with the complete faster-whisper parameter set (model, language, translate, beam/best-of/patience, temperature, penalties, thresholds, prompts, hotwords, word timestamps with normalized cues or word highlighting, chunking, Silero VAD), SRT/WebVTT/TXT/LRC/TSV/JSON outputs, trim range, live streamed segments with ETA and realtime speed, confirmed cancellation, Retry failed, Results ZIP, Open in Caption Editor, `metadata.json` + `run_log.txt` per run, run-history and Recover Settings integration, and F9/Esc hotkeys.
+- Whisper models download automatically on first use with resumable progress in the terminal and the interface (`models/whisper/<alias>`); 17 aliases (large-v1/v2/v3, large-v3-turbo, distil, medium, small, base, tiny) are listed with their download size and downloaded state, and can be downloaded, verified, or deleted from the Transcribe tab, System & Models, and `Models_Downloader.py`. The defaults mirror the proven SECourses Whisper configuration (large-v1, float16, beam 5, repetition penalty 1.2, word timestamps + normalized subtitles); the reference app produces identical output for identical parameters.
+- New **7. Speech transcript (Whisper)** stage in the Processing Pipeline: every caption run can transcribe the same input first, write `<name>_transcript.srt/.txt` next to the caption, and inject the clip-local speech into the prompt through the new `{{TRANSCRIPT}}` template variable; the run log records what was injected and `metadata.json` carries a transcript summary.
+- Three shipped presets: **Transcribe - Whisper best quality (large-v1)**, **Transcribe - Whisper large-v3 turbo (fast)**, and **Caption + Whisper transcript (Qwen3-Omni Instruct)**. Whisper runs in its own subprocess that never imports PyTorch, so CUDA 12 CTranslate2 and CUDA 13 PyTorch coexist; the requirements gained `faster-whisper`, `ctranslate2`, `onnxruntime`, `nvidia-cublas-cu12` (and `nvidia-cudnn-cu12` on Linux).
+- Fixed from the full real-user Chrome pass: Caption Editor **Regenerate selected** on a scene segment now re-captions only that clip window (40 s instead of 100 s, single caption replaced) and **Export approved** cuts the approved segment from the source instead of copying the whole video; segment rows show `…_segments/clip_0003.txt · 00:09.5–00:11.8`; the first scanned item is selected with its preview; find & replace defaults to whole words; typing an unknown value into the Task / prompt preset boxes no longer raises; Chat reuses the resident model instead of unloading and reloading the same variant; **Write plan JSON** works with the default folders; the progress bar starts at `Preparing…` instead of a full `ready` bar; Results ZIP renders on its own row; regeneration runs show up correctly in Run history; Enter sends a chat message (Shift+Enter adds a line); Save-as clears after a preset delete; Unload reports the real VRAM change; the System & Models timer no longer walks model folders every 3 seconds; Caption-tab downloads and scene previews can be cancelled; `output_formats`, `system_prompt`, and `trim_end_s` are typed in the registry; the literal text `None` can no longer become a system prompt.
+- Selecting a long video that a browser cannot play (VP9/Opus MP4, MKV, HEVC…) no longer re-encodes it for the preview: the input block shows a first-frame poster immediately and the probe, resolved input, and Start are never delayed.
+- Verified in Chrome on an RTX 5090: every tab, single/path/folder inputs with Unicode paths, cancel/confirm, batch skip and retry, presets, editor tools, dataset tools, settings, recover, health, Qwen3-Omni INT4 and GGUF Q4, TimeChat INT4, Whisper large-v1 and large-v3-turbo (5-, 10-, and 28-minute inputs), automatic model download, and the caption + transcript pipeline. See docs/QA_VERIFICATION_v1.5.0.md.
+""".strip(),
+    ),
+    (
         "v1.4.1",
         "2026-09-04",
         """

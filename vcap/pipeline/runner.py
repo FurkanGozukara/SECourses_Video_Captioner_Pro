@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import threading
@@ -45,7 +46,7 @@ from vcap.core.scene_split import SceneDetectParams, SceneRange, plan_segments, 
 from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, ModelSpec, variant_to_family
 
-from .job import InputItem, ItemResult, JobResult, JobSpec
+from .job import InputItem, ItemResult, JobResult, JobSpec, TranscriptSpec
 
 
 _TOTAL_STEPS = 8
@@ -693,6 +694,87 @@ def _metadata_finish_reason(items: Sequence[ItemResult]) -> str | list[str] | No
     return reasons[0] if len(reasons) == 1 else reasons
 
 
+def _metadata_transcript_summary(
+    spec: JobSpec,
+    items: Sequence[ItemResult],
+) -> dict[str, Any] | None:
+    if not spec.transcript.enabled:
+        return None
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for item in sorted(items, key=lambda value: value.index):
+        raw = item.transcript
+        if not isinstance(raw, Mapping):
+            continue
+        if raw.get("error"):
+            errors.append(
+                {
+                    "item_index": item.index,
+                    "path": item.path,
+                    "error": str(raw["error"]),
+                }
+            )
+            continue
+        probability = raw.get("language_probability", raw.get("probability"))
+        duration = float(raw.get("duration_s", raw.get("duration", 0.0)) or 0.0)
+        elapsed = float(raw.get("elapsed_s", raw.get("elapsed", 0.0)) or 0.0)
+        segment_count = int(raw.get("segment_count", raw.get("segments_count", 0)) or 0)
+        word_count = int(raw.get("word_count", raw.get("words_count", 0)) or 0)
+        record = {
+            "item_index": item.index,
+            "path": item.path,
+            "model": str(raw.get("model") or spec.transcript.whisper.get("model") or ""),
+            "language": raw.get("language"),
+            "probability": probability,
+            "language_probability": probability,
+            "duration": duration,
+            "duration_s": duration,
+            "elapsed": elapsed,
+            "elapsed_s": elapsed,
+            "segments": segment_count,
+            "segment_count": segment_count,
+            "words": word_count,
+            "word_count": word_count,
+            "files": [str(value) for value in raw.get("files", []) or []],
+            "injected": bool(raw.get("injected", False)),
+        }
+        records.append(record)
+    if len(records) == 1 and not errors:
+        return records[0]
+    models = list(dict.fromkeys(record["model"] for record in records if record["model"]))
+    languages = list(
+        dict.fromkeys(str(record["language"]) for record in records if record["language"])
+    )
+    summary: dict[str, Any] = {
+        "model": (
+            models[0]
+            if len(models) == 1
+            else models
+            if models
+            else str(spec.transcript.whisper.get("model") or "")
+        ),
+        "language": languages[0] if len(languages) == 1 else languages,
+        "probability": records[0]["probability"] if len(records) == 1 else None,
+        "language_probability": records[0]["probability"] if len(records) == 1 else None,
+        "duration": sum(float(record["duration"]) for record in records),
+        "duration_s": sum(float(record["duration_s"]) for record in records),
+        "elapsed": sum(float(record["elapsed"]) for record in records),
+        "elapsed_s": sum(float(record["elapsed_s"]) for record in records),
+        "segments": sum(int(record["segment_count"]) for record in records),
+        "segment_count": sum(int(record["segment_count"]) for record in records),
+        "words": sum(int(record["word_count"]) for record in records),
+        "word_count": sum(int(record["word_count"]) for record in records),
+        "files": list(
+            dict.fromkeys(path for record in records for path in record["files"])
+        ),
+        "injected": any(bool(record["injected"]) for record in records),
+        "items": records,
+    }
+    if errors:
+        summary["errors"] = errors
+    return summary
+
+
 def _write_batch_summary(
     run_dir: Path,
     items: Sequence[ItemResult],
@@ -763,6 +845,10 @@ def _write_metadata(
     name = str(spec.internal.get("metadata_name") or "metadata.json")
     target = run_dir / sanitize_filename(name)
     builder = MetadataBuilder()
+    metadata_extra = {"counts": _status_counts(items), **dict(extra or {})}
+    transcript_summary = _metadata_transcript_summary(spec, items)
+    if transcript_summary is not None:
+        metadata_extra.setdefault("transcript", transcript_summary)
     builder.build(
         VERSION,
         model_info,
@@ -770,7 +856,7 @@ def _write_metadata(
         [item.to_dict() for item in sorted(items, key=lambda value: value.index)],
         {"elapsed_s": max(0.0, elapsed)},
         gpu_info,
-        {"counts": _status_counts(items), **dict(extra or {})},
+        metadata_extra,
     )
     source_root = normalize_path(spec.output.source_root) if spec.output.source_root else None
     explicit_metadata = dict(
@@ -887,6 +973,25 @@ def _media_budget_hint(spec: JobSpec, resolved: Sequence["_ResolvedInput"]) -> A
     )
 
 
+def _emit_model_download_progress(emitter: Any, message: Any, payload: Any = None) -> None:
+    """Keep readiness checks in the log instead of jumping the job bar to 100%."""
+
+    data = payload if isinstance(payload, Mapping) else {}
+    if str(data.get("state") or "").casefold() == "ready":
+        emitter.log(str(message), scope="models")
+        return
+    fraction = data.get("fraction") if isinstance(data, Mapping) else None
+    try:
+        parsed_fraction = float(fraction) if fraction is not None else None
+    except (TypeError, ValueError):
+        parsed_fraction = None
+    emitter.phase_progress(
+        str(message),
+        parsed_fraction,
+        data={"phase": "model_download", **dict(data)},
+    )
+
+
 class _ModelSession:
     def __init__(
         self,
@@ -960,17 +1065,7 @@ class _ModelSession:
         self._patched_loader = loader_is_patched
 
         def download_progress(message: Any, payload: Any = None) -> None:
-            data = payload if isinstance(payload, Mapping) else {}
-            fraction = data.get("fraction") if isinstance(data, Mapping) else None
-            try:
-                parsed_fraction = float(fraction) if fraction is not None else None
-            except (TypeError, ValueError):
-                parsed_fraction = None
-            self.emitter.phase_progress(
-                str(message),
-                parsed_fraction,
-                data={"phase": "model_download", **dict(data)},
-            )
+            _emit_model_download_progress(self.emitter, message, payload)
 
         if not loader_is_patched and os.environ.get("VCAP_SKIP_MODEL_ENSURE", "") != "1":
             ready, detail = downloads.ensure_model(
@@ -1614,6 +1709,240 @@ def _model_prompt(
     )
 
 
+class _PipelineTranscriptSink:
+    """Bridge Whisper worker events into the pipeline's existing progress stream."""
+
+    def __init__(self, emitter: _Emitter, entry: _ResolvedInput) -> None:
+        self.emitter = emitter
+        self.entry = entry
+
+    def on_log(self, message: str, level: str = "info") -> None:
+        self.emitter.log(message, level=level, scope="transcript")
+
+    def on_download(self, payload: dict[str, Any]) -> None:
+        message = str(payload.get("message") or "Downloading Whisper model")
+        self.emitter.log(message, scope="transcript")
+        try:
+            fraction = max(0.0, min(1.0, float(payload.get("fraction") or 0.0)))
+        except (TypeError, ValueError):
+            fraction = 0.0
+        self.emitter.progress(
+            self.entry.tracker_index,
+            self.entry.result_index,
+            message,
+            0.02 + 0.05 * fraction,
+            step_index=1,
+        )
+
+    def on_progress(self, payload: dict[str, Any]) -> None:
+        raw_fraction = payload.get("fraction", payload.get("progress", 0.0))
+        try:
+            fraction = max(0.0, min(1.0, float(raw_fraction or 0.0)))
+        except (TypeError, ValueError):
+            fraction = 0.0
+        self.emitter.progress(
+            self.entry.tracker_index,
+            self.entry.result_index,
+            str(payload.get("message") or "Transcribing speech"),
+            0.05 + 0.10 * fraction,
+            step_index=1,
+        )
+
+    def on_segment(self, payload: dict[str, Any]) -> None:
+        text = str(payload.get("text") or "").strip()
+        if text:
+            self.emitter.log(text, scope="transcript")
+
+    def on_item_done(self, payload: dict[str, Any]) -> None:
+        del payload
+
+    def on_item_error(self, payload: dict[str, Any]) -> None:
+        message = str(payload.get("message") or "Whisper transcription failed")
+        self.emitter.log(message, level="warning", scope="transcript")
+
+
+def _run_item_transcript(
+    spec: JobSpec,
+    entry: _ResolvedInput,
+    source: Path,
+    run_dir: Path,
+    emitter: _Emitter,
+    cancel: CancelToken,
+) -> tuple[Any | None, dict[str, Any] | None, dict[str, str]]:
+    """Run one transcript request without importing Whisper at module import time."""
+
+    from vcap.whisper.client import build_request, run_transcription
+    from vcap.whisper.params import TranscriptOutputOptions, WhisperParams
+
+    params = WhisperParams.from_dict(spec.transcript.whisper)
+    output = TranscriptOutputOptions(
+        formats=tuple(spec.transcript.formats),
+        file_suffix=spec.transcript.file_suffix,
+    )
+    request = build_request(
+        params,
+        output,
+        [
+            {
+                "index": entry.result_index,
+                "path": str(source),
+                "out_dir": str(entry.out_dir),
+                "stem": entry.stem,
+                "trim_start_s": 0.0,
+                "trim_end_s": None,
+            }
+        ],
+    )
+    emitter.log(f"Transcribing speech for {entry.stem}", scope="transcript")
+    outcome = run_transcription(
+        request,
+        sink=_PipelineTranscriptSink(emitter, entry),
+        cancel=cancel,
+        request_dir=run_dir / ".work" / "whisper",
+    )
+    if bool(getattr(outcome, "cancelled", False)) or cancel.is_cancelled():
+        raise CancelledError("Whisper transcription cancelled")
+    result = getattr(outcome, "results", {}).get(entry.result_index)
+    items = list(getattr(outcome, "items", []) or [])
+    item_payload = next(
+        (
+            item
+            for item in items
+            if int(item.get("item_index", entry.result_index)) == entry.result_index
+        ),
+        items[0] if items else {},
+    )
+    if result is None:
+        error = str(
+            item_payload.get("message")
+            or getattr(outcome, "error", "")
+            or "Whisper returned no transcript"
+        )
+        raise RuntimeError(error)
+
+    data = result.to_dict()
+    files = [str(path) for path in item_payload.get("files", []) or []]
+    data["files"] = files
+    outputs: dict[str, str] = {}
+    for path_text in files:
+        path = Path(path_text)
+        key = f"transcript_{path.suffix.casefold().lstrip('.') or len(outputs) + 1}"
+        outputs[key] = str(path)
+    result_segments = list(getattr(result, "segments", []) or [])
+    segment_count = len(result_segments)
+    word_count = sum(
+        1
+        for segment in result_segments
+        for word in (getattr(segment, "words", None) or [])
+        if str(getattr(word, "word", "") or "").strip()
+    )
+    if not word_count:
+        word_count = len(str(getattr(result, "text", "") or "").split())
+    language = str(getattr(result, "language", None) or "unknown")
+    elapsed = float(getattr(result, "elapsed_s", 0.0) or 0.0)
+    probability = getattr(result, "language_probability", None)
+    duration = float(getattr(result, "duration_s", 0.0) or 0.0)
+    data.update(
+        probability=probability,
+        duration=duration,
+        elapsed=elapsed,
+        segment_count=segment_count,
+        word_count=word_count,
+        injected=False,
+        injection_windows=[],
+    )
+    emitter.log(
+        f"Transcript: {segment_count} segments, {word_count} words, language {language}, {elapsed:.1f} s",
+        scope="transcript",
+    )
+    return result, data, outputs
+
+
+_TRANSCRIPT_TOKEN_RE = re.compile(r"\{\{\s*TRANSCRIPT\s*\}\}", re.IGNORECASE)
+
+
+def _prompt_has_transcript_token(prompt: Any) -> bool:
+    template = getattr(prompt, "user_prompt", None)
+    if template is None and getattr(prompt, "preset_id", None):
+        try:
+            from vcap.prompts.presets import get_preset
+
+            template = get_preset(str(prompt.preset_id)).user_prompt
+        except KeyError:
+            template = None
+    return bool(_TRANSCRIPT_TOKEN_RE.search(str(template or "")))
+
+
+def _transcript_clock(seconds: float) -> str:
+    tenths = max(0, int(round(float(seconds) * 10.0)))
+    hours, remainder = divmod(tenths, 36_000)
+    minutes, remainder = divmod(remainder, 600)
+    whole_seconds, fraction = divmod(remainder, 10)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{fraction}"
+    return f"{minutes:02d}:{whole_seconds:02d}.{fraction}"
+
+
+def _prompt_with_transcript(
+    prompt: Any,
+    transcript_result: Any | None,
+    start_s: float,
+    end_s: float,
+    transcript_spec: TranscriptSpec,
+) -> tuple[Any, str]:
+    """Fill the transcript token last and optionally append the configured wrapper."""
+
+    from vcap.prompts.presets import _render_template, get_preset, render_prompt
+
+    transcript_text = ""
+    if transcript_result is not None:
+        from vcap.whisper.engine import text_between
+
+        transcript_text = text_between(transcript_result, start_s, end_s)
+    variables = dict(getattr(prompt, "variables", {}) or {})
+    variables["TRANSCRIPT"] = transcript_text
+
+    direct_user = getattr(prompt, "user_prompt", None)
+    template_user = direct_user
+    preset = None
+    preset_id = getattr(prompt, "preset_id", None)
+    if template_user is None and preset_id:
+        try:
+            preset = get_preset(preset_id)
+            template_user = preset.user_prompt
+        except KeyError:
+            preset = None
+
+    has_token = bool(_TRANSCRIPT_TOKEN_RE.search(str(template_user or "")))
+    user_prompt = direct_user
+    if direct_user is not None:
+        user_prompt = _TRANSCRIPT_TOKEN_RE.sub(transcript_text, str(direct_user))
+    elif has_token and preset is not None:
+        _, user_prompt = render_prompt(preset, variables)
+
+    if transcript_spec.inject_prompt and not has_token and transcript_result is not None:
+        wrapper = _render_template(transcript_spec.prompt_wrapper, variables) or ""
+        if user_prompt is None and preset is not None:
+            _, user_prompt = render_prompt(preset, variables)
+        base = str(user_prompt or "").strip()
+        user_prompt = "\n\n".join(part for part in (base, wrapper.strip()) if part)
+
+    return replace(prompt, user_prompt=user_prompt, variables=variables), transcript_text
+
+
+def _structured_with_transcript(
+    structured: Any,
+    transcript: Mapping[str, Any] | None,
+) -> Any:
+    if not transcript:
+        return structured
+    if isinstance(structured, Mapping):
+        return {**dict(structured), "transcript": dict(transcript)}
+    if structured is None:
+        return {"transcript": dict(transcript)}
+    return {"caption": structured, "transcript": dict(transcript)}
+
+
 def _model_gen(spec: JobSpec) -> Any:
     from vcap.models.base import GenParams as ModelGenParams
 
@@ -2061,6 +2390,28 @@ def _process_item(
         else:
             assert entry.path is not None and entry.info is not None
             source, info, trim_offset = _trim_source(spec, entry, entry.path, work_dir, emitter)
+        transcript_result: Any | None = None
+        transcript_data: dict[str, Any] | None = None
+        transcript_outputs: dict[str, str] = {}
+        if spec.transcript.enabled and entry.kind in {"video", "audio"} and source is not None:
+            try:
+                transcript_result, transcript_data, transcript_outputs = _run_item_transcript(
+                    spec,
+                    entry,
+                    source,
+                    run_dir,
+                    emitter,
+                    cancel,
+                )
+            except CancelledError:
+                raise
+            except Exception as exc:
+                transcript_data = {"error": f"{type(exc).__name__}: {exc}"}
+                emitter.log(
+                    f"Transcript failed; continuing without speech text: {type(exc).__name__}: {exc}",
+                    level="warning",
+                    scope="transcript",
+                )
         emitter.progress(entry.tracker_index, entry.result_index, "Planning segments", 0.18, step_index=2)
         segments = (
             [SceneRange(0.0, 0.0)]
@@ -2172,6 +2523,58 @@ def _process_item(
                     f"Applied previous-segment context to clip {segment.index}/{total_sources}.",
                     scope="prompts",
                 )
+            transcript_injected = bool(
+                transcript_result is not None
+                and (
+                    spec.transcript.inject_prompt
+                    or _prompt_has_transcript_token(segment_prompt)
+                )
+            )
+            segment_prompt, clip_transcript = _prompt_with_transcript(
+                segment_prompt,
+                transcript_result,
+                segment.start_s,
+                segment.end_s,
+                spec.transcript,
+            )
+            clip_word_count = len(clip_transcript.split())
+            if transcript_result is not None:
+                window_start = trim_offset + segment.start_s
+                window_end = trim_offset + segment.end_s
+                detail = (
+                    f"{clip_word_count} words"
+                    if clip_word_count
+                    else "no speech in this window"
+                )
+                if transcript_injected:
+                    emitter.log(
+                        "Transcript injected into the prompt for clip "
+                        f"{segment.index} ({_transcript_clock(window_start)}–"
+                        f"{_transcript_clock(window_end)}): {detail}",
+                        scope="transcript",
+                    )
+                else:
+                    emitter.log(
+                        "Transcript not injected into the prompt for clip "
+                        f"{segment.index} ({_transcript_clock(window_start)}–"
+                        f"{_transcript_clock(window_end)}): {detail}",
+                        scope="transcript",
+                    )
+                if transcript_data is not None:
+                    transcript_data["injected"] = bool(
+                        transcript_data.get("injected", False) or transcript_injected
+                    )
+                    windows = transcript_data.setdefault("injection_windows", [])
+                    if isinstance(windows, list):
+                        windows.append(
+                            {
+                                "clip": segment.index,
+                                "start_s": window_start,
+                                "end_s": window_end,
+                                "word_count": clip_word_count,
+                                "injected": transcript_injected,
+                            }
+                        )
             caption_result = _caption_with_oom_recovery(
                 spec,
                 model,
@@ -2201,6 +2604,21 @@ def _process_item(
             final_structured = _finalize_structured(
                 spec,
                 getattr(caption_result, "structured", None),
+            )
+            clip_transcript_data = (
+                {
+                    "start_s": trim_offset + segment.start_s,
+                    "end_s": trim_offset + segment.end_s,
+                    "text": clip_transcript,
+                    "word_count": clip_word_count,
+                    "injected": transcript_injected,
+                }
+                if transcript_data is not None
+                else None
+            )
+            final_structured = _structured_with_transcript(
+                final_structured,
+                clip_transcript_data,
             )
             local_cues = [
                 Segment(float(start), float(end), _finalize_cue_text(spec, str(text)))
@@ -2263,6 +2681,7 @@ def _process_item(
                 finish_reason=usage.get("finish_reason"),
                 timing=_record_value(timing),
                 peak_vram_gb=float(getattr(caption_result, "peak_vram_gb", 0.0) or 0.0),
+                transcript=clip_transcript_data,
             )
             accepted.append(record)
             previous_final_text = final_text
@@ -2285,9 +2704,11 @@ def _process_item(
                 "skipped",
                 message,
                 segments=accepted,
+                outputs=dict(transcript_outputs),
                 elapsed=elapsed,
                 peak_vram_gb=peak,
                 gpu_index=spec.runtime.gpu_index,
+                transcript=transcript_data,
             )
         if len(done_records) == 1:
             combined_text = str(done_records[0]["caption"])
@@ -2335,6 +2756,7 @@ def _process_item(
                 combined_structured = {**dict(combined_structured), "summary": summary}
             else:
                 combined_structured = {"segments": combined_structured, "summary": summary}
+        combined_structured = _structured_with_transcript(combined_structured, transcript_data)
         emitter.progress(entry.tracker_index, entry.result_index, "Writing combined outputs", 0.94, step_index=7)
         formats = list(spec.post.formats)
         if spec.post.save_reasoning and combined_reasoning and "reasoning" not in formats:
@@ -2351,6 +2773,7 @@ def _process_item(
         )
         if summary_path is not None:
             combined_paths["summary"] = summary_path
+        combined_paths.update({key: Path(value) for key, value in transcript_outputs.items()})
         elapsed = time.perf_counter() - started
         emitter.progress(entry.tracker_index, entry.result_index, "Item complete", 1.0, step_index=8)
         return ItemResult(
@@ -2367,6 +2790,7 @@ def _process_item(
             summary=summary,
             summary_usage=summary_usage,
             summary_timing=summary_timing,
+            transcript=transcript_data,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

@@ -9,4 +9,5 @@ __all__ = [
     "health_tab",
     "recover_tab",
     "settings_tab",
+    "transcribe_tab",
 ]

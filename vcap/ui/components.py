@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import math
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 import gradio as gr
+from gradio import processing_utils
 
+from vcap import TEMP_DIR
 from vcap.core import gpu
 from vcap.core.captions_post import parse_replace_pairs, replace_pairs_to_html_chips
-from vcap.core.media import MediaInfo, probe_media
+from vcap.core.media import MediaInfo, make_thumbnail, probe_media
 from vcap.core.paths import (
     guess_kind_by_extension,
     list_media_files,
@@ -318,6 +321,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             return (
                 *skipped(),
                 gr.skip(),
+                gr.skip(),
                 "<span class='vc-warn'>No preset deletion was pending.</span>",
                 gr.skip(),
                 gr.update(visible=False),
@@ -338,6 +342,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             return (
                 *preset_values(coerced),
                 gr.update(choices=_preset_choices(ctx), value=default_name),
+                "",
                 (
                     "<span class='vc-ok'>Deleted "
                     f"{html.escape(selected)}; loaded {html.escape(default_name)}.</span>"
@@ -350,6 +355,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             return (
                 *skipped(),
                 gr.update(choices=_preset_choices(ctx)),
+                gr.skip(),
                 f"<span class='vc-err'>{html.escape(str(exc))}</span>",
                 gr.skip(),
                 gr.update(visible=False),
@@ -358,7 +364,12 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
 
     def reset_settings() -> tuple[Any, ...]:
         defaults = registry.defaults()
-        return (*preset_values(defaults), "<span class='vc-ok'>Restored preset defaults.</span>", applied("", defaults))
+        return (
+            *preset_values(defaults),
+            gr.update(value=None),
+            "<span class='vc-ok'>Restored application defaults (defaults).</span>",
+            applied("", defaults),
+        )
 
     def apply_named_preset(name: str | None, *, remember: bool, lead: str) -> tuple[Any, ...]:
         """Apply one preset by name, falling back to application defaults."""
@@ -413,6 +424,12 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
             lead="Loaded last used:" if remembered else "No preset used yet; loaded",
         )
 
+    ctx.states["preset_bar_handlers"] = {
+        "confirm_delete": confirm_delete_preset,
+        "reset": reset_settings,
+        "component_count": len(components),
+    }
+
     handles.save.click(
         save_preset,
         inputs=[handles.save_as, *components],
@@ -454,6 +471,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         outputs=[
             *components,
             handles.dropdown,
+            handles.save_as,
             handles.status,
             applied_state,
             handles.delete_confirmation,
@@ -473,7 +491,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     )
     reset_event = handles.reset.click(
         reset_settings,
-        outputs=[*components, handles.status, applied_state],
+        outputs=[*components, handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -551,6 +569,11 @@ class MediaInputHandles:
     mode_state: gr.State
     modality_state: gr.State
     duration_state: gr.State
+    save_next_to_source: Any = None
+    existing_extension_state: Any = None
+    scan_fn: Callable[..., tuple[Any, ...]] | None = None
+    scan_inputs: list[Any] | None = None
+    scan_outputs: list[Any] | None = None
 
 
 def _paths(value: Any) -> list[str]:
@@ -582,15 +605,20 @@ def _duration(value: float | None) -> str:
 def _media_info_markdown(info: MediaInfo) -> str:
     if info.kind == "unknown":
         return f"<span class='vc-err'>Could not inspect media: {html.escape(info.error or 'unknown error')}</span>"
-    # ASCII separators keep compact dimensions visually unambiguous.
-    geometry = f"{int(info.width)} x {int(info.height)}" if info.width and info.height else "n/a"
-    frame_rate = f"{info.fps:.3g} fps" if info.fps else "n/a"
     audio = (
         f"{info.audio_codec or 'audio'}, {info.audio_sample_rate or '?'} Hz, {info.audio_channels or '?'} ch"
         if info.has_audio
         else "no audio"
     )
     codec = info.video_codec or info.audio_codec or info.container or "n/a"
+    if info.kind == "audio":
+        return (
+            f"**{html.escape(info.path.name)}** · audio · {_duration(info.duration)} · "
+            f"{html.escape(audio)} · codec `{html.escape(codec)}`"
+        )
+    # ASCII separators keep compact dimensions visually unambiguous.
+    geometry = f"{int(info.width)} x {int(info.height)}" if info.width and info.height else "n/a"
+    frame_rate = f"{info.fps:.3g} fps" if info.fps else "n/a"
     return (
         f"**{html.escape(info.path.name)}** · {html.escape(info.kind)} · {_duration(info.duration)} · "
         f"{geometry} · {frame_rate} · {html.escape(audio)} · codec `{html.escape(codec)}`"
@@ -632,14 +660,43 @@ def _preview_updates(paths: list[str]) -> tuple[Any, ...]:
     video = gr.update(value=None, visible=False)
     audio = gr.update(value=None, visible=False)
     image = gr.update(value=None, visible=False)
+    details = _media_info_markdown(info)
+    modality = "video_audio" if info.kind == "video" else "video" if info.kind == "video_no_audio" else info.kind
     if info.kind in {"video", "video_no_audio"}:
-        video = gr.update(value=str(info.path), visible=True)
+        try:
+            playable = bool(processing_utils.video_is_playable(str(info.path)))
+        except Exception:
+            playable = False
+        if playable:
+            video = gr.update(value=str(info.path), visible=True)
+        else:
+            container = info.container or info.path.suffix.lstrip(".") or "unknown"
+            video_codec = info.video_codec or "unknown video"
+            audio_codec = info.audio_codec or "no audio"
+            preview_note = (
+                "Preview shows the first frame: "
+                f"{container}/{video_codec}/{audio_codec} is not browser-playable. "
+                "Trim range still works."
+            )
+            details += f"<br><span class='vc-help'>{html.escape(preview_note)}</span>"
+            try:
+                stat = info.path.stat()
+                identity = f"{info.path.resolve(strict=False)}\0{stat.st_size}\0{stat.st_mtime_ns}"
+                digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()[:28]
+                poster = normalize_path(TEMP_DIR / "preview_posters" / f"{digest}.png")
+                if not poster.is_file() or not poster.stat().st_size:
+                    poster = make_thumbnail(info.path, poster, at_seconds=0.0, width=960)
+                image = gr.update(value=str(poster), visible=True)
+            except Exception as exc:
+                details += (
+                    "<br><span class='vc-warn'>First-frame preview unavailable: "
+                    f"{html.escape(str(exc))}</span>"
+                )
     elif info.kind == "audio":
         audio = gr.update(value=str(info.path), visible=True)
     elif info.kind == "image":
         image = gr.update(value=str(info.path), visible=True)
-    modality = "video_audio" if info.kind == "video" else "video" if info.kind == "video_no_audio" else info.kind
-    return video, audio, image, _media_info_markdown(info), _input_gallery(paths), modality, float(info.duration or 0.0)
+    return video, audio, image, details, _input_gallery(paths), modality, float(info.duration or 0.0)
 
 
 def _folder_scan(
@@ -650,6 +707,11 @@ def _folder_scan(
     limit_items: int | float = 0,
     include_kinds: Iterable[str] | None = None,
     name_filter: str = "",
+    allowed_kinds: Iterable[str] = ("video", "audio", "image", "text"),
+    existing_extension: str = ".txt",
+    save_next_to_source: bool = False,
+    existing_item_noun: str = "captioned",
+    existing_files_label: str = "captions",
 ) -> tuple[list[str], str]:
     raw = str(folder or "").strip()
     if not raw:
@@ -660,10 +722,15 @@ def _folder_scan(
         return [], f"<span class='vc-err'>{html.escape(str(exc))}</span>"
     if not root.is_dir():
         return [], f"<span class='vc-err'>Folder does not exist: {html.escape(str(root))}</span>"
+    selected_kinds = tuple(
+        value
+        for value in (str(item).casefold() for item in allowed_kinds)
+        if value in {"video", "audio", "image", "text"}
+    ) or ("video", "audio", "image", "text")
     found = list_media_files(
         root,
         recursive=bool(recursive),
-        kinds=("video", "audio", "image", "text"),
+        kinds=selected_kinds,
     )
     try:
         # Task A owns this helper. The local import keeps the UI buildable while
@@ -675,7 +742,7 @@ def _folder_scan(
         found = filter_media_paths(
             found,
             (
-                ["video", "audio", "image", "text"]
+                list(selected_kinds)
                 if include_kinds is None
                 else list(include_kinds)
             ),
@@ -687,25 +754,37 @@ def _folder_scan(
         return [], f"<span class='vc-err'>Invalid output folder: {html.escape(str(exc))}</span>"
     counts = {"video": 0, "audio": 0, "image": 0, "text": 0}
     existing = 0
+    extension = str(existing_extension or ".txt").strip().casefold()
+    if not extension.startswith("."):
+        extension = "." + extension
     for path in found:
         kind = guess_kind_by_extension(path)
         if kind in counts:
             counts[kind] += 1
         relative = path.relative_to(root)
-        caption_path = output_root / relative.with_suffix(".txt") if output_root is not None else None
+        caption_path = (
+            path.with_suffix(extension)
+            if save_next_to_source
+            else output_root / relative.with_suffix(extension)
+            if output_root is not None
+            else None
+        )
         if caption_path is not None and caption_path.is_file():
             existing += 1
     overwrite_hint = (
-        "Overwrite is on; existing captions will be replaced."
+        f"Overwrite is on; existing {existing_files_label} will be replaced."
         if overwrite
-        else "Overwrite is off; existing captions will be skipped."
+        else f"Overwrite is off; existing {existing_files_label} will be skipped."
     )
-    summary = (
-        f"🎬 {counts['video']} videos · 🎵 {counts['audio']} audios · "
-        f"🖼️ {counts['image']} images · 📄 {counts['text']} texts · "
-        f"{existing} already captioned in output folder. "
-        f"{overwrite_hint}"
-    )
+    count_labels = {
+        "video": f"🎬 {counts['video']} videos",
+        "audio": f"🎵 {counts['audio']} audios",
+        "image": f"🖼️ {counts['image']} images",
+        "text": f"📄 {counts['text']} texts",
+    }
+    summary = " · ".join(count_labels[kind] for kind in selected_kinds)
+    location = "next to source files" if save_next_to_source else "in output folder"
+    summary += f" · {existing} already {existing_item_noun} {location}. {overwrite_hint}"
     limit = max(0, int(limit_items or 0))
     if limit:
         summary += f" · limiting to first {limit}"
@@ -810,6 +889,12 @@ def _resolved_after_preview_edit(
         return selected
     resolved = str(normalize_path(value))
     if selected:
+        try:
+            cached_path = normalize_path(resolved)
+            cached_path.relative_to(normalize_path(TEMP_DIR / "preview_posters"))
+            return selected
+        except (OSError, TypeError, ValueError):
+            pass
         cache_root = os.environ.get("GRADIO_TEMP_DIR")
         if cache_root:
             try:
@@ -826,41 +911,89 @@ def _resolved_after_preview_edit(
     return [resolved, *selected[1:]] if selected else [resolved]
 
 
-def media_input_block(ctx: "UiContext") -> MediaInputHandles:
-    """Build the single upload/path/folder input surface and auto-preview wiring."""
+def media_input_block(
+    ctx: "UiContext",
+    *,
+    registry_keys: Mapping[str, str] | None = None,
+    state_prefix: str = "",
+    allowed_kinds: Iterable[str] = ("video", "audio", "image", "text"),
+    settings_section: str | None = None,
+    output_folder_default: str | os.PathLike[str] | None = None,
+    output_folder_registry_default: str | None = None,
+    output_folder_label: str = "Batch output folder",
+    output_folder_info: str = "Input names and relative folders are mirrored here.",
+    overwrite_label: str = "Overwrite existing captions",
+    overwrite_info: str = "Off skips media that already has the requested output.",
+    limit_info: str = "Process only the first N items that are not already captioned.",
+    folder_placeholder: str = "Folder containing videos, audio, or images",
+    upload_description: str = "Uploaded video, audio, image, or text files.",
+    show_archive_upload: bool = True,
+    show_kind_filters: bool = True,
+    save_next_to_source_key: str | None = None,
+    default_existing_extension: str = ".txt",
+    existing_item_noun: str = "captioned",
+    existing_files_label: str = "captions",
+    input_tabs_elem_id: str = "vc-input-tabs",
+) -> MediaInputHandles:
+    """Build the shared upload/path/folder surface with optional namespacing.
+
+    Caption keeps the historical defaults. Other tabs can restrict media kinds
+    and provide their own registry/state keys without duplicating preview and
+    folder-scan behaviour.
+    """
+
+    keys = dict(registry_keys or {})
+
+    def setting_key(name: str) -> str:
+        return str(keys.get(name) or name)
+
+    def state_key(name: str) -> str:
+        return f"{state_prefix}{name}" if state_prefix else name
+
+    section = str(settings_section or "input")
+    selected_kinds = tuple(
+        value
+        for value in (str(item).casefold() for item in allowed_kinds)
+        if value in {"video", "audio", "image", "text"}
+    ) or ("video", "audio", "image", "text")
 
     resolved_state = gr.State([])
     mode_state = gr.State("upload")
     modality_state = gr.State("video_audio")
     duration_state = gr.State(0.0)
+    existing_extension_state = gr.State(str(default_existing_extension or ".txt"))
     ctx.states.update(
-        resolved_inputs=resolved_state,
-        input_mode=mode_state,
-        input_modality=modality_state,
-        input_duration=duration_state,
+        {
+            state_key("resolved_inputs"): resolved_state,
+            state_key("input_mode"): mode_state,
+            state_key("input_modality"): modality_state,
+            state_key("input_duration"): duration_state,
+        }
     )
 
     with gr.Column():
         gr.Markdown("### Input")
-        with gr.Tabs(selected="upload", elem_id="vc-input-tabs") as input_tabs:
+        with gr.Tabs(selected="upload", elem_id=input_tabs_elem_id) as input_tabs:
             with gr.Tab("📤 Upload files", id="upload") as upload_tab:
                 # Inside a group Gradio draws the drop zone with its bold dashed
                 # outline, the same look as the reference-voice field in IndexTTS.
                 with gr.Group():
                     files = gr.File(
                         file_count="multiple",
-                        file_types=["video", "audio", "image", ".txt"],
+                        file_types=[".txt" if kind == "text" else kind for kind in selected_kinds],
                         type="filepath",
                         label="Files",
                         height=118,
                     )
+                    gr.Markdown(upload_description, elem_classes=["vc-help"])
                 ctx.reg(
-                    "input_files",
+                    setting_key("input_files"),
                     files,
                     [],
-                    section="input",
-                    description="Uploaded video, audio, image, or text files.",
+                    section=section,
+                    description=upload_description,
                     in_preset=False,
+                    kind="list",
                 )
             with gr.Tab("📄 File path", id="path") as path_tab:
                 path = gr.Textbox(
@@ -869,10 +1002,10 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                     info="Quoted, mixed-separator, and non-ASCII paths are supported.",
                 )
                 ctx.reg(
-                    "input_path",
+                    setting_key("input_path"),
                     path,
                     "",
-                    section="input",
+                    section=section,
                     description="Local path treated exactly like an uploaded file.",
                     in_preset=False,
                     kind="str",
@@ -880,89 +1013,95 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
             with gr.Tab("📁 Folder batch", id="folder") as folder_tab:
                 folder = gr.Textbox(
                     label="Input folder",
-                    placeholder="Folder containing videos, audio, or images",
+                    placeholder=folder_placeholder,
                     info="The light scan reads filenames only; media is probed during processing.",
                 )
                 ctx.reg(
-                    "batch_input_folder",
+                    setting_key("batch_input_folder"),
                     folder,
                     "",
-                    section="input",
+                    section=section,
                     description="Batch source folder.",
                     in_preset=False,
                     kind="str",
                 )
-                with gr.Group():
-                    zip_upload = gr.File(
-                        label="…or upload a ZIP archive of media",
-                        file_types=[".zip"],
-                        type="filepath",
-                        elem_id="vc_batch_zip_upload",
+                if show_archive_upload:
+                    with gr.Group():
+                        zip_upload = gr.File(
+                            label="…or upload a ZIP archive of media",
+                            file_types=[".zip"],
+                            type="filepath",
+                            elem_id="vc_batch_zip_upload",
+                        )
+                    gr.Markdown(
+                        "The archive is extracted safely below Outputs/uploaded_batches, then scanned with "
+                        "the folder options below.",
+                        elem_classes=["vc-help"],
                     )
-                gr.Markdown(
-                    "The archive is extracted safely below Outputs/uploaded_batches, then scanned with "
-                    "the folder options below.",
-                    elem_classes=["vc-help"],
-                )
+                else:
+                    zip_upload = gr.State(None)
+                default_output = str(output_folder_default or (ctx.outputs_dir / "batch_captions"))
                 output_folder = gr.Textbox(
-                    value=str(ctx.outputs_dir / "batch_captions"),
-                    label="Batch output folder",
-                    info="Input names and relative folders are mirrored here.",
+                    value=default_output,
+                    label=output_folder_label,
+                    info=output_folder_info,
                 )
                 ctx.reg(
-                    "batch_output_folder",
+                    setting_key("batch_output_folder"),
                     output_folder,
-                    str(ctx.outputs_dir / "batch_captions"),
-                    section="input",
-                    description="Destination folder for mirrored batch captions.",
+                    default_output
+                    if output_folder_registry_default is None
+                    else output_folder_registry_default,
+                    section=section,
+                    description=output_folder_info,
                     in_preset=False,
                     kind="str",
                 )
-                with gr.Row():
-                    include_kinds = gr.CheckboxGroup(
-                        choices=[
-                            ("Video", "video"),
-                            ("Audio", "audio"),
-                            ("Image", "image"),
-                            ("Text", "text"),
-                        ],
-                        value=["video", "audio", "image", "text"],
-                        label="Include media kinds",
-                        info="Media kinds included when scanning the batch folder.",
-                        scale=3,
-                        elem_id="vc_batch_include_kinds",
-                    )
-                    ctx.reg(
-                        "batch_include_kinds",
-                        include_kinds,
-                        ["video", "audio", "image", "text"],
-                        section="input",
-                        description="Media kinds included when scanning the batch folder.",
-                        kind="list",
-                        choices=["video", "audio", "image", "text"],
-                    )
-                    name_filter = gr.Textbox(
-                        value="",
-                        label="File name filter",
-                        placeholder="*.mp4;clip_*",
-                        info=(
-                            "Optional glob on file names, for example *.mp4 or clip_*; "
-                            "separate several patterns with ;. Empty includes every file."
-                        ),
-                        scale=3,
-                        elem_id="vc_batch_name_filter",
-                    )
-                    ctx.reg(
-                        "batch_name_filter",
-                        name_filter,
-                        "",
-                        section="input",
-                        description=(
-                            "Optional glob on file names, for example *.mp4 or clip_*; "
-                            "separate several patterns with ;. Empty includes every file."
-                        ),
-                        kind="str",
-                    )
+                if show_kind_filters:
+                    with gr.Row():
+                        kind_choices = [(kind.title(), kind) for kind in selected_kinds]
+                        include_kinds = gr.CheckboxGroup(
+                            choices=kind_choices,
+                            value=list(selected_kinds),
+                            label="Include media kinds",
+                            info="Media kinds included when scanning the batch folder.",
+                            scale=3,
+                            elem_id="vc_batch_include_kinds",
+                        )
+                        ctx.reg(
+                            setting_key("batch_include_kinds"),
+                            include_kinds,
+                            list(selected_kinds),
+                            section=section,
+                            description="Media kinds included when scanning the batch folder.",
+                            kind="list",
+                            choices=list(selected_kinds),
+                        )
+                        name_filter = gr.Textbox(
+                            value="",
+                            label="File name filter",
+                            placeholder="*.mp4;clip_*",
+                            info=(
+                                "Optional glob on file names, for example *.mp4 or clip_*; "
+                                "separate several patterns with ;. Empty includes every file."
+                            ),
+                            scale=3,
+                            elem_id="vc_batch_name_filter",
+                        )
+                        ctx.reg(
+                            setting_key("batch_name_filter"),
+                            name_filter,
+                            "",
+                            section=section,
+                            description=(
+                                "Optional glob on file names, for example *.mp4 or clip_*; "
+                                "separate several patterns with ;. Empty includes every file."
+                            ),
+                            kind="str",
+                        )
+                else:
+                    include_kinds = gr.State(list(selected_kinds))
+                    name_filter = gr.State("")
                 with gr.Row():
                     recursive = gr.Checkbox(
                         value=False,
@@ -970,24 +1109,24 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                         info="Include supported files below the selected folder.",
                     )
                     ctx.reg(
-                        "batch_recursive",
+                        setting_key("batch_recursive"),
                         recursive,
                         False,
-                        section="input",
+                        section=section,
                         description="Recursively scan the batch input folder.",
                         kind="bool",
                     )
                     overwrite = gr.Checkbox(
                         value=False,
-                        label="Overwrite existing captions",
-                        info="Off skips media that already has the requested output.",
+                        label=overwrite_label,
+                        info=overwrite_info,
                     )
                     ctx.reg(
-                        "overwrite_existing",
+                        setting_key("overwrite_existing"),
                         overwrite,
                         False,
-                        section="output",
-                        description="Replace existing batch captions instead of skipping them.",
+                        section=section if settings_section else "output",
+                        description=overwrite_info,
                         kind="bool",
                     )
                     limit_items = gr.Number(
@@ -996,18 +1135,38 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                         step=1,
                         precision=0,
                         label="Limit items (0 = all)",
-                        info="Process only the first N items that are not already captioned.",
+                        info=limit_info,
                     )
                     ctx.reg(
-                        "batch_limit_items",
+                        setting_key("batch_limit_items"),
                         limit_items,
                         0,
-                        section="input",
-                        description="Maximum processable batch items after existing-caption skips.",
+                        section=section,
+                        description=limit_info,
                         kind="int",
                         minimum=0,
                     )
                     rescan = action_button("↻ Rescan", "cyan")
+                save_next_to_source: Any = None
+                if save_next_to_source_key:
+                    save_next_to_source = gr.Checkbox(
+                        value=False,
+                        label="Save transcripts next to the source files",
+                        info=(
+                            "Write each transcript beside its source instead of mirroring it below "
+                            "the batch output folder."
+                        ),
+                    )
+                    ctx.reg(
+                        save_next_to_source_key,
+                        save_next_to_source,
+                        False,
+                        section=section,
+                        description=(
+                            "Write batch transcripts beside their source files instead of the batch output folder."
+                        ),
+                        kind="bool",
+                    )
                 scan_summary = gr.Markdown(
                     "<span class='vc-help'>Choose a folder for a light extension scan.</span>",
                     elem_classes=["vc-status"],
@@ -1063,6 +1222,8 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         limit_value: int | float,
         kinds_value: list[str] | None,
         name_filter_value: str,
+        existing_extension_value: str = ".txt",
+        save_next_value: bool = False,
     ) -> tuple[Any, ...]:
         selected, summary = _folder_scan(
             value,
@@ -1072,6 +1233,11 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
             limit_value,
             kinds_value,
             name_filter_value,
+            selected_kinds,
+            existing_extension_value,
+            save_next_value,
+            existing_item_noun,
+            existing_files_label,
         )
         return (*_preview_updates(selected), selected, summary)
 
@@ -1125,7 +1291,10 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         limit_items,
         include_kinds,
         name_filter,
+        existing_extension_state,
     ]
+    if save_next_to_source is not None:
+        folder_inputs.append(save_next_to_source)
     folder_tab.select(
         scan_folder,
         inputs=folder_inputs,
@@ -1134,16 +1303,27 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         show_progress="hidden",
         api_visibility="private",
     )
-    for trigger in (
+    scan_triggers = [
         folder.change,
         recursive.change,
         output_folder.change,
         overwrite.change,
         limit_items.change,
-        include_kinds.change,
-        name_filter.change,
         rescan.click,
-    ):
+    ]
+    if show_kind_filters:
+        scan_triggers.extend([include_kinds.change, name_filter.change])
+    if save_next_to_source is not None:
+        scan_triggers.append(save_next_to_source.change)
+        save_next_to_source.change(
+            lambda enabled: gr.update(interactive=not bool(enabled)),
+            inputs=save_next_to_source,
+            outputs=output_folder,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    for trigger in scan_triggers:
         trigger(
             scan_folder,
             inputs=folder_inputs,
@@ -1256,21 +1436,22 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
                 f"<span class='vc-err'>Could not extract ZIP: {html.escape(str(exc))}</span>",
             )
 
-    zip_upload.upload(
-        extract_batch_zip,
-        inputs=[
-            zip_upload,
-            recursive,
-            output_folder,
-            overwrite,
-            limit_items,
-            include_kinds,
-            name_filter,
-        ],
-        outputs=[folder, recursive, *folder_outputs],
-        show_progress="minimal",
-        api_visibility="private",
-    )
+    if show_archive_upload:
+        zip_upload.upload(
+            extract_batch_zip,
+            inputs=[
+                zip_upload,
+                recursive,
+                output_folder,
+                overwrite,
+                limit_items,
+                include_kinds,
+                name_filter,
+            ],
+            outputs=[folder, recursive, *folder_outputs],
+            show_progress="minimal",
+            api_visibility="private",
+        )
 
     def accept_editor_value(
         value: str | None,
@@ -1329,6 +1510,11 @@ def media_input_block(ctx: "UiContext") -> MediaInputHandles:
         mode_state,
         modality_state,
         duration_state,
+        save_next_to_source,
+        existing_extension_state,
+        scan_folder,
+        folder_inputs,
+        folder_outputs,
     )
 
 
@@ -1464,16 +1650,21 @@ def render_progress_html(fraction: float, label: str, detail: str = "") -> str:
     )
 
 
-def progress_panel(ctx: "UiContext") -> ProgressPanelHandles:
+def progress_panel(
+    ctx: "UiContext",
+    *,
+    waiting_detail: str = "Waiting for a caption job.",
+    throughput_text: str = "**Speed:** — · **Context:** —",
+) -> ProgressPanelHandles:
     """Build stable progress, status, ETA, and throughput outputs."""
 
     del ctx
     with gr.Column():
-        bars = gr.HTML(render_progress_html(0.0, "Ready", "Waiting for a caption job."))
+        bars = gr.HTML(render_progress_html(0.0, "Ready", waiting_detail))
         with gr.Row():
             status = gr.Markdown("**Status:** Ready", scale=5)
             eta = gr.Markdown("**ETA:** —", scale=2)
-            tokens = gr.Markdown("**Speed:** — · **Context:** —", scale=2)
+            tokens = gr.Markdown(throughput_text, scale=2)
     return ProgressPanelHandles(bars, status, eta, tokens)
 
 

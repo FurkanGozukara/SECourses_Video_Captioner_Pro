@@ -216,6 +216,83 @@ def chat_prompt_choices(
     return choices, selected or None
 
 
+def validate_chat_prompt_preset(
+    value: str,
+    previous_valid: str | None,
+    variant_key: str,
+    paths: Sequence[str] | None,
+) -> tuple[Any, str, Any]:
+    """Reject custom chat preset text and restore the prior compatible preset."""
+
+    choices, default = chat_prompt_choices(variant_key, paths, previous_valid)
+    aliases = {preset_id: preset_id for _, preset_id in choices}
+    aliases.update({label: preset_id for label, preset_id in choices})
+    selected = aliases.get(str(value or ""))
+    if selected is not None:
+        return (gr.update(value=selected) if selected != str(value or "") else gr.skip()), selected, gr.skip()
+    valid_ids = {preset_id for _, preset_id in choices}
+    fallback = str(previous_valid or "")
+    if fallback not in valid_ids:
+        fallback = str(default or "")
+    if not fallback:
+        return gr.update(choices=[], value=None), "", "Unknown task preset; no compatible preset is available"
+    label = next((label for label, preset_id in choices if preset_id == fallback), fallback)
+    return gr.update(choices=choices, value=fallback), fallback, f"Unknown task preset; kept {label}"
+
+
+def _model_family_or_empty(variant_key: Any) -> str:
+    try:
+        return variant_to_family(str(variant_key or ""))
+    except KeyError:
+        return ""
+
+
+def chat_model_change_updates(
+    variant_key: str,
+    current_state: Mapping[str, Any] | None,
+) -> tuple[Any, ...]:
+    """Update model-specific chat controls, clearing only across model families."""
+
+    try:
+        get_variant(str(variant_key))
+    except KeyError:
+        return tuple(gr.skip() for _ in range(8))
+    mode, note = model_chat_support(variant_key)
+    family = variant_to_family(str(variant_key))
+    thinking = family == "qwen3_omni_thinking"
+    cap = MODEL_SPECS[family].limits.max_new_tokens_cap
+    state = dict(current_state or _INITIAL_STATE)
+    previous_family = _model_family_or_empty(state.get("model_key"))
+    family_changed = bool(previous_family and previous_family != family)
+    has_conversation = bool(state.get("messages"))
+    if family_changed and has_conversation:
+        conversation_outputs: tuple[Any, Any, Any, Any] = (
+            [],
+            dict(_INITIAL_STATE),
+            "",
+            gr.update(visible=False),
+        )
+        status = "<span class='vc-warn'>Model family changed; conversation cleared.</span>"
+    else:
+        conversation_outputs = (gr.skip(), gr.skip(), gr.skip(), gr.skip())
+        status = (
+            note
+            if mode == "unsupported"
+            else (
+                "<span class='vc-ok'>Model variant updated; conversation kept because the model family is unchanged.</span>"
+                if has_conversation and previous_family == family
+                else "<span class='vc-ok'>Ready.</span>"
+            )
+        )
+    return (
+        note,
+        gr.update(interactive=thinking),
+        gr.update(info=f"Hard limit for the next assistant response; {MODEL_SPECS[family].label} caps it at {cap} tokens."),
+        *conversation_outputs,
+        status,
+    )
+
+
 def build(ctx: "UiContext") -> ChatTabHandles:
     """Render chat controls and register preset-owned generation parameters."""
 
@@ -250,13 +327,14 @@ def build(ctx: "UiContext") -> ChatTabHandles:
             message = gr.Textbox(
                 label="Message",
                 placeholder="Ask about the attached media…",
-                info="Enter the next user turn; attachments are sent with the turn they accompany. Qwen3-Omni can also chat without media.",
+                info="Enter sends, Shift+Enter adds a line. Attachments are sent with the turn they accompany.",
                 lines=3,
                 max_lines=8,
                 autofocus=False,
+                elem_id="vc_chat_message",
             )
             with gr.Row():
-                send = action_button("➤ Send", "cyan", variant="primary", scale=3)
+                send = action_button("➤ Send", "cyan", variant="primary", scale=3, elem_id="vc_chat_send")
                 stop = action_button(
                     "⏹ Stop",
                     "red",
@@ -299,6 +377,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 info="Filtered to the chat model family and the first attached media kind.",
                 elem_id="vc_chat_prompt_preset",
             )
+            valid_prompt_preset = gr.State(initial_prompt_id or "")
             system_prompt = gr.Textbox(
                 value="",
                 label="System prompt",
@@ -520,7 +599,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
         path_text: str,
         variant_key: str,
         current: str,
-    ) -> Any:
+    ) -> tuple[Any, str]:
         try:
             paths = resolve_chat_attachments(file_value, path_text)
         except Exception:
@@ -528,18 +607,40 @@ def build(ctx: "UiContext") -> ChatTabHandles:
         try:
             choices, selected = chat_prompt_choices(str(variant_key), paths, current)
         except KeyError:
-            return gr.skip()
-        return gr.update(choices=choices, value=selected)
+            return gr.skip(), str(current or "")
+        return gr.update(choices=choices, value=selected), str(selected or "")
 
     for event in (files.change, path.change, caption_model.change):
         event(
             update_prompt_presets,
             inputs=[files, path, caption_model, prompt_preset],
-            outputs=prompt_preset,
+            outputs=[prompt_preset, valid_prompt_preset],
             queue=False,
             show_progress="hidden",
             api_visibility="private",
         )
+
+    def guard_prompt_preset(
+        value: str,
+        previous_valid: str,
+        file_value: Any,
+        path_text: str,
+        variant_key: str,
+    ) -> tuple[Any, str, Any]:
+        try:
+            paths = resolve_chat_attachments(file_value, path_text)
+        except Exception:
+            paths = []
+        return validate_chat_prompt_preset(value, previous_valid, variant_key, paths)
+
+    prompt_preset.change(
+        guard_prompt_preset,
+        inputs=[prompt_preset, valid_prompt_preset, files, path, caption_model],
+        outputs=[prompt_preset, valid_prompt_preset, status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
 
     caption_variable_keys = [
         "trigger_word",
@@ -574,9 +675,10 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 )
             )
             rendered_system, rendered_user = render_prompt(preset, variables)
-            return rendered_system or "", rendered_user
+            return rendered_system or "", rendered_user or ""
         except Exception as exc:
-            gr.Warning(f"Could not render chat prompt preset: {exc}")
+            if not isinstance(exc, KeyError):
+                gr.Warning(f"Could not render chat prompt preset: {exc}")
             return gr.skip(), gr.skip()
 
     prompt_preset.select(
@@ -588,35 +690,9 @@ def build(ctx: "UiContext") -> ChatTabHandles:
         api_visibility="private",
     )
 
-    def change_model(variant_key: str) -> tuple[Any, ...]:
-        try:
-            get_variant(str(variant_key))
-        except KeyError:
-            return tuple(gr.skip() for _ in range(8))
-        mode, note = model_chat_support(variant_key)
-        family = variant_to_family(str(variant_key))
-        thinking = family == "qwen3_omni_thinking"
-        cap = MODEL_SPECS[family].limits.max_new_tokens_cap
-        return (
-            note,
-            gr.update(interactive=thinking),
-            # Never shrink the ceiling below a stored value (Gradio rejects such inputs);
-            # the backend clamps to the family cap, so only the hint changes.
-            gr.update(info=f"Hard limit for the next assistant response; {MODEL_SPECS[family].label} caps it at {cap} tokens."),
-            [],
-            dict(_INITIAL_STATE),
-            "",
-            gr.update(visible=False),
-            (
-                "<span class='vc-ok'>Ready.</span>"
-                if mode != "unsupported"
-                else note
-            ),
-        )
-
     caption_model.change(
-        change_model,
-        inputs=caption_model,
+        chat_model_change_updates,
+        inputs=[caption_model, conversation_state],
         outputs=[
             model_note,
             enable_thinking,
@@ -740,7 +816,12 @@ def wire(ctx: "UiContext") -> None:
             yield rejected(f"<span class='vc-err'>{html.escape(str(exc))}</span>")
             return
         previous_messages = list(state.get("messages") or [])
-        if str(state.get("model_key") or "") not in {"", model_key}:
+        previous_model_key = str(state.get("model_key") or "")
+        if (
+            previous_model_key
+            and previous_model_key != model_key
+            and _model_family_or_empty(previous_model_key) != _model_family_or_empty(model_key)
+        ):
             previous_messages = []
             state = dict(_INITIAL_STATE)
         if mode == "single":

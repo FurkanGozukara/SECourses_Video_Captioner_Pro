@@ -151,7 +151,7 @@ class SettingsRegistry:
                 raise ValueError(f"not a finite number: {value}")
             return numeric
         if normalized in {"str", "string"}:
-            return str(value)
+            return "" if value is None else str(value)
         if normalized in {"list", "array", "sequence"}:
             if value is None:
                 return []
@@ -206,7 +206,17 @@ class SettingsRegistry:
         for entry in self._entries:
             raw = source.get(entry.key, deepcopy(entry.default))
             try:
-                value = self._cast(raw, entry.kind)
+                kind_name = (
+                    entry.kind.__name__.casefold()
+                    if isinstance(entry.kind, type)
+                    else str(entry.kind).casefold()
+                )
+                preserve_null = (
+                    raw is None
+                    and entry.default is None
+                    and kind_name not in {"str", "string"}
+                )
+                value = None if preserve_null else self._cast(raw, entry.kind)
             except (TypeError, ValueError) as exc:
                 value = deepcopy(entry.default)
                 warnings.append(f"{entry.key}: {exc}; using default {entry.default!r}.")

@@ -23,9 +23,14 @@ import gradio as gr
 from vcap.core import gpu
 from vcap.core.media import find_ffmpeg
 from vcap.core.paths import open_in_file_manager
-from vcap.core.subprocess_runner import build_child_env, kill_process_tree
+from vcap.core.subprocess_runner import CancelToken, build_child_env, kill_process_tree
 from vcap.models.attention import probe_available
-from vcap.models.downloads import _parse_status, ensure_model, format_status_line
+from vcap.models.downloads import (
+    _parse_status,
+    ensure_model,
+    format_status_line,
+    invalidate_variant_disk_usage,
+)
 from vcap.models.llamacpp_install import describe_runtime, ensure_llamacpp
 from vcap.models.registry import (
     MODEL_SPECS,
@@ -40,6 +45,33 @@ from vcap.ui.components import action_button, render_progress_html
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
+
+
+def whisper_model_inventory(models_dir: Path) -> tuple[list[list[Any]], list[tuple[str, str]]]:
+    """Return the lightweight Whisper alias table without importing inference libraries."""
+
+    try:
+        from vcap.whisper.models import (
+            WHISPER_MODELS,
+            format_size,
+            is_model_ready,
+            local_size_bytes,
+        )
+
+        rows = [
+            [
+                model.alias,
+                model.repo_id,
+                format_size(model.size_bytes),
+                "Yes" if is_model_ready(model.alias, models_dir) else "No",
+                local_size_bytes(model.alias, models_dir),
+            ]
+            for model in WHISPER_MODELS
+        ]
+        choices = [(model.alias, model.alias) for model in WHISPER_MODELS]
+        return rows, choices
+    except Exception:
+        return [], [("large-v1", "large-v1")]
 
 
 def _package_version(name: str) -> str:
@@ -706,6 +738,54 @@ def build(ctx: "UiContext") -> None:
         interactive=False, autoscroll=True, elem_classes=["vc-log"],
     )
 
+    gr.Markdown("### Whisper speech models")
+    whisper_rows, whisper_choices = whisper_model_inventory(ctx.models_dir)
+    whisper_table = gr.Dataframe(
+        value=whisper_rows,
+        headers=["Alias", "Repository", "Download size", "Downloaded", "On-disk bytes"],
+        datatype=["str", "str", "str", "str", "number"],
+        type="array",
+        interactive=False,
+        show_search="filter",
+        max_height=420,
+        pinned_columns=1,
+        static_columns=list(range(5)),
+        buttons=["copy", "fullscreen"],
+        label="Whisper model aliases",
+    )
+    whisper_default = whisper_choices[0][1] if whisper_choices else "large-v1"
+    with gr.Row():
+        whisper_variant = gr.Dropdown(
+            choices=whisper_choices,
+            value=whisper_default,
+            label="Whisper model action",
+            info="Pick a speech model alias to download, verify, or delete.",
+            scale=5,
+        )
+        whisper_download = action_button("📥 Download / Verify", "emerald")
+        whisper_verify = action_button("🔍 Verify Whisper", "violet")
+        whisper_cancel = action_button("⏹ Cancel", "red", interactive=False)
+        whisper_delete = action_button("🗑 Delete model files", "olive")
+        whisper_refresh = action_button("↻ Refresh", "cyan")
+    with gr.Row(visible=False, elem_classes=["vc-confirm-bar"]) as whisper_delete_confirmation:
+        whisper_delete_question = gr.Markdown("Delete the selected Whisper model files from disk?")
+        whisper_delete_yes = action_button("✔ Yes, delete", "red")
+        whisper_delete_keep = action_button("✖ Keep files", "gray")
+    whisper_status = gr.Markdown(
+        "<span class='vc-help'>Ready for a Whisper model action.</span>",
+        elem_classes=["vc-status"],
+    )
+    whisper_progress = gr.HTML(render_progress_html(0.0, "Ready", "Choose a Whisper model action."))
+    whisper_log = gr.Textbox(
+        value="",
+        label="Whisper model action log",
+        lines=8,
+        max_lines=12,
+        interactive=False,
+        autoscroll=True,
+        elem_classes=["vc-log"],
+    )
+
     meter_timer = gr.Timer(2.0)
     model_health_timer = gr.Timer(3.0)
     gpu_index_state = ctx.states.get("gpu_index")
@@ -1155,6 +1235,7 @@ def build(ctx: "UiContext") -> None:
         downloader = _find_downloader(ctx)
         if selected_variant.backend != "llamacpp" and downloader is None:
             ready, detail = variant_is_ready(key)
+            invalidate_variant_disk_usage(key)
             yield (
                 f"Registry check only: {detail}",
                 _selected_status(key, f"<span class='{'vc-ok' if ready else 'vc-err'}'>{html.escape(detail)}</span>"),
@@ -1255,10 +1336,12 @@ def build(ctx: "UiContext") -> None:
                 render_progress_html(float(fraction or 0.0), "Verifying", message),
             )
         if terminal.get("cancelled"):
+            invalidate_variant_disk_usage(key)
             message = "Model verification cancelled."
             yield "\n".join([*lines, message]), _selected_status(key, message), model_inventory()[0], render_progress_html(0.0, "Cancelled", message)
             return
         if "error" in terminal:
+            invalidate_variant_disk_usage(key)
             message = str(terminal["error"])
             yield "\n".join([*lines, f"ERROR: {message}"]), _selected_status(key, f"<span class='vc-err'>{html.escape(message)}</span>"), model_inventory()[0], render_progress_html(0.0, "Failed", message)
             return
@@ -1270,6 +1353,7 @@ def build(ctx: "UiContext") -> None:
             code = int(terminal.get("code") or 0)
             ok = code == 0 and ready
         message = f"Verification {'passed' if ok else 'failed'} for {key}: {detail}"
+        invalidate_variant_disk_usage(key)
         ctx.app_log.log(message, scope="models")
         yield "\n".join([*lines, message]), _selected_status(key, f"<span class='{'vc-ok' if ok else 'vc-err'}'>{html.escape(message)}</span>"), model_inventory()[0], render_progress_html(1.0 if ok else 0.0, "Verified" if ok else "Failed", message)
 
@@ -1277,6 +1361,232 @@ def build(ctx: "UiContext") -> None:
         verify_handler, inputs=variant, outputs=[download_log, model_status, model_table, model_progress],
         concurrency_id="model_download", concurrency_limit=1,
         show_progress="hidden", api_visibility="private",
+    )
+
+    def refresh_whisper(selected: str) -> tuple[list[list[Any]], Any, str]:
+        rows, choices = whisper_model_inventory(ctx.models_dir)
+        aliases = [str(choice[1]) for choice in choices]
+        value = str(selected or whisper_default)
+        if value not in aliases:
+            value = aliases[0] if aliases else "large-v1"
+        return (
+            rows,
+            gr.update(choices=choices, value=value),
+            "<span class='vc-help'>Whisper model inventory refreshed.</span>",
+        )
+
+    whisper_refresh.click(
+        refresh_whisper,
+        inputs=whisper_variant,
+        outputs=[whisper_table, whisper_variant, whisper_status],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def verify_whisper(alias: str) -> tuple[list[list[Any]], str, str]:
+        value = str(alias or whisper_default)
+        try:
+            from vcap.whisper.models import is_model_ready, local_size_bytes, model_dir
+
+            ready = is_model_ready(value, ctx.models_dir)
+            local_bytes = local_size_bytes(value, ctx.models_dir)
+            location = model_dir(value, ctx.models_dir)
+            message = (
+                f"{value} is downloaded and ready ({local_bytes / (1024 ** 2):.1f} MB at {location})."
+                if ready
+                else f"{value} is incomplete or not downloaded. Use Download to fetch or resume it."
+            )
+            css = "vc-ok" if ready else "vc-warn"
+        except Exception as exc:
+            ready = False
+            message = f"Could not verify {value}: {exc}"
+            css = "vc-err"
+        return (
+            whisper_model_inventory(ctx.models_dir)[0],
+            f"<span class='{css}'>{html.escape(message)}</span>",
+            render_progress_html(1.0 if ready else 0.0, "Verified" if ready else "Not ready", message),
+        )
+
+    whisper_verify.click(
+        verify_whisper,
+        inputs=whisper_variant,
+        outputs=[whisper_table, whisper_status, whisper_progress],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    whisper_delete.click(
+        lambda alias: (
+            gr.update(visible=True),
+            f"Delete Whisper model {html.escape(str(alias or whisper_default))} from disk?",
+        ),
+        inputs=whisper_variant,
+        outputs=[whisper_delete_confirmation, whisper_delete_question],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    whisper_delete_keep.click(
+        lambda: gr.update(visible=False),
+        outputs=whisper_delete_confirmation,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def delete_whisper(alias: str) -> tuple[list[list[Any]], str, Any]:
+        value = str(alias or whisper_default)
+        if ctx.get_active_cancel() is not None:
+            return (
+                whisper_model_inventory(ctx.models_dir)[0],
+                "<span class='vc-warn'>Wait for the active caption or transcription job before deleting model files.</span>",
+                gr.update(visible=False),
+            )
+        try:
+            from vcap.whisper.models import delete_model
+
+            removed = delete_model(value, ctx.models_dir)
+            message = f"Deleted {removed / (1024 ** 2):.1f} MB for {value}."
+            css = "vc-ok"
+        except Exception as exc:
+            message = f"Could not delete {value}: {exc}"
+            css = "vc-err"
+        return (
+            whisper_model_inventory(ctx.models_dir)[0],
+            f"<span class='{css}'>{html.escape(message)}</span>",
+            gr.update(visible=False),
+        )
+
+    whisper_delete_yes.click(
+        delete_whisper,
+        inputs=whisper_variant,
+        outputs=[whisper_table, whisper_status, whisper_delete_confirmation],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    whisper_download_outputs = [
+        whisper_log,
+        whisper_status,
+        whisper_table,
+        whisper_progress,
+        whisper_cancel,
+        whisper_download,
+        whisper_delete,
+    ]
+
+    def download_whisper(alias: str):
+        value = str(alias or whisper_default)
+        if ctx.get_active_cancel() is not None:
+            message = "Another caption, transcription, or model action is already running."
+            yield (
+                message,
+                f"<span class='vc-warn'>{message}</span>",
+                whisper_model_inventory(ctx.models_dir)[0],
+                render_progress_html(0.0, "Busy", message),
+                gr.update(interactive=False),
+                gr.update(interactive=True),
+                gr.update(interactive=True),
+            )
+            return
+        token = CancelToken()
+        ctx.activate_cancel(token)
+        ctx.states["health_whisper_token"] = token
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+        def progress(payload: dict[str, Any]) -> None:
+            events.put(("progress", dict(payload)))
+
+        def work() -> None:
+            try:
+                from vcap.whisper.models import download_model
+
+                path = download_model(
+                    value,
+                    ctx.models_dir,
+                    progress_cb=progress,
+                    cancel_check=token.is_cancelled,
+                )
+                events.put(("done", path))
+            except BaseException as exc:
+                events.put(("error", exc))
+
+        threading.Thread(target=work, daemon=True, name="whisper-health-download").start()
+        lines = [f"Selected: {value}", "Checking local files and download manifest"]
+        yield (
+            "\n".join(lines),
+            f"<span class='vc-ok'>Downloading or verifying {html.escape(value)}…</span>",
+            gr.skip(),
+            render_progress_html(0.0, "Checking model", value),
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+        )
+        terminal: tuple[str, Any] | None = None
+        while terminal is None:
+            event, payload = events.get()
+            if event in {"done", "error"}:
+                terminal = event, payload
+                break
+            message = str(payload.get("message") or "Downloading model files")
+            lines.append(message)
+            lines = lines[-500:]
+            yield (
+                "\n".join(lines),
+                f"<span class='vc-ok'>{html.escape(message)}</span>",
+                gr.skip(),
+                render_progress_html(float(payload.get("fraction") or 0.0), "Downloading", message),
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+            )
+        event, payload = terminal
+        if event == "done":
+            message, css, fraction = f"{value} is downloaded and verified at {payload}.", "vc-ok", 1.0
+        elif token.is_cancelled():
+            message, css, fraction = "Whisper model download cancelled; partial files remain resumable.", "vc-warn", 0.0
+        else:
+            message, css, fraction = f"Whisper model download failed: {payload}", "vc-err", 0.0
+        lines.append(message)
+        ctx.clear_active_cancel(token)
+        if ctx.states.get("health_whisper_token") is token:
+            ctx.states["health_whisper_token"] = None
+        yield (
+            "\n".join(lines),
+            f"<span class='{css}'>{html.escape(message)}</span>",
+            whisper_model_inventory(ctx.models_dir)[0],
+            render_progress_html(fraction, "Ready" if fraction else "Stopped", message),
+            gr.update(interactive=False),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+        )
+
+    whisper_download.click(
+        download_whisper,
+        inputs=whisper_variant,
+        outputs=whisper_download_outputs,
+        concurrency_id="model_download",
+        concurrency_limit=1,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+
+    def cancel_whisper_download() -> str:
+        token = ctx.states.get("health_whisper_token")
+        if isinstance(token, CancelToken):
+            token.cancel()
+            return "<span class='vc-warn'>Whisper model cancellation requested.</span>"
+        return "<span class='vc-help'>No Whisper model download is running.</span>"
+
+    whisper_cancel.click(
+        cancel_whisper_download,
+        outputs=whisper_status,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
     )
 
     def open_models_handler() -> str:
@@ -1300,4 +1610,5 @@ __all__ = [
     "selected_model_action_key",
     "verify_local_files",
     "verify_local_gguf",
+    "whisper_model_inventory",
 ]

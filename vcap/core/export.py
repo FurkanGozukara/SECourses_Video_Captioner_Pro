@@ -6,15 +6,17 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import tomli_w
 
 from .logs import get_log
 from .outputs import OutputWriter
 from .paths import list_media_files, normalize_path, sanitize_filename, sort_paths_natural
+from .scene_split import SceneRange, split_video
 
 _REPEAT_PREFIX = re.compile(r"^(\d+)_(.+)$")
 _FLAGS_FILE = ".vcap_flags.json"
@@ -44,6 +46,7 @@ class ExportReport:
     media_files: list[Path]
     caption_files: list[Path]
     errors: list[str]
+    segment_full_source_fallbacks: int = 0
 
     @property
     def exported_count(self) -> int:
@@ -358,6 +361,59 @@ def _unique_caption_target(directory: Path, stem: str, caption_ext: str) -> Path
         counter += 1
 
 
+def _segment_details(item: Any, caption_path: Any) -> tuple[int | None, float | None, float | None, Path | None]:
+    raw_index = _item_value(item, "segment_index", "clip_index", default=None)
+    if raw_index is None and caption_path:
+        match = re.match(r"^clip_(\d+)$", Path(str(caption_path)).stem, flags=re.IGNORECASE)
+        if match and Path(str(caption_path)).parent.name.casefold().endswith("_segments"):
+            raw_index = match.group(1)
+    try:
+        index = int(raw_index) if raw_index is not None else None
+    except (TypeError, ValueError):
+        index = None
+    try:
+        start = float(_item_value(item, "start_s", "segment_start_s", default=None))
+        end = float(_item_value(item, "end_s", "segment_end_s", default=None))
+        if end <= start:
+            start = end = None
+    except (TypeError, ValueError):
+        start = end = None
+    produced_raw = _item_value(item, "segment_media_path", "clip_path", default=None)
+    produced = normalize_path(produced_raw) if produced_raw else None
+    if produced is not None and not produced.is_file():
+        produced = None
+    return index, start, end, produced
+
+
+def _cut_segment(
+    cutter: Callable[..., Any],
+    source: Path,
+    start_s: float,
+    end_s: float,
+    temporary_dir: Path,
+    item: Any,
+) -> Path:
+    clips = cutter(
+        source,
+        [SceneRange(start_s, end_s)],
+        temporary_dir,
+        mode=str(_item_value(item, "split_mode", "cut_mode", default="copy") or "copy"),
+        keep_audio=True,
+        name_template="segment_{index:04d}",
+        encoder=str(_item_value(item, "encode_codec", default="libx264") or "libx264"),
+        crf=int(_item_value(item, "encode_crf", default=18) or 18),
+        preset=str(_item_value(item, "encode_preset", default="veryfast") or "veryfast"),
+        audio_bitrate=str(_item_value(item, "encode_audio_bitrate", default="192k") or "192k"),
+    )
+    if not clips:
+        raise RuntimeError("The video cutter did not produce a segment")
+    first = clips[0]
+    path = Path(str(getattr(first, "path", first)))
+    if not path.is_file():
+        raise RuntimeError(f"The video cutter did not create {path}")
+    return path
+
+
 def export_dataset(
     items: Iterable[Any],
     out_root: str | os.PathLike[str],
@@ -367,6 +423,7 @@ def export_dataset(
     caption_ext: str = ".txt",
     flat: bool = True,
     include_caption_only: bool = False,
+    cutter: Callable[..., Any] | None = None,
 ) -> ExportReport:
     """Export approved pairs and optional caption-only items with explicit counts."""
 
@@ -375,7 +432,7 @@ def export_dataset(
     extension = str(caption_ext or ".txt")
     if not extension.startswith("."):
         extension = "." + extension
-    exported = skipped = rejected = no_media = 0
+    exported = skipped = rejected = no_media = segment_full_source_fallbacks = 0
     media_outputs: list[Path] = []
     caption_outputs: list[Path] = []
     errors: list[str] = []
@@ -410,14 +467,62 @@ def export_dataset(
             destination_dir = root if flat else root / _relative_parent(item)
             destination_dir.mkdir(parents=True, exist_ok=True)
             if media is not None:
-                safe_name = sanitize_filename(media.name)
+                segment_index, start_s, end_s, produced_clip = _segment_details(item, raw_caption_path)
+                is_segment = segment_index is not None
+                source_media_raw = _item_value(item, "source_media_path", default=None)
+                source_media = normalize_path(source_media_raw) if source_media_raw else media
+                if not source_media.is_file():
+                    source_media = media
+                if is_segment and produced_clip is None:
+                    if media.stem.casefold() == f"clip_{segment_index:04d}" and media.parent.name.casefold().endswith("_clips"):
+                        produced_clip = media
+                    elif raw_caption_path:
+                        caption_path = Path(str(raw_caption_path))
+                        if caption_path.parent.name.casefold().endswith("_segments"):
+                            clips_dir = caption_path.parent.with_name(
+                                caption_path.parent.name[: -len("_segments")] + "_clips"
+                            )
+                            produced_clip = next(
+                                (
+                                    candidate
+                                    for candidate in clips_dir.glob(f"clip_{segment_index:04d}.*")
+                                    if candidate.is_file()
+                                ),
+                                None,
+                            )
+                segment_suffix = (
+                    produced_clip.suffix
+                    if produced_clip is not None
+                    else (".mp4" if start_s is not None and end_s is not None else source_media.suffix)
+                )
+                safe_name = (
+                    f"{sanitize_filename(source_media.stem)}_clip_{segment_index:04d}{segment_suffix}"
+                    if is_segment
+                    else sanitize_filename(media.name)
+                )
                 media_target = _unique_target(destination_dir, safe_name, extension)
                 caption_target = media_target.with_suffix(extension)
                 if copy_media:
-                    shutil.copy2(media, media_target)
+                    if produced_clip is not None:
+                        shutil.copy2(produced_clip, media_target)
+                    elif is_segment and start_s is not None and end_s is not None:
+                        with tempfile.TemporaryDirectory(prefix="vcap_export_", dir=root) as temp_raw:
+                            cut_path = _cut_segment(
+                                cutter or split_video,
+                                source_media,
+                                start_s,
+                                end_s,
+                                Path(temp_raw),
+                                item,
+                            )
+                            shutil.copy2(cut_path, media_target)
+                    else:
+                        shutil.copy2(media, media_target)
+                        if is_segment:
+                            segment_full_source_fallbacks += 1
                     media_outputs.append(media_target)
                 else:
-                    media_outputs.append(media)
+                    media_outputs.append(produced_clip or source_media)
             else:
                 source_name = caption_source.name if caption_source is not None else Path(str(raw_caption_path or "caption.txt")).name
                 safe_stem = Path(sanitize_filename(source_name)).stem or "caption"
@@ -440,6 +545,7 @@ def export_dataset(
         media_files=media_outputs,
         caption_files=caption_outputs,
         errors=errors,
+        segment_full_source_fallbacks=segment_full_source_fallbacks,
     )
 
 

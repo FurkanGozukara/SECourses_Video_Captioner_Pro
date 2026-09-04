@@ -27,6 +27,11 @@ _ENCODE_PRESETS = frozenset(
 _AUDIO_BITRATES = frozenset({"96k", "128k", "192k", "256k", "320k"})
 _GGUF_FLASH_ATTN = frozenset({"auto", "on", "off"})
 _MEDIA_KINDS = ("video", "audio", "image", "text")
+_TRANSCRIPT_FORMATS = frozenset({"srt", "vtt", "txt", "lrc", "tsv", "json"})
+DEFAULT_TRANSCRIPT_PROMPT_WRAPPER = (
+    "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n"
+    "{{TRANSCRIPT}}"
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -64,6 +69,16 @@ def _setting(settings: Mapping[str, Any], *keys: str, default: Any = None) -> An
         if key in settings:
             return settings[key]
     return default
+
+
+def _optional_system_prompt(value: Any) -> str | None:
+    """Normalize empty and JSON-like null sentinels to no system message."""
+
+    if value is None:
+        return None
+    text = str(value)
+    normalized = text.strip().casefold()
+    return None if not normalized or normalized in {"none", "null"} else text
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -195,6 +210,36 @@ def _replace_pairs(value: Any) -> tuple[tuple[str, str], ...]:
     return tuple(result)
 
 
+def _transcript_formats(value: Any) -> tuple[str, ...]:
+    if value is None:
+        value = ("srt", "txt")
+    if isinstance(value, str):
+        values = [part.strip() for part in value.replace(";", ",").split(",")]
+    else:
+        values = list(value)
+    result: list[str] = []
+    for item in values:
+        selected = str(item).casefold().lstrip(".")
+        if selected == "webvtt":
+            selected = "vtt"
+        if selected in _TRANSCRIPT_FORMATS and selected not in result:
+            result.append(selected)
+    return tuple(result)
+
+
+def _default_whisper_params() -> dict[str, Any]:
+    """Return W1's JSON-safe defaults without importing Whisper at module load."""
+
+    from vcap.whisper.params import WhisperParams
+
+    params = WhisperParams()
+    try:
+        return dict(params.to_dict())
+    except NotImplementedError:
+        # Keeps W2's typed job tests usable while W1 is landing concurrently.
+        return _json_safe(asdict(params))
+
+
 @dataclass(frozen=True)
 class InputItem:
     """One path, text file, or direct text prompt supplied to a job."""
@@ -258,6 +303,9 @@ class PromptSpec:
     system_prompt: str | None = None
     user_prompt: str | None = None
     variables: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "system_prompt", _optional_system_prompt(self.system_prompt))
 
 
 @dataclass(frozen=True)
@@ -562,6 +610,30 @@ class RuntimeSpec:
 
 
 @dataclass(frozen=True)
+class TranscriptSpec:
+    """Optional Whisper stage run before an item's caption clips."""
+
+    enabled: bool = False
+    formats: tuple[str, ...] = ("srt", "txt")
+    inject_prompt: bool = True
+    prompt_wrapper: str = DEFAULT_TRANSCRIPT_PROMPT_WRAPPER
+    file_suffix: str = "_transcript"
+    whisper: dict[str, Any] = field(default_factory=_default_whisper_params)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "enabled", _bool(self.enabled, False))
+        object.__setattr__(self, "formats", _transcript_formats(self.formats))
+        object.__setattr__(self, "inject_prompt", _bool(self.inject_prompt, True))
+        object.__setattr__(
+            self,
+            "prompt_wrapper",
+            str(self.prompt_wrapper or DEFAULT_TRANSCRIPT_PROMPT_WRAPPER),
+        )
+        object.__setattr__(self, "file_suffix", str(self.file_suffix or ""))
+        object.__setattr__(self, "whisper", _json_safe(dict(self.whisper or {})))
+
+
+@dataclass(frozen=True)
 class JobSpec:
     """Complete immutable input to the unified single/batch pipeline."""
 
@@ -574,6 +646,7 @@ class JobSpec:
     split: SplitSpec = field(default_factory=SplitSpec)
     post: PostSpec = field(default_factory=PostSpec)
     runtime: RuntimeSpec = field(default_factory=RuntimeSpec)
+    transcript: TranscriptSpec = field(default_factory=TranscriptSpec)
     context_carry_over: bool = False
     context_carry_words: int = 60
     context_carry_prompt: str = DEFAULT_CONTEXT_CARRY_PROMPT
@@ -600,6 +673,15 @@ class JobSpec:
             "summary_max_new_tokens",
             max(64, min(8192, _int(self.summary_max_new_tokens, 1024))),
         )
+        if "system_prompt" in self.settings:
+            settings = dict(self.settings)
+            raw_system = settings["system_prompt"]
+            if isinstance(raw_system, str) and raw_system.strip().casefold() in {
+                "none",
+                "null",
+            }:
+                settings["system_prompt"] = ""
+                object.__setattr__(self, "settings", settings)
 
     @property
     def gen(self) -> GenParams:
@@ -775,9 +857,14 @@ class JobSpec:
             value = _setting(source, *keys, default=None)
             if value is not None:
                 variable_values[variable] = value
+        # Caption UI rendering happens before Whisper runs. Keeping this token
+        # literal lets the runner substitute the per-clip transcript last.
+        variable_values.setdefault("TRANSCRIPT", "{{TRANSCRIPT}}")
         prompt = PromptSpec(
             preset_id=preset_id,
-            system_prompt=_setting(source, "system_prompt", default=None),
+            system_prompt=_optional_system_prompt(
+                _setting(source, "system_prompt", default=None)
+            ),
             user_prompt=_setting(source, "user_prompt", default=None),
             variables=variable_values,
         )
@@ -1130,6 +1217,37 @@ class JobSpec:
                 ),
             ),
         )
+        from vcap.whisper.params import WhisperParams
+
+        try:
+            whisper_settings = WhisperParams.from_settings(source).to_dict()
+        except NotImplementedError:
+            # W1 and W2 are developed in parallel; remove this compatibility
+            # path naturally once W1's normalizer is available.
+            whisper_settings = _default_whisper_params()
+        transcript = TranscriptSpec(
+            enabled=_bool(_setting(source, "transcript_enabled", default=False), False),
+            formats=_transcript_formats(
+                _setting(source, "transcript_formats", default=("srt", "txt"))
+            ),
+            inject_prompt=_bool(
+                _setting(source, "transcript_inject_prompt", default=True),
+                True,
+            ),
+            prompt_wrapper=str(
+                _setting(
+                    source,
+                    "transcript_prompt_wrapper",
+                    default=DEFAULT_TRANSCRIPT_PROMPT_WRAPPER,
+                )
+                or DEFAULT_TRANSCRIPT_PROMPT_WRAPPER
+            ),
+            file_suffix=str(
+                _setting(source, "transcript_file_suffix", default="_transcript")
+                or ""
+            ),
+            whisper=whisper_settings,
+        )
         return cls(
             inputs=[item if isinstance(item, InputItem) else InputItem(**item) for item in inputs],
             output=resolved_output,
@@ -1140,6 +1258,7 @@ class JobSpec:
             split=split,
             post=post,
             runtime=runtime,
+            transcript=transcript,
             context_carry_over=_bool(_setting(source, "context_carry_over", default=False), False),
             context_carry_words=max(
                 10,
@@ -1193,6 +1312,7 @@ class JobSpec:
         post_data = dict(data.get("post") or {})
         output_data = dict(data.get("output") or {})
         runtime_data = dict(data.get("runtime") or {})
+        transcript_data = dict(data.get("transcript") or {})
         return cls(
             inputs=[item if isinstance(item, InputItem) else InputItem(**dict(item)) for item in data.get("inputs", [])],
             output=OutputSpec(**output_data),
@@ -1203,6 +1323,7 @@ class JobSpec:
             split=SplitSpec(**dict(data.get("split") or {})),
             post=PostSpec(**post_data),
             runtime=RuntimeSpec(**runtime_data),
+            transcript=TranscriptSpec(**transcript_data),
             context_carry_over=_bool(data.get("context_carry_over"), False),
             context_carry_words=max(
                 10,
@@ -1246,6 +1367,7 @@ class ItemResult:
     summary: str = ""
     summary_usage: dict[str, Any] = field(default_factory=dict)
     summary_timing: dict[str, Any] = field(default_factory=dict)
+    transcript: dict[str, Any] | None = None
 
     def __getitem__(self, key: str) -> Any:
         """Allow lightweight mapping-style access in UI table adapters."""
@@ -1294,6 +1416,7 @@ class JobResult:
 __all__ = [
     "DEFAULT_CONTEXT_CARRY_PROMPT",
     "DEFAULT_SUMMARY_PROMPT",
+    "DEFAULT_TRANSCRIPT_PROMPT_WRAPPER",
     "GenParams",
     "InputItem",
     "ItemResult",
@@ -1307,4 +1430,5 @@ __all__ = [
     "PromptSpec",
     "RuntimeSpec",
     "SplitSpec",
+    "TranscriptSpec",
 ]

@@ -202,8 +202,8 @@ def test_fitness_plan_uses_output_folder_and_progress_lines_are_deduped(tmp_path
     assert written.is_file()
     assert not (source / "clip_fitness_plan.json").exists()
     assert lines == ["clip 1.mp4: Splitting clip 1/5"]
-    with pytest.raises(ValueError, match="outside"):
-        write_clip_fitness_plan(plan, source, timestamp="same-folder")
+    nested = write_clip_fitness_plan(plan, source / "clip_fitness", timestamp="same-folder")
+    assert nested == source / "clip_fitness" / "source ünicode_same-folder.json"
 
 
 def test_health_protocol_rendering_and_selected_key() -> None:

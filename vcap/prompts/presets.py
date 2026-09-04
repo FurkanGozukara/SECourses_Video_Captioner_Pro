@@ -67,6 +67,10 @@ TEMPLATE_VARIABLES: dict[str, dict[str, str]] = {
         "description": "Optional task-specific instructions appended to the prompt.",
         "default": "",
     },
+    "TRANSCRIPT": {
+        "description": "Exact Whisper speech overlapping the current caption clip.",
+        "default": "",
+    },
 }
 
 
@@ -825,6 +829,31 @@ PRESETS: tuple[PromptPreset, ...] = (
         tags=("native", "audio", "mixed", "instruments", "sfx"),
     ),
 
+    PromptPreset(
+        id="whisper_guided_dialogue_caption",
+        label="Transcription · Whisper-guided dialogue caption",
+        group="Transcription",
+        description=(
+            "Uses the per-clip Whisper transcript as exact dialogue evidence while Qwen3-Omni "
+            "describes the visible action and speaker context."
+        ),
+        system_prompt=None,
+        user_prompt=(
+            "Write one {{CAPTION_LENGTH}} {{LANGUAGE}} caption that combines the visible scene, "
+            "ordered action, camera behavior, and audible context. Treat the supplied speech "
+            "transcript as exact dialogue: quote it faithfully when relevant, never invent missing "
+            "speech, and identify speakers only from visible evidence. Return one coherent paragraph "
+            "without a heading or list. {{AVOID}} {{EXTRA_INSTRUCTIONS}}\n\n"
+            "Exact speech transcript for this clip:\n{{TRANSCRIPT}}"
+        ),
+        applies_to_models=QWEN_GENERIC,
+        modalities=("video_audio", "audio"),
+        output_format="text",
+        post_processor="plain",
+        generation_overrides=QWEN_GREEDY,
+        recommended_media={"max_duration_s": 120, "fps": 2.0, "max_pixels": 262144},
+        tags=("whisper", "transcript", "dialogue", "caption"),
+    ),
     PromptPreset(
         id="asr_clean",
         label="ASR — clean transcript",

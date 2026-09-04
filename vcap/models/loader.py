@@ -1332,7 +1332,7 @@ class ModelCache:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._loaded: LoadedModel | None = None
-        self._key: tuple[Any, ...] | None = None
+        self._key: tuple[tuple[str, Any], ...] | None = None
 
     @property
     def loaded(self) -> LoadedModel | None:
@@ -1348,43 +1348,59 @@ class ModelCache:
         # A llama-server is started with a fixed context, so a different requested
         # window needs a restart; Transformers apply the window per call instead.
         context_key = 0
-        runtime_key = ""
+        runtime_key: Any = ()
         try:
             if get_variant(variant_key).scheme == "gguf":
                 context_key = int(getattr(kwargs.get("budget_hint"), "context_tokens", 0) or 0)
-                runtime_key = repr(kwargs.get("runtime"))
+                from .llamacpp_backend import LlamaCppRuntimeOptions
+
+                runtime_key = tuple(sorted(asdict(LlamaCppRuntimeOptions.from_spec(kwargs.get("runtime"))).items()))
         except KeyError:
             context_key = 0
+        max_memory = getattr(offload, "max_memory", None)
+        max_memory_key = tuple(
+            sorted((str(name), str(value)) for name, value in (max_memory or {}).items())
+        )
         key = (
-            variant_key,
-            str(kwargs.get("device", "cuda:0")),
-            kwargs.get("gpu_index"),
-            str(kwargs.get("attention", "auto")),
-            repr(offload),
-            str(kwargs.get("dtype")),
-            str(kwargs.get("hf_dir")),
-            bool(kwargs.get("compile_model", False)),
-            str(kwargs.get("compile_mode", DEFAULT_COMPILE_MODE)),
-            repr(kwargs.get("last_token_logits", True)),
-            context_key,
-            runtime_key,
+            ("variant", variant_key),
+            ("device", str(kwargs.get("device", "cuda:0"))),
+            ("gpu_index", kwargs.get("gpu_index")),
+            ("attention", str(kwargs.get("attention", "auto"))),
+            ("dtype", str(kwargs.get("dtype"))),
+            ("hf_dir", str(kwargs.get("hf_dir"))),
+            ("compile", bool(kwargs.get("compile_model", False))),
+            ("compile_mode", str(kwargs.get("compile_mode", DEFAULT_COMPILE_MODE))),
+            ("offload.gpu_layers", getattr(offload, "gpu_layers", "auto")),
+            ("offload.offload_experts", bool(getattr(offload, "offload_experts", False))),
+            ("offload.max_memory", max_memory_key),
+            ("offload.pin_cpu", bool(getattr(offload, "pin_cpu", True))),
+            ("offload.swap_slots", int(getattr(offload, "swap_slots", 2))),
+            ("offload.vram_reserve_gb", float(getattr(offload, "vram_reserve_gb", 2.0))),
+            ("offload.pinned_ram_budget_gb", float(getattr(offload, "pinned_ram_budget_gb", 0.0))),
+            ("context", context_key),
+            ("runtime", runtime_key),
         )
         with self._lock:
             if self._loaded is not None and self._key == key and self._loaded.model is not None:
-                if self._plan_covers(self._loaded, kwargs.get("budget_hint")):
-                    return self._loaded
-                get_log().log(
-                    "Reloading the resident model: the new job needs more activation VRAM "
-                    "than the current block-swap plan reserved.",
-                    scope="models",
-                )
+                try:
+                    _install_last_token_logits_hook(
+                        self._loaded.model,
+                        bool(kwargs.get("last_token_logits", True)),
+                    )
+                except (AttributeError, TypeError):
+                    pass
+                return self._loaded
             released_old = False
             if self._loaded is not None:
+                old_fields = dict(self._key or ())
+                new_fields = dict(key)
+                changes = [
+                    f"{name} {old_fields.get(name)}→{new_fields.get(name)}"
+                    for name, _value in key
+                    if old_fields.get(name) != new_fields.get(name)
+                ]
+                get_log().log(f"Reloading: {'; '.join(changes) or 'cache key changed'}", scope="models")
                 old_key = str(getattr(self._loaded.variant, "key", "<unknown>"))
-                get_log().log(
-                    f"Switching model: unloading {old_key} before loading {variant_key}",
-                    scope="models",
-                )
                 report = unload_model(self._loaded)
                 if report is not None and not report.released:
                     get_log().warn(
@@ -1410,28 +1426,15 @@ class ModelCache:
                         pass
                 raise
             self._key = key
+            if self._loaded.model is not None:
+                try:
+                    _install_last_token_logits_hook(
+                        self._loaded.model,
+                        bool(kwargs.get("last_token_logits", True)),
+                    )
+                except (AttributeError, TypeError):
+                    pass
             return self._loaded
-
-    @staticmethod
-    def _plan_covers(loaded: LoadedModel, hint: Any) -> bool:
-        """Return whether the resident plan's activation reserve covers ``hint``."""
-
-        report = getattr(loaded, "load_report", None)
-        planned = int(getattr(report, "activation_estimate_bytes", 0) or 0)
-        if planned <= 0:
-            return True  # legacy, GGUF, or CPU loads carry no block-swap plan
-        try:
-            needed = int(
-                estimate_activation_bytes(
-                    loaded.spec.family,
-                    getattr(loaded.model, "config", None),
-                    hint,
-                    observed_ratio=observed_activation_ratio(loaded.variant.key),
-                )
-            )
-        except Exception:
-            return True
-        return needed <= planned
 
     def loaded_variant_key(self) -> str | None:
         """Return the resident variant key without exposing the model object."""

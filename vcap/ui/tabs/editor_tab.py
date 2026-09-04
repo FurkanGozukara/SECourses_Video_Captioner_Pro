@@ -40,7 +40,7 @@ from vcap.core.paths import (
     reveal_in_file_manager,
 )
 from vcap.models.registry import MODEL_SPECS, all_variant_choices, variant_to_family
-from vcap.pipeline.job import InputItem, JobSpec, OutputSpec, PostSpec
+from vcap.pipeline.job import InputItem, JobSpec, OutputSpec
 from vcap.prompts.presets import default_preset_for, get_preset, list_presets
 from vcap.ui.components import action_button
 
@@ -89,6 +89,15 @@ class EditorItem(TypedDict, total=False):
     tokens: int
     flag: str | None
     status: str
+    segment_index: int
+    start_s: float
+    end_s: float
+    segment_media_path: str | None
+    split_mode: str
+    encode_codec: str
+    encode_crf: int
+    encode_preset: str
+    encode_audio_bitrate: str
 
 
 class EditorState(TypedDict, total=False):
@@ -309,7 +318,7 @@ def _entry_output_paths(entry: Mapping[str, Any]) -> list[str]:
 
 def _entry_source_paths(entry: Mapping[str, Any]) -> list[str]:
     values: list[str] = []
-    for key in ("input", "source", "media_path", "path", "file"):
+    for key in ("input", "source_media_path", "source_path", "source", "media_path", "path", "file"):
         if key in entry:
             values.extend(_path_values(entry[key]))
     return values
@@ -409,6 +418,184 @@ def resolve_media_from_metadata(
         if root is not None and directory == root:
             break
     return None, None
+
+
+_CLIP_STEM_RE = re.compile(r"^clip_(\d+)$", re.IGNORECASE)
+
+
+def _finite_window(value: Mapping[str, Any]) -> tuple[float, float] | None:
+    try:
+        start = float(value.get("start_s"))
+        end = float(value.get("end_s"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        return None
+    return max(0.0, start), end
+
+
+def _segment_context_from_metadata(
+    caption_path: Path,
+    scan_root: Path,
+) -> dict[str, Any]:
+    """Recover a segment's source, window, and optional persisted clip."""
+
+    clip_match = _CLIP_STEM_RE.match(caption_path.stem)
+    index_hint = int(clip_match.group(1)) if clip_match else None
+    is_segment_dir = caption_path.parent.name.casefold().endswith("_segments")
+    context: dict[str, Any] = {}
+
+    sidecars = [caption_path] if caption_path.suffix.casefold() == ".json" else [caption_path.with_suffix(".json")]
+    for sidecar in sidecars:
+        try:
+            document = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(document, Mapping):
+            continue
+        window = _finite_window(document)
+        if window:
+            context.update(start_s=window[0], end_s=window[1])
+        for key in ("source_media_path", "source_path", "source", "path"):
+            raw = document.get(key)
+            if raw:
+                context["source_media_path"] = str(_metadata_candidate(str(raw), sidecar))
+                break
+        raw_index = document.get("index", document.get("segment_index"))
+        if raw_index is not None:
+            try:
+                context["segment_index"] = int(raw_index)
+            except (TypeError, ValueError):
+                pass
+
+    directories = [caption_path.parent, *caption_path.parent.parents]
+    for directory in directories:
+        try:
+            directory.relative_to(scan_root)
+        except ValueError:
+            break
+        metadata_path = directory / "metadata.json"
+        if not metadata_path.is_file():
+            if directory == scan_root:
+                break
+            continue
+        try:
+            document = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            document = None
+        if not isinstance(document, Mapping):
+            continue
+        settings = document.get("settings")
+        if isinstance(settings, Mapping):
+            for key in ("split_mode", "encode_codec", "encode_crf", "encode_preset", "encode_audio_bitrate"):
+                if key in settings:
+                    context[key] = settings[key]
+        for entry in _metadata_entries(document):
+            entry_matches = any(
+                _is_caption_match(raw, caption_path, metadata_path)
+                for raw in _entry_output_paths(entry)
+            )
+            if entry_matches:
+                window = _finite_window(entry)
+                if window:
+                    context.update(start_s=window[0], end_s=window[1])
+                raw_index = entry.get("index", entry.get("segment_index", index_hint))
+                if raw_index is not None:
+                    try:
+                        context["segment_index"] = int(raw_index)
+                    except (TypeError, ValueError):
+                        pass
+                source_candidates = _entry_source_paths(entry)
+                if source_candidates:
+                    context["source_media_path"] = str(
+                        _metadata_candidate(source_candidates[0], metadata_path)
+                    )
+                clip_candidates = _path_values(entry.get("clip_path"))
+                if clip_candidates:
+                    produced = _metadata_candidate(clip_candidates[0], metadata_path)
+                    if produced.is_file():
+                        context["segment_media_path"] = str(produced)
+            segments = entry.get("segments")
+            if not isinstance(segments, list):
+                continue
+            source_candidates = _entry_source_paths(entry)
+            source = source_candidates[0] if source_candidates else None
+            for position, raw_segment in enumerate(segments, start=1):
+                if not isinstance(raw_segment, Mapping):
+                    continue
+                raw_index = raw_segment.get("index", raw_segment.get("segment_index", position))
+                try:
+                    segment_index = int(raw_index)
+                except (TypeError, ValueError):
+                    segment_index = position
+                output_match = any(
+                    _is_caption_match(raw, caption_path, metadata_path)
+                    for raw in _entry_output_paths(raw_segment)
+                )
+                if not output_match and index_hint is not None:
+                    output_match = segment_index == index_hint
+                if not output_match:
+                    continue
+                window = _finite_window(raw_segment)
+                if window:
+                    context.update(start_s=window[0], end_s=window[1])
+                context["segment_index"] = segment_index
+                if source:
+                    context["source_media_path"] = str(_metadata_candidate(source, metadata_path))
+                media_candidates = _path_values(raw_segment.get("media_path"))
+                if media_candidates:
+                    produced = _metadata_candidate(media_candidates[0], metadata_path)
+                    if produced.is_file():
+                        context["segment_media_path"] = str(produced)
+                break
+        if context.get("start_s") is not None and context.get("source_media_path"):
+            break
+        if directory == scan_root:
+            break
+
+    if (is_segment_dir or context.get("start_s") is not None) and "segment_index" not in context and index_hint is not None:
+        context["segment_index"] = index_hint
+    if is_segment_dir and not context.get("source_media_path"):
+        source_stem = caption_path.parent.name[: -len("_segments")]
+        candidates = [
+            path
+            for path in caption_path.parent.parent.glob(f"{source_stem}.*")
+            if guess_kind_by_extension(path) in {"video", "audio", "image"}
+        ]
+        source = next((path for path in candidates if path.is_file()), None)
+        if source is not None:
+            context["source_media_path"] = str(source)
+    if "segment_index" in context and not context.get("segment_media_path"):
+        source_raw = context.get("source_media_path")
+        source = Path(str(source_raw)) if source_raw else None
+        index = int(context["segment_index"])
+        candidates: list[Path] = []
+        if source is not None:
+            candidates.append(caption_path.parent.parent / f"{source.stem}_clips" / f"clip_{index:04d}{source.suffix}")
+        if caption_path.parent.name.casefold().endswith("_segments"):
+            clips_name = caption_path.parent.name[: -len("_segments")] + "_clips"
+            clips_dir = caption_path.parent.with_name(clips_name)
+            candidates.extend(clips_dir.glob(f"clip_{index:04d}.*") if clips_dir.is_dir() else [])
+        produced = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if produced is not None:
+            context["segment_media_path"] = str(produced)
+    return context
+
+
+def _enrich_segment_item(item: EditorItem, root: Path) -> None:
+    caption_path = Path(str(item["caption_path"]))
+    context = _segment_context_from_metadata(caption_path, root)
+    if not context:
+        return
+    item.update(context)  # type: ignore[typeddict-item]
+    source = context.get("source_media_path")
+    if source:
+        item["source_media_path"] = str(source)
+        if Path(str(source)).is_file():
+            item["media_path"] = str(source)
+            item["kind"] = guess_kind_by_extension(source)
+            if item.get("status") == "no media":
+                item["status"] = "ok" if str(item.get("caption") or "").strip() else "empty"
 
 
 def _item_from_pair(
@@ -513,7 +700,9 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
             selected, formats = media.with_suffix(".txt"), []
         else:
             used_captions.update(str(path.resolve(strict=False)).casefold() for path in formats)
-        items.append(_item_from_pair(media, selected, formats, root, flags, failed_paths, failed_names))
+        item = _item_from_pair(media, selected, formats, root, flags, failed_paths, failed_names)
+        _enrich_segment_item(item, root)
+        items.append(item)
 
     for caption_path in caption_files:
         if str(caption_path.resolve(strict=False)).casefold() in used_captions:
@@ -534,6 +723,7 @@ def scan_folder(folder: str | os.PathLike[str], recursive: bool = False) -> list
         )
         if source_media is not None:
             item["source_media_path"] = str(source_media)
+        _enrich_segment_item(item, root)
         items.append(item)
 
     def item_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -617,22 +807,53 @@ def paginate_items(items: list[Any], page: int, page_size: int) -> tuple[list[An
     return items[start:end], selected, pages
 
 
+def _segment_clock(seconds: float, *, milliseconds: bool = False) -> str:
+    precision = 3 if milliseconds else 1
+    factor = 10**precision
+    value = math.floor(max(0.0, float(seconds)) * factor + 0.5) / factor
+    hours = int(value // 3600)
+    minutes = int((value % 3600) // 60)
+    remainder = value % 60
+    seconds_text = f"{remainder:0{3 + precision}.{precision}f}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds_text}"
+    return f"{minutes:02d}:{seconds_text}"
+
+
+def editor_item_label(item: Mapping[str, Any], scan_root: str | os.PathLike[str] | None = None) -> str:
+    """Return the stable row/gallery label for an editor item."""
+
+    caption = Path(str(item.get("caption_path") or "caption"))
+    is_segment = item.get("segment_index") is not None or caption.parent.name.casefold().endswith("_segments")
+    if is_segment:
+        try:
+            name = caption.relative_to(normalize_path(scan_root)).as_posix() if scan_root else caption.as_posix()
+        except (OSError, ValueError):
+            name = f"{caption.parent.name}/{caption.name}"
+        if item.get("start_s") is not None and item.get("end_s") is not None:
+            name += f" · {_segment_clock(float(item['start_s']))}–{_segment_clock(float(item['end_s']))}"
+        return name
+    return Path(str(item.get("media_path") or caption)).name
+
+
 def _page_rows(state: EditorState) -> tuple[list[list[Any]], str]:
     indices = filtered_indices(state)
     page, pages, start, end = pagination_math(len(indices), int(state.get("page", 1)), int(state.get("page_size", 25)))
     state["page"] = page
     rows: list[list[Any]] = []
     token_limit = int((state.get("filter") or {}).get("token_limit") or 512)
+    selected = state.get("selected_index")
     for global_index in indices[start:end]:
         item = state["items"][global_index]
-        name = Path(str(item.get("media_path") or item.get("caption_path") or "")).name
+        name = editor_item_label(item, state.get("folder"))
         preview = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
         preview = preview if len(preview) <= 120 else preview[:117].rstrip() + "..."
         token_count = int(item.get("tokens") or 0)
         flag = str(item.get("flag") or "-")
         if token_count > token_limit:
             flag = f"⚠ {flag}" if flag != "-" else "⚠"
-        rows.append([global_index + 1, name, preview, int(item.get("chars") or 0), token_count, flag, item.get("status") or "empty"])
+        row_number = f"▶ {global_index + 1}" if selected is not None and int(selected) == global_index else str(global_index + 1)
+        rows.append([row_number, name, preview, int(item.get("chars") or 0), token_count, flag, item.get("status") or "empty"])
     showing = "0" if not indices else f"{start + 1}-{end}"
     return rows, f"**Page {page} / {pages}** · showing {showing} of {len(indices)}"
 
@@ -699,7 +920,7 @@ def _selection_payload(
     video, audio, image = gr.update(value=None, visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False)
     media_path = item.get("media_path")
     source_media_path = item.get("source_media_path") or media_path
-    placeholder = gr.update(visible=False)
+    placeholder = gr.update(value="", visible=False)
     if not media_path:
         if source_media_path:
             placeholder = gr.update(
@@ -714,13 +935,23 @@ def _selection_payload(
         try:
             info = probe_media(media_path)
             item["duration"], item["kind"] = info.duration, ("video" if info.has_video else info.kind)
-            safe = str(preview_safe_media(media_path, cache_dir))
+            safe_path = preview_safe_media(media_path, cache_dir)
+            safe = str(safe_path)
             if info.has_video:
-                video = gr.update(value=safe, visible=True)
+                if safe_path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                    image = gr.update(value=safe, visible=True)
+                    placeholder = gr.update(
+                        value="Preview shows the first frame; this video is not browser-playable.",
+                        visible=True,
+                    )
+                else:
+                    video = gr.update(value=safe, visible=True)
             elif info.kind == "audio":
                 audio = gr.update(value=safe, visible=True)
             elif info.kind == "image":
                 image = gr.update(value=safe, visible=True)
+            else:
+                placeholder = gr.update(value="Media preview unavailable.", visible=True)
         except Exception:
             placeholder = gr.update(value="Media preview unavailable.", visible=True)
     state["dirty"], state["draft_caption"] = False, None
@@ -781,7 +1012,7 @@ def editor_page_gallery(
     values: list[tuple[str, str]] = []
     for global_index in page_indices:
         item = (state.get("items") or [])[global_index]
-        name = Path(str(item.get("media_path") or item.get("caption_path") or "caption")).name
+        name = editor_item_label(item, state.get("folder"))
         excerpt = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
         if len(excerpt) > 88:
             excerpt = excerpt[:85].rstrip() + "..."
@@ -1063,6 +1294,11 @@ def editor_export_handler(
             f"Exported {report.exported} approved item(s); no-media {report.no_media}; "
             f"not-approved {report.not_approved}; errors {report.error_count}."
         )
+        if report.segment_full_source_fallbacks:
+            message += (
+                f" {report.segment_full_source_fallbacks} segment captions exported against the full source "
+                "because no clip window was recorded."
+            )
         if report.errors:
             message += " " + " | ".join(report.errors[:3])
         if create_zip:
@@ -1072,6 +1308,100 @@ def editor_export_handler(
         return message
     except Exception as exc:
         return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
+
+
+def _regeneration_formats(item: Mapping[str, Any]) -> tuple[str, ...]:
+    paths = [Path(str(item.get("caption_path") or "caption.txt"))]
+    paths.extend(Path(str(path)) for path in item.get("caption_formats") or [])
+    formats = [
+        path.suffix.casefold().lstrip(".")
+        for path in paths
+        if path.suffix.casefold().lstrip(".") in {"txt", "json", "srt", "vtt", "jsonl"}
+    ]
+    return tuple(dict.fromkeys(formats or ["txt"]))
+
+
+def editor_regeneration_log(item: Mapping[str, Any]) -> str:
+    source = Path(str(item.get("source_media_path") or item.get("media_path") or "media"))
+    index = int(item.get("segment_index") or 0)
+    if index and item.get("start_s") is not None and item.get("end_s") is not None:
+        return (
+            f"Regenerating clip {index} "
+            f"({_segment_clock(float(item['start_s']), milliseconds=True)}–"
+            f"{_segment_clock(float(item['end_s']), milliseconds=True)}) of {source.name}"
+        )
+    return f"Regenerating {Path(str(item.get('caption_path') or source)).name}"
+
+
+def build_editor_regeneration_spec(
+    settings: Mapping[str, Any],
+    item: Mapping[str, Any],
+    *,
+    variant: str,
+    prompt_id: str,
+    override: str = "",
+    outputs_root: str | os.PathLike[str],
+) -> JobSpec:
+    """Build a one-item regeneration job, constraining known segments to their clip."""
+
+    caption_path = Path(str(item["caption_path"]))
+    formats = _regeneration_formats(item)
+    produced_raw = item.get("segment_media_path")
+    produced = Path(str(produced_raw)) if produced_raw else None
+    known_window = item.get("start_s") is not None and item.get("end_s") is not None
+    if produced is not None and produced.is_file():
+        media_path = produced
+        trim_start, trim_end = 0.0, None
+    else:
+        media_raw = item.get("source_media_path") or item.get("media_path")
+        if not media_raw:
+            raise ValueError("The selected caption has no media to regenerate.")
+        media_path = Path(str(media_raw))
+        trim_start = float(item["start_s"]) if known_window else float(settings.get("trim_start_s") or 0.0)
+        raw_trim_end = float(item["end_s"]) if known_window else settings.get("trim_end_s")
+        trim_end = float(raw_trim_end) if raw_trim_end not in (None, "") else None
+    if not media_path.is_file():
+        raise FileNotFoundError(f"Media not found: {media_path}")
+
+    merged = dict(settings)
+    merged.update(
+        model_key=variant,
+        variant_key=variant,
+        prompt_preset_id=prompt_id,
+        system_prompt="",
+        overwrite_existing=True,
+        output_formats=list(formats),
+        trim_start_s=trim_start,
+        trim_end_s=trim_end,
+        segment_mode="whole",
+        scene_detect_enabled=False,
+    )
+    override_prompt = str(override or "").strip()
+    if override_prompt:
+        merged["user_prompt"] = override_prompt
+    else:
+        merged.pop("user_prompt", None)
+    output = OutputSpec(
+        kind="batch",
+        outputs_root=str(outputs_root),
+        batch_output_dir=str(caption_path.parent),
+        mirror_names=False,
+        overwrite=True,
+    )
+    spec = JobSpec.from_settings(merged, [InputItem(path=str(media_path))], output)
+    return replace(
+        spec,
+        preprocess=replace(spec.preprocess, trim_start_s=trim_start, trim_end_s=trim_end),
+        split=replace(spec.split, mode="whole"),
+        post=replace(spec.post, formats=formats),
+        internal={
+            **dict(spec.internal or {}),
+            "output_dirs": [str(caption_path.parent)],
+            "output_stems": [caption_path.stem],
+            "metadata_name": "editor_regeneration_metadata.json",
+            "continue_on_error": True,
+        },
+    )
 
 
 def build(ctx: "UiContext") -> None:
@@ -1142,11 +1472,12 @@ def build(ctx: "UiContext") -> None:
             )
             table = gr.Dataframe(
                 value=[], headers=_TABLE_HEADERS,
-                datatype=["number", "str", "str", "number", "number", "str", "str"],
+                datatype=["str", "str", "str", "number", "number", "str", "str"],
                 type="array", interactive=False, show_search="none", max_height=520,
                 pinned_columns=2, static_columns=list(range(7)),
                 column_widths=[55, 180, "46%", 70, 75, 90, 100], wrap=False,
                 buttons=["copy", "fullscreen"], label="Review queue",
+                elem_id="vc_editor_review_table",
             )
             gallery = gr.Gallery(
                 value=[],
@@ -1384,7 +1715,7 @@ def build(ctx: "UiContext") -> None:
         with gr.Row():
             replace_regex = gr.Checkbox(value=False, label="Regex", info="Treat Find as a regular expression.")
             replace_case = gr.Checkbox(value=False, label="Case sensitive", info="Match letter case exactly.")
-            replace_whole = gr.Checkbox(value=False, label="Whole word", info="Exclude matches embedded inside longer words.")
+            replace_whole = gr.Checkbox(value=True, label="Whole word", info="Exclude matches embedded inside longer words.")
             preview_replace = action_button("Preview", "purple")
             apply_replace = action_button("Apply", "orange")
         replace_result = gr.HTML("")
@@ -1462,7 +1793,7 @@ def build(ctx: "UiContext") -> None:
             matches = filtered_indices(next_state)
             next_state["selected_index"] = matches[0] if matches else None
             rows, page_text = _page_rows(next_state)
-            selection = _selection_payload(next_state, preview_cache, load_preview=False)
+            selection = _selection_payload(next_state, preview_cache, load_preview=True)
             message = f"Scanned {len(items)} review item(s) in {next_state['folder']}."
             ctx.app_log.log(message, scope="editor")
             result = (
@@ -1561,6 +1892,35 @@ def build(ctx: "UiContext") -> None:
         outputs=gallery,
         queue=False,
         trigger_mode="always_last",
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    state.change(
+        fn=None,
+        inputs=state,
+        outputs=[],
+        js=r"""
+        (value) => {
+          const key = `${value?.folder || ''}|${value?.selected_index ?? ''}|${value?.page || 1}`;
+          const selectMarkedRow = (attempt) => {
+            const root = document.getElementById('vc_editor_review_table');
+            const row = Array.from(root?.querySelectorAll('tbody tr') || []).find((item) =>
+              (item.querySelector('td')?.textContent || '').trim().startsWith('▶')
+            );
+            if (row) {
+              if (window.__vcapEditorSelectedMarker !== key) {
+                window.__vcapEditorSelectedMarker = key;
+                (row.querySelector('td') || row).click();
+              }
+            } else if (attempt < 8) {
+              window.setTimeout(() => selectMarkedRow(attempt + 1), 50);
+            }
+          };
+          window.setTimeout(() => selectMarkedRow(0), 0);
+          return [];
+        }
+        """,
+        queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2194,63 +2554,31 @@ def build(ctx: "UiContext") -> None:
             if message:
                 yield gr.update(visible=False), message, next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
                 return
-        selected = next_state.get("selected_index")
-        reference_item = (
-            next_state["items"][int(selected)]
-            if selected is not None and int(selected) in indices
-            else target_items[0]
-        )
-        _, prompt_id, _ = resolve_regeneration_prompt_choices(
-            variant,
-            reference_item,
-            prompt_id,
-        )
         try:
             settings = registry.values_to_dict(runtime_values)
-            media_paths = [str(item.get("media_path") or "") for item in target_items]
             caption_paths = [Path(str(item["caption_path"])) for item in target_items]
-            formats = sorted(
-                {
-                    path.suffix.casefold().lstrip(".")
-                    for path in caption_paths
-                    if path.suffix.casefold().lstrip(".") in {"txt", "json", "srt", "vtt", "jsonl"}
-                }
-            ) or ["txt"]
-            settings.update(
-                model_key=variant,
-                variant_key=variant,
-                prompt_preset_id=prompt_id,
-                system_prompt=None,
-                user_prompt=(str(override).strip() or None),
-                overwrite_existing=True,
-                output_formats=formats,
-                continue_on_error=True,
-            )
-            get_preset(prompt_id)
             variant_to_family(variant)
-            output = OutputSpec(
-                kind="batch",
-                outputs_root=str(ctx.outputs_dir),
-                batch_output_dir=str(normalize_path(next_state.get("folder") or ctx.outputs_dir)),
-                mirror_names=False,
-                overwrite=True,
-            )
-            spec = JobSpec.from_settings(
-                settings,
-                [InputItem(path=path) for path in media_paths],
-                output,
-            )
-            spec = replace(
-                spec,
-                post=replace(spec.post, formats=tuple(formats)),
-                internal={
-                    **dict(spec.internal or {}),
-                    "output_dirs": [str(path.parent) for path in caption_paths],
-                    "output_stems": [path.stem for path in caption_paths],
-                    "metadata_name": "editor_regeneration_metadata.json",
-                    "continue_on_error": True,
-                },
-            )
+            specs: list[tuple[JobSpec, str]] = []
+            for target_item in target_items:
+                _, item_prompt_id, message = resolve_regeneration_prompt_choices(
+                    variant, target_item, prompt_id
+                )
+                if message or not item_prompt_id:
+                    raise ValueError(message or "No compatible regeneration prompt is available")
+                get_preset(item_prompt_id)
+                specs.append(
+                    (
+                        build_editor_regeneration_spec(
+                            settings,
+                            target_item,
+                            variant=variant,
+                            prompt_id=item_prompt_id,
+                            override=override,
+                            outputs_root=ctx.outputs_dir,
+                        ),
+                        editor_regeneration_log(target_item),
+                    )
+                )
         except Exception as exc:
             yield gr.update(visible=False), f"<span class='vc-err'>{html.escape(str(exc))}</span>", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
             return
@@ -2261,7 +2589,13 @@ def build(ctx: "UiContext") -> None:
         def work() -> None:
             try:
                 ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
-                terminal["result"] = ctx.pipeline.run_job(spec, _RegenerationSink(events))
+                results = []
+                sink = _RegenerationSink(events)
+                for spec, log_message in specs:
+                    ctx.app_log.log(log_message, scope="editor")
+                    events.put(("log", log_message))
+                    results.append(ctx.pipeline.run_job(spec, sink))
+                terminal["results"] = results
             except BaseException as exc:
                 terminal["error"] = exc
             finally:
@@ -2295,8 +2629,10 @@ def build(ctx: "UiContext") -> None:
         selected = next_state.get("selected_index")
         selected_item = next_state["items"][int(selected)] if selected is not None else None
         caption_value = str(selected_item.get("caption") or "") if selected_item else ""
-        result = terminal.get("result")
-        counts = dict(getattr(result, "counts", {}) or {})
+        counts: dict[str, int] = {}
+        for result in terminal.get("results", []):
+            for key, value in dict(getattr(result, "counts", {}) or {}).items():
+                counts[key] = counts.get(key, 0) + int(value or 0)
         message = (
             f"Regenerated {changed}/{len(indices)} caption(s); "
             f"failed {int(counts.get('failed', 0) or 0)}."
@@ -2334,8 +2670,8 @@ def build(ctx: "UiContext") -> None:
         if message:
             yield gr.skip(), message, *(gr.skip() for _ in range(6))
             return
-        media_path = item.get("media_path")
-        if not media_path or not Path(media_path).is_file():
+        media_path = item.get("segment_media_path") or item.get("source_media_path") or item.get("media_path")
+        if not media_path or not Path(str(media_path)).is_file():
             yield gr.skip(), "<span class='vc-err'>The selected caption has no media to regenerate.</span>", *(gr.skip() for _ in range(6))
             return
         caption_path = Path(str(item["caption_path"]))
@@ -2353,31 +2689,16 @@ def build(ctx: "UiContext") -> None:
         except ValueError as exc:
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
             return
-        settings.update(
-            model_key=variant,
-            variant_key=variant,
-            prompt_preset_id=prompt_id,
-            system_prompt=None,
-            user_prompt=(str(override).strip() or None),
-            overwrite_existing=True,
-            output_formats=[caption_path.suffix.lstrip(".") or "txt"],
-        )
-        output = OutputSpec(
-            kind="batch", outputs_root=str(ctx.outputs_dir), batch_output_dir=str(caption_path.parent),
-            mirror_names=False, overwrite=True,
-        )
         try:
             get_preset(prompt_id)
             variant_to_family(variant)
-            spec = JobSpec.from_settings(settings, [InputItem(path=media_path)], output)
-            spec = replace(
-                spec,
-                post=PostSpec(formats=(caption_path.suffix.lstrip(".") or "txt",)),
-                internal={
-                    "output_dirs": [str(caption_path.parent)],
-                    "output_stems": [caption_path.stem],
-                    "metadata_name": "editor_regeneration_metadata.json",
-                },
+            spec = build_editor_regeneration_spec(
+                settings,
+                item,
+                variant=variant,
+                prompt_id=prompt_id,
+                override=override,
+                outputs_root=ctx.outputs_dir,
             )
         except Exception as exc:
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
@@ -2389,6 +2710,9 @@ def build(ctx: "UiContext") -> None:
         def work() -> None:
             try:
                 ctx.pipeline_client.subprocess_mode = bool(settings.get("subprocess_mode", True))
+                log_message = editor_regeneration_log(item)
+                ctx.app_log.log(log_message, scope="editor")
+                events.put(("log", log_message))
                 terminal["result"] = ctx.pipeline.run_job(spec, _RegenerationSink(events))
             except BaseException as exc:
                 terminal["error"] = exc

@@ -208,6 +208,7 @@ if TYPE_CHECKING:
 
 _INITIAL_VARIANT = "qwen3_omni_instruct_int4"
 _INITIAL_MODALITY = "video_audio"
+_CAPTION_LENGTH_CHOICES = ("short", "medium", "detailed", "very detailed")
 _PRIMARY_PROMPT_MODALITIES = {
     "timechat": "video_audio",
     "avocado": "video_audio",
@@ -349,6 +350,63 @@ def _resolve_prompt_preset(
     return family, choices, selected
 
 
+def validate_prompt_preset(
+    value: str,
+    previous_valid: str | None,
+    variant_key: str,
+    modality: str,
+    include_audio: bool,
+) -> tuple[Any, str, str, list[str]]:
+    """Keep a typed prompt combobox value on a compatible registered preset."""
+
+    effective_modality = _effective_prompt_modality(variant_key, modality, include_audio)
+    family, choices, default = _resolve_prompt_preset(
+        variant_key, effective_modality, previous_valid
+    )
+    by_value = {preset_id: preset_id for _, preset_id in choices}
+    by_value.update({label: preset_id for label, preset_id in choices})
+    by_value.update(
+        {
+            preset.label: preset.id
+            for preset in list_presets(family, effective_modality)
+        }
+    )
+    selected = by_value.get(str(value or ""))
+    context = [family, effective_modality]
+    if selected is not None:
+        preset = get_preset(selected)
+        update = gr.update(value=selected) if selected != str(value or "") else gr.skip()
+        return update, selected, _display(preset.description), context
+    fallback = str(previous_valid or "")
+    if fallback not in {preset_id for _, preset_id in choices}:
+        fallback = default.id if default is not None else (choices[0][1] if choices else "")
+    if not fallback:
+        return gr.update(choices=[], value=None), "", "Unknown task preset; no compatible preset is available", context
+    preset = get_preset(fallback)
+    return (
+        gr.update(choices=choices, value=fallback),
+        fallback,
+        f"Unknown task preset; kept {_display(preset.label)}",
+        context,
+    )
+
+
+def validate_caption_length(value: str, previous_valid: str | None) -> tuple[Any, str, Any]:
+    """Reject custom caption-length text while retaining the last valid choice."""
+
+    selected = str(value or "")
+    if selected in _CAPTION_LENGTH_CHOICES:
+        return gr.skip(), selected, gr.skip()
+    fallback = str(previous_valid or "detailed")
+    if fallback not in _CAPTION_LENGTH_CHOICES:
+        fallback = "detailed"
+    return (
+        gr.update(value=fallback),
+        fallback,
+        f"Unknown caption length; kept {fallback}",
+    )
+
+
 def _effective_prompt_modality(
     variant_key: str,
     modality: str,
@@ -383,7 +441,11 @@ def _prompt_variables(values: Iterable[Any]) -> dict[str, Any]:
         "SUBJECT_CLASS",
         "EXTRA_INSTRUCTIONS",
     )
-    return dict(zip(names, values))
+    variables = dict(zip(names, values))
+    # Whisper runs after the UI has rendered the selected prompt. Preserve its
+    # placeholder here so the runner can fill it with clip-local speech last.
+    variables["TRANSCRIPT"] = "{{TRANSCRIPT}}"
+    return variables
 
 
 def render_prompt_preserving_edits(
@@ -398,7 +460,7 @@ def render_prompt_preserving_edits(
     preset = get_preset(str(preset_id))
     rendered_system, rendered_user = render_prompt(preset, dict(variables))
     next_system = rendered_system or ""
-    next_user = rendered_user
+    next_user = rendered_user or ""
     previous = dict(last_auto or {})
     manually_loaded = bool(previous.get("manual"))
     system_is_auto = not manually_loaded and str(current_system or "") == str(previous.get("system") or "")
@@ -609,11 +671,17 @@ def unload_model_report(client: Any, gpu_index: int = 0) -> str:
         if isinstance(before_ping, Mapping)
         else None
     )
-    outcome = client.unload()
+    release = getattr(client, "release_model", None)
+    outcome = release(timeout_s=30.0) if callable(release) else client.unload()
+    if isinstance(outcome, Mapping) and outcome.get("busy"):
+        return "<span class='vc-warn'>A job is running; the model cannot be unloaded yet.</span>"
+    if isinstance(outcome, Mapping) and outcome.get("error"):
+        return f"<span class='vc-err'>Model unload failed: {html.escape(str(outcome['error']))}</span>"
     after_ping = client.ping()
     after_snapshot = resource_snapshot(int(gpu_index or 0))
 
-    payload: Mapping[str, Any] = outcome if isinstance(outcome, Mapping) else {}
+    outer: Mapping[str, Any] = outcome if isinstance(outcome, Mapping) else {}
+    payload: Mapping[str, Any] = outer
     nested = payload.get("report")
     if isinstance(nested, Mapping):
         payload = nested
@@ -622,7 +690,7 @@ def unload_model_report(client: Any, gpu_index: int = 0) -> str:
     elif outcome is not None and hasattr(outcome, "__dataclass_fields__"):
         payload = asdict(outcome)
 
-    released = payload.get("variant_key") or payload.get("released") or resident
+    released = payload.get("variant_key") or outer.get("released") or resident
     before = payload.get("vram_before_gb", before_snapshot.get("vram_used_gb", 0.0))
     after = payload.get("vram_after_gb", after_snapshot.get("vram_used_gb", 0.0))
     try:
@@ -798,7 +866,10 @@ def run_history_records(summaries: Iterable[Any]) -> list[dict[str, Any]]:
     for summary in summaries:
         raw_metadata = _summary_value(summary, "metadata_path")
         metadata_path = str(raw_metadata) if raw_metadata else None
-        if metadata_path and Path(metadata_path).name.casefold() != "metadata.json":
+        if metadata_path and Path(metadata_path).name.casefold() not in {
+            "metadata.json",
+            "editor_regeneration_metadata.json",
+        }:
             metadata_path = None
         records.append(
             {
@@ -854,8 +925,10 @@ def load_prompt_library_entry(
     library = _make_prompt_library(normalize_path(directory), library_factory)
     entry = library.load(str(name or ""))
     loaded_name = str(entry.name if hasattr(entry, "name") else entry.get("name", name))
-    system = str(entry.system_prompt if hasattr(entry, "system_prompt") else entry.get("system_prompt", ""))
-    user = str(entry.user_prompt if hasattr(entry, "user_prompt") else entry.get("user_prompt", ""))
+    raw_system = entry.system_prompt if hasattr(entry, "system_prompt") else entry.get("system_prompt", "")
+    raw_user = entry.user_prompt if hasattr(entry, "user_prompt") else entry.get("user_prompt", "")
+    system = str(raw_system or "")
+    user = str(raw_user or "")
     manual_state = {"system": system, "user": user, "manual": True}
     return system, user, manual_state, f"<span class='vc-ok'>Loaded prompt: {html.escape(loaded_name)}</span>"
 
@@ -1382,6 +1455,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     initial_prompt = default_preset_for(initial_family, _INITIAL_MODALITY)
     initial_vars = {name: data["default"] for name, data in TEMPLATE_VARIABLES.items()}
     initial_system, initial_user = render_prompt(initial_prompt, initial_vars)
+    initial_system, initial_user = initial_system or "", initial_user or ""
     prompt_library_dir = normalize_path(ctx.presets_dir / "prompts")
     try:
         initial_prompt_names = prompt_library_names(prompt_library_dir)
@@ -1429,7 +1503,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         )
                         controls["trim_end_s"] = ctx.reg(
                             "trim_end_s", trim_end, None, section="preprocessing",
-                            description="Optional numeric trim end in seconds.", minimum=0.0,
+                            description="Optional numeric trim end in seconds.", kind="float", minimum=0.0,
                         )
                     gr.Markdown(
                         "Use the player's built-in trim editor for visual trimming; its edited file becomes the first input automatically.",
@@ -1522,12 +1596,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         elem_id="vc_results_zip",
                         interactive=False,
                     )
+                with gr.Row():
                     results_zip_file = gr.File(
                         label="Results ZIP download",
                         interactive=False,
                         visible=False,
                         elem_id="vc_results_zip_download",
-                        scale=3,
                     )
                 with gr.Row(
                     visible=False,
@@ -2191,6 +2265,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "prompt_preset_id", prompt_preset, initial_prompt.id, section="prompt",
                         description="Built-in task and prompt preset identifier.", kind="str",
                     )
+                    valid_prompt_preset_state = gr.State(initial_prompt.id)
                     prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
                     system_prompt = gr.Textbox(
                         value=initial_system or "",
@@ -2201,8 +2276,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         elem_classes=["vc-mono"],
                     )
                     controls["system_prompt"] = ctx.reg(
-                        "system_prompt", system_prompt, initial_system, section="prompt",
-                        description="Rendered or custom system instruction.",
+                        "system_prompt", system_prompt, "", section="prompt",
+                        description="Rendered or custom system instruction.", kind="str",
                     )
                     user_prompt = gr.Textbox(
                         value=initial_user,
@@ -2295,7 +2370,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             )
                         with gr.Row():
                             caption_length = gr.Dropdown(
-                                choices=["short", "medium", "detailed", "very detailed"],
+                                choices=list(_CAPTION_LENGTH_CHOICES),
                                 value="detailed",
                                 allow_custom_value=True,
                                 label="Caption length",
@@ -2305,6 +2380,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 "caption_length", caption_length, "detailed", section="prompt",
                                 description="Requested caption length or detail level.", kind="str",
                             )
+                            valid_caption_length_state = gr.State("detailed")
                             subject_class = gr.Textbox(value="person", label="Subject class", info="Generic identity class for LoRA captions.")
                             controls["subject_class"] = ctx.reg(
                                 "subject_class", subject_class, "person", section="prompt",
@@ -3149,6 +3225,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     controls["output_formats"] = ctx.reg(
                         "output_formats", formats, ["txt", "json"], section="output",
                         description="Caption and dataset file formats written for every item.",
+                        kind="list", choices=["txt", "json", "srt", "vtt", "jsonl"],
                     )
                     with gr.Row():
                         subtitle_min_cue_s = gr.Number(
@@ -3247,6 +3324,108 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             description="Maximum tokens generated by the long-video summary and chapters stage.",
                             kind="int", minimum=64, maximum=8192,
                         )
+
+                with gr.Accordion("7. Speech transcript (Whisper)", open=False):
+                    transcript_enabled = gr.Checkbox(
+                        value=False,
+                        label="Also transcribe speech with Whisper during caption runs",
+                        info=(
+                            "Runs Whisper once on each video or audio item before captioning and writes "
+                            "transcript sidecars beside the caption outputs."
+                        ),
+                        elem_id="vc_transcript_enabled",
+                    )
+                    controls["transcript_enabled"] = ctx.reg(
+                        "transcript_enabled",
+                        transcript_enabled,
+                        False,
+                        section="transcript",
+                        description="Also transcribe speech with Whisper during caption runs.",
+                        kind="bool",
+                    )
+                    transcript_formats = gr.CheckboxGroup(
+                        choices=[
+                            ("SubRip", "srt"),
+                            ("WebVTT", "vtt"),
+                            ("Plain text", "txt"),
+                            ("LRC", "lrc"),
+                            ("TSV", "tsv"),
+                            ("JSON", "json"),
+                        ],
+                        value=["srt", "txt"],
+                        label="Transcript formats",
+                        info="File formats written beside each caption output.",
+                        show_select_all=True,
+                    )
+                    controls["transcript_formats"] = ctx.reg(
+                        "transcript_formats",
+                        transcript_formats,
+                        ["srt", "txt"],
+                        section="transcript",
+                        description="Transcript sidecar formats written during caption runs.",
+                        kind="list",
+                        choices=["srt", "vtt", "txt", "lrc", "tsv", "json"],
+                    )
+                    transcript_inject_prompt = gr.Checkbox(
+                        value=True,
+                        label="Inject transcript into the caption prompt",
+                        info=(
+                            "Adds the overlapping speech to each clip prompt when the prompt does not "
+                            "already contain {{TRANSCRIPT}}."
+                        ),
+                    )
+                    controls["transcript_inject_prompt"] = ctx.reg(
+                        "transcript_inject_prompt",
+                        transcript_inject_prompt,
+                        True,
+                        section="transcript",
+                        description="Inject the overlapping Whisper transcript into each caption prompt.",
+                        kind="bool",
+                    )
+                    transcript_prompt_wrapper = gr.Textbox(
+                        value=(
+                            "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n"
+                            "{{TRANSCRIPT}}"
+                        ),
+                        label="Transcript prompt wrapper",
+                        info=(
+                            "Block appended when prompt injection is on and the user prompt has no "
+                            "{{TRANSCRIPT}} token."
+                        ),
+                        lines=3,
+                        max_lines=6,
+                        elem_classes=["vc-mono"],
+                    )
+                    controls["transcript_prompt_wrapper"] = ctx.reg(
+                        "transcript_prompt_wrapper",
+                        transcript_prompt_wrapper,
+                        (
+                            "Exact speech transcript for this clip (use it verbatim for dialogue, do not invent speech):\n"
+                            "{{TRANSCRIPT}}"
+                        ),
+                        section="transcript",
+                        description="Wrapper appended around an injected clip-local transcript.",
+                        kind="str",
+                    )
+                    transcript_file_suffix = gr.Textbox(
+                        value="_transcript",
+                        label="Transcript file suffix",
+                        info="Suffix inserted between the source stem and transcript extension.",
+                        max_length=80,
+                    )
+                    controls["transcript_file_suffix"] = ctx.reg(
+                        "transcript_file_suffix",
+                        transcript_file_suffix,
+                        "_transcript",
+                        section="transcript",
+                        description="Filename suffix used for transcript sidecars.",
+                        kind="str",
+                    )
+                    gr.Markdown(
+                        "Uses the model and decoding settings from the Transcribe tab. The Whisper model "
+                        "downloads automatically on first use.",
+                        elem_classes=["vc-help"],
+                    )
 
     handles = CaptionTabHandles(
         media=media,
@@ -3899,14 +4078,20 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         extra_instructions,
     ]
 
-    def render_selected(preset_id: str, *values: Any) -> tuple[str, str, str, dict[str, str]]:
+    def render_selected(preset_id: str, *values: Any) -> tuple[Any, Any, Any, Any]:
         try:
             preset = get_preset(str(preset_id))
             system, user = render_prompt(preset, _prompt_variables(values))
-            tracked = {"system": system or "", "user": user}
-            return _display(preset.description), system or "", user, tracked
+            system, user = system or "", user or ""
+            tracked = {"system": system, "user": user}
+            return _display(preset.description), system, user, tracked
         except Exception as exc:
-            return f"<span class='vc-err'>{html.escape(str(exc))}</span>", "", "", {"system": "", "user": ""}
+            return (
+                f"<span class='vc-warn'>{html.escape(str(exc))}</span>",
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+            )
 
     def select_prompt(preset_id: str, variant_key: str, *values: Any) -> tuple[Any, ...]:
         description, system, user, tracked = render_selected(preset_id, *values)
@@ -4045,20 +4230,29 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         api_visibility="private",
     )
 
-    def describe_prompt(
-        preset_id: str,
-        variant_key: str,
-        modality: str,
-        include_audio: bool,
-    ) -> tuple[str, list[str]]:
-        description = _display(get_preset(str(preset_id)).description) if preset_id else ""
-        effective_modality = _effective_prompt_modality(variant_key, modality, include_audio)
-        return description, [variant_to_family(variant_key), effective_modality]
-
     prompt_preset.change(
-        describe_prompt,
-        inputs=[prompt_preset, model_key, media.modality_state, use_audio],
-        outputs=[prompt_description, prompt_context_state],
+        validate_prompt_preset,
+        inputs=[
+            prompt_preset,
+            valid_prompt_preset_state,
+            model_key,
+            media.modality_state,
+            use_audio,
+        ],
+        outputs=[
+            prompt_preset,
+            valid_prompt_preset_state,
+            prompt_description,
+            prompt_context_state,
+        ],
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    caption_length.change(
+        validate_caption_length,
+        inputs=[caption_length, valid_caption_length_state],
+        outputs=[caption_length, valid_caption_length_state, prompt_description],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -4125,7 +4319,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         else:
             rendered_system, rendered_user = render_prompt(preset, _prompt_variables(values))
             system = rendered_system or ""
-            user = rendered_user
+            user = rendered_user or ""
             tracked = {"system": system, "user": user}
         return (
             gr.update(choices=choices, value=preset.id),
@@ -4544,6 +4738,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 else "<span class='vc-warn'>No cuts detected; the pipeline will use the selected range as one clip.</span>"
             )
             yield rows, status
+        except CancelledError:
+            yield [], "<span class='vc-warn'>Scene preview cancelled.</span>"
         except Exception as exc:
             yield [], f"<span class='vc-err'>{html.escape(str(exc))}</span>"
         finally:
@@ -4610,7 +4806,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             thread.join()
             if "error" in result:
                 raise result["error"]
-            yield _ready_line(variant_key)
+            ready, detail = result.get("value", (False, "Model action returned no result"))
+            if not ready:
+                css = "vc-warn" if "cancel" in str(detail).casefold() else "vc-err"
+                yield f"<span class='{css}'>{html.escape(str(detail))}</span>"
+            else:
+                yield _ready_line(variant_key)
         except BaseException as exc:
             yield f"<span class='vc-err'>{html.escape(str(exc))}</span>"
         finally:
@@ -5062,7 +5263,7 @@ def wire(ctx: "UiContext") -> None:
                 _prompt_variables(prompt_values),
             )
             settings["system_prompt"] = rendered_system or ""
-            settings["user_prompt"] = rendered_user
+            settings["user_prompt"] = rendered_user or ""
 
         segment_mode = str(settings.get("segment_mode") or "whole")
         if segment_mode == "scenes" and not bool(settings.get("scene_detect_enabled")):
@@ -5160,8 +5361,8 @@ def wire(ctx: "UiContext") -> None:
             starting_label = "Retrying"
             starting_status = f"Retrying {len(items)} item(s)"
         else:
-            starting_label = "Starting"
-            starting_status = "Starting caption worker"
+            starting_label = "Preparing…"
+            starting_status = "Preparing caption job…"
         yield (
             render_progress_html(
                 0,
@@ -5480,7 +5681,7 @@ def wire(ctx: "UiContext") -> None:
             )
 
     def request_cancel_job() -> tuple[Any, Any, str]:
-        token = ctx.states.get("caption_job_token")
+        token = ctx.states.get("caption_job_token") or ctx.get_active_cancel()
         state = request_caption_cancel(token)
         if state != "confirm":
             return (
@@ -5495,14 +5696,16 @@ def wire(ctx: "UiContext") -> None:
         )
 
     def confirm_cancel_job() -> tuple[Any, Any, str]:
-        token = ctx.states.get("caption_job_token")
+        caption_token = ctx.states.get("caption_job_token")
+        token = caption_token or ctx.get_active_cancel()
         if not confirm_caption_cancel(token):
             return (
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
                 "**Status:** No armed caption cancellation request.",
             )
-        ctx.pipeline_client.cancel(force=False)
+        if token is caption_token:
+            ctx.pipeline_client.cancel(force=False)
         return (
             gr.update(value="Cancelling…", interactive=False),
             gr.update(visible=False),
@@ -5510,7 +5713,7 @@ def wire(ctx: "UiContext") -> None:
         )
 
     def keep_running_job() -> tuple[Any, Any, str]:
-        token = ctx.states.get("caption_job_token")
+        token = ctx.states.get("caption_job_token") or ctx.get_active_cancel()
         kept = keep_caption_running(token)
         return (
             gr.update(value="⏹ Cancel", interactive=bool(kept)),
@@ -5523,7 +5726,7 @@ def wire(ctx: "UiContext") -> None:
         )
 
     def escape_cancel_job() -> tuple[Any, Any, str]:
-        token = ctx.states.get("caption_job_token")
+        token = ctx.states.get("caption_job_token") or ctx.get_active_cancel()
         if token is not None and token.is_armed():
             return confirm_cancel_job()
         return request_cancel_job()
@@ -5580,7 +5783,7 @@ def wire(ctx: "UiContext") -> None:
         last_state: Mapping[str, Any] | None,
         current_caption: str,
     ) -> tuple[Any, ...]:
-        token = ctx.states.get("caption_job_token")
+        token = ctx.states.get("caption_job_token") or ctx.get_active_cancel()
         any_job_running = (
             ctx.get_active_cancel() is not None
             or bool(getattr(ctx.pipeline_client, "_busy", False))

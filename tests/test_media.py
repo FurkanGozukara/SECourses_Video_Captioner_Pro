@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import vcap.core.media as media_module
+from vcap.core.logs import get_log
 from vcap.core.media import (
+    MediaInfo,
     extract_audio,
     extract_frames_to_files,
     find_ffmpeg,
@@ -200,8 +203,9 @@ def test_trim_copy_precise_and_preview(media_files: dict[str, Path], tmp_path: P
     assert precise_info.has_video and precise_info.duration and precise_info.duration > 0.6
 
     preview = preview_safe_media(media_files["incompatible"], tmp_path / "previews")
-    assert preview.suffix == ".mp4" and preview.is_file()
-    assert probe_media(preview).video_codec == "h264"
+    assert preview.suffix == ".png" and preview.is_file()
+    with Image.open(preview) as poster:
+        assert poster.width == 960
     assert preview_safe_media(media_files["incompatible"], tmp_path / "previews") == preview
 
 
@@ -245,3 +249,80 @@ def test_unicode_voyager_dimensions_are_unambiguous_in_ui() -> None:
     rendered = _media_info_markdown(info)
     assert "960 x 720" in rendered
     assert "980 x 720" not in rendered
+
+
+def test_preview_safe_media_remuxes_h264_with_stream_copy_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mkv"
+    source.write_bytes(b"source")
+    info = MediaInfo(
+        source,
+        "video",
+        duration=20.0,
+        width=1280,
+        height=720,
+        fps=24.0,
+        has_video=True,
+        has_audio=True,
+        video_codec="h264",
+        audio_codec="aac",
+        container="matroska",
+    )
+    commands: list[list[str]] = []
+
+    def fake_ffmpeg(command: list[str], *_args, **_kwargs) -> None:
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"remux")
+
+    before = get_log().revision
+    monkeypatch.setattr(media_module, "probe_media", lambda _path: info)
+    monkeypatch.setattr(media_module, "run_ffmpeg", fake_ffmpeg)
+
+    preview = preview_safe_media(source, tmp_path / "cache")
+
+    assert preview.suffix == ".mp4" and preview.read_bytes() == b"remux"
+    assert len(commands) == 1
+    assert commands[0].count("copy") == 2
+    assert "libx264" not in commands[0] and "aac" not in commands[0]
+    lines, _revision = get_log().snapshot(before)
+    assert any("Preparing preview" in line for line in lines)
+
+
+def test_preview_safe_media_uses_poster_for_vp9_without_running_remux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    info = MediaInfo(
+        source,
+        "video",
+        duration=20.0,
+        width=1280,
+        height=720,
+        fps=24.0,
+        has_video=True,
+        has_audio=True,
+        video_codec="vp9",
+        audio_codec="opus",
+        container="mp4",
+    )
+    poster = tmp_path / "poster.png"
+
+    def fake_thumbnail(_source: Path, _target: Path, **_kwargs) -> Path:
+        poster.write_bytes(b"poster")
+        return poster
+
+    monkeypatch.setattr(media_module, "probe_media", lambda _path: info)
+    monkeypatch.setattr(media_module, "make_thumbnail", fake_thumbnail)
+    monkeypatch.setattr(
+        media_module,
+        "run_ffmpeg",
+        lambda *_args, **_kwargs: pytest.fail("video remux or re-encode was attempted"),
+    )
+
+    preview = preview_safe_media(source, tmp_path / "cache")
+
+    assert preview == poster and preview.read_bytes() == b"poster"

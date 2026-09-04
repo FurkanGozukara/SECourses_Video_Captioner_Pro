@@ -162,6 +162,8 @@ metadata.json: app version, timestamp, model (key, variant, files+sha), all sett
 ## 6. Prompt/task presets (initial list; per-model applicability)
 Wan 2.2 T2V dense · Wan T2V sparse · Wan I2V motion-only · Hunyuan dense cinematic · LTX 2.5 short physical · MiniMax H3 performance+sound · Character LoRA (trigger, drop identity) · Motion LoRA (trigger then movement) · TimeChat 6D raw JSON · TimeChat → Wan flatten · AVoCaDO aligned A/V · AVoCaDO visual-only · AVoCaDO structured (UGC) · Audio SFX bed · Audio caption (Captioner) · ASR clean · ASR + timestamps (SRT) · ASR + translate ({{TARGET_LANGUAGE}}) · Lyrics · Booru-ish tags · Negative/avoid list · No-speech visual · Screen text include (OCR) · Chapters & summary · Search/index metadata JSON · Closed captions/SDH · Custom (free text). Template variables: `{{TRIGGER}}`, `{{LANGUAGE}}`, `{{TARGET_LANGUAGE}}`, `{{CAPTION_LENGTH}}`, `{{AVOID}}`, `{{SUBJECT_CLASS}}`.
 
+Whisper-guided captioning additionally reserves `{{TRANSCRIPT}}`, filled from clip-local speech only after the ordinary prompt variables render.
+
 ## 7. Work breakdown (codex tasks; parallel where independent)
 - T1 Core foundation: `vcap/core/{paths,logs,progress,gpu,media,outputs,presets,registry,subprocess_runner}.py` + tests. (reports 01,03,05,02)
 - T2 Scene split + preprocess + clip fitness + captions_post + export: `core/{scene_split,preprocess,clip_fitness,captions_post,export}.py` + tests. (reports 05,06)
@@ -229,3 +231,9 @@ VCAP_STATUS {"key":"timechat_int4","state":"downloading","fraction":0.423,"bytes
 - The user-facing mode registry defaults to Inductor `default` and offers `max-autotune-no-cudagraphs`; direct `cudagraphs` and `reduce-overhead` are hidden because token-by-token `DynamicCache` mutation is not replay-safe.
 - A Dynamo, Inductor, or CUDA-graph error restores every compiled decoder forward to its original eager callable without reloading weights. The pipeline clears CUDA caches and retries the same segment once from fresh model inputs.
 - A failed `(model family, requested mode)` pair is process-local disabled after recovery, so later segments and model reuse remain eager. Toolchain discovery still degrades from full Inductor through Triton-only and CUDA-graphs compatibility paths to eager.
+
+## 12. v1.5.0 Whisper
+
+- `vcap/whisper/` owns the isolated faster-whisper/CTranslate2 engine, model catalog, CUDA runtime discovery, Silero VAD, transcript writers, JSON-lines worker, and cancellable parent client. The Gradio process never imports inference libraries or downloads at import time.
+- The top-level Transcribe tab resolves video/audio single files and mirrored folder batches, allocates `NNNN_whisper` bookkeeping runs, streams bounded segment previews and realtime progress, writes all selected transcript formats plus recoverable metadata, and exposes model download/verify/delete actions. Its quality preset is shipped as `Transcribe - Whisper best quality (large-v1)`.
+- `JobSpec.transcript` enables a pre-caption subprocess stage. Its result and sidecar paths are recorded per item, overlapping speech fills `{{TRANSCRIPT}}` last for each clip, and failures warn but do not stop visual captioning.

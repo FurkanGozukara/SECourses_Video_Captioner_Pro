@@ -17,6 +17,7 @@ import gradio as gr
 from vcap.core.clip_fitness import (
     TRAINER_TARGETS,
     evaluate_clip,
+    is_clip_fitness_plan_path,
     resolution_bucket_preview,
     suggest_clip_length,
 )
@@ -128,7 +129,11 @@ def analyze_clip_fitness(
     if not root.is_dir():
         raise NotADirectoryError(root)
     selected_target = _trainer_config(target, custom_fps, custom_frames)
-    files = list_media_files(root, recursive=True, kinds=("video",))
+    files = [
+        path
+        for path in list_media_files(root, recursive=True, kinds=("video",))
+        if not is_clip_fitness_plan_path(path, root)
+    ]
     rows: list[list[Any]] = []
     planned: list[dict[str, Any]] = []
     ok_count = dropped = split_count = 0
@@ -213,22 +218,16 @@ def write_clip_fitness_plan(
     *,
     timestamp: str | None = None,
 ) -> Path:
-    """Write a collision-safe plan outside the scanned source directory."""
+    """Write a collision-safe plan, including below the scanned source directory."""
 
     raw_source = str(plan.get("source_folder") or "").strip()
     raw_output = str(output_dir or "").strip()
     if not raw_source:
         raise ValueError("Clip fitness plan has no source folder")
     if not raw_output:
-        raise ValueError("Choose a plan output directory")
+        raise ValueError("Choose a plan output directory, for example '<source>/clip_fitness'")
     source = normalize_path(raw_source, must_exist=True)
     destination = normalize_path(raw_output)
-    try:
-        destination.relative_to(source)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("Plan output directory must be outside the scanned source folder")
     destination.mkdir(parents=True, exist_ok=True)
     source_name = sanitize_filename(source.name or "clips")
     stamp = sanitize_filename(timestamp or datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -290,7 +289,7 @@ def build(ctx: "UiContext") -> None:
             plan_output_dir = gr.Textbox(
                 value=str(ctx.outputs_dir / "clip_fitness"),
                 label="Plan output directory",
-                info="Plans are timestamped here and never written into the scanned source folder.",
+                info="Plans are timestamped here; clip_fitness plan folders are skipped by analysis.",
                 scale=4,
             )
             bucket = gr.Radio(

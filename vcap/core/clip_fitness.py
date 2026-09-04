@@ -102,6 +102,18 @@ class FitnessReport:
     bucket: tuple[int, int]
 
 
+def is_clip_fitness_plan_path(path: str | os.PathLike[str], source_root: str | os.PathLike[str]) -> bool:
+    """Return whether a scanned path lives inside a generated clip-fitness plan folder."""
+
+    candidate = Path(path).resolve(strict=False)
+    root = Path(source_root).resolve(strict=False)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+    return any(part.casefold() == "clip_fitness" for part in relative.parts[:-1])
+
+
 def _target_config(target: str | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(target, Mapping):
         base_name = str(target.get("name", target.get("target", "custom"))).casefold()
@@ -360,6 +372,7 @@ __all__ = [
     "FitnessReport",
     "TRAINER_TARGETS",
     "evaluate_clip",
+    "is_clip_fitness_plan_path",
     "resolution_bucket_preview",
     "sub_split_plan",
     "suggest_clip_length",

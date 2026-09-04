@@ -436,6 +436,7 @@ HOTKEYS_HEAD = r"""
     const selected = bar && bar.querySelector('[role="tab"][aria-selected="true"], button.selected');
     const label = (selected && selected.textContent ? selected.textContent : '').toLowerCase();
     if (label.includes('caption editor')) return 'editor';
+    if (label.includes('transcribe')) return 'transcribe';
     if (label.includes('caption')) return 'caption';
     if (label.includes('processing pipeline')) return 'caption';
     const panels = root.querySelectorAll('[role="tabpanel"]');
@@ -443,6 +444,7 @@ HOTKEYS_HEAD = r"""
       const style = window.getComputedStyle(panel);
       if (panel.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility === 'hidden') continue;
       if (panel.querySelector('#hk_ed_save')) return 'editor';
+      if (panel.querySelector('#hk_transcribe_start')) return 'transcribe';
       if (panel.querySelector('#hk_caption_start')) return 'caption';
     }
     return null;
@@ -476,8 +478,20 @@ HOTKEYS_HEAD = r"""
     return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
   }
 
+  function transcribeJobRunning() {
+    const button = document.getElementById('vc_transcribe_cancel');
+    return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+  }
+
   document.addEventListener('keydown', function (event) {
     const target = event.target;
+    const chatComposer = target && target.closest ? target.closest('#vc_chat_message textarea') : null;
+    if (chatComposer && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      const send = document.getElementById('vc_chat_send');
+      if (send && !send.disabled) send.click();
+      return;
+    }
     if (isDropdownSearch(target)) return;
     const tab = activeMainTab();
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
@@ -491,6 +505,11 @@ HOTKEYS_HEAD = r"""
     if (tab === 'caption') {
       if (plain && event.key === 'F9' && !captionJobRunning()) clickHotkey('hk_caption_start', event);
       else if (plain && event.key === 'Escape' && captionJobRunning()) clickHotkey('hk_caption_cancel', event);
+      return;
+    }
+    if (tab === 'transcribe') {
+      if (plain && event.key === 'F9' && !transcribeJobRunning()) clickHotkey('hk_transcribe_start', event);
+      else if (plain && event.key === 'Escape' && transcribeJobRunning()) clickHotkey('hk_transcribe_cancel', event);
       return;
     }
     if (tab === 'editor') {

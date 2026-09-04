@@ -44,6 +44,7 @@ from vcap.ui.tabs import (
     health_tab,
     recover_tab,
     settings_tab,
+    transcribe_tab,
 )
 
 
@@ -68,6 +69,7 @@ class UiContext:
     states: dict[str, Any] = field(default_factory=dict)
     preset_handles: PresetBarHandles | None = None
     caption_handles: caption_tab.CaptionTabHandles | None = None
+    transcribe_handles: transcribe_tab.TranscribeTabHandles | None = None
     chat_handles: chat_tab.ChatTabHandles | None = None
     _active_cancel: CancelToken | None = field(default=None, repr=False)
     _runtime_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -175,6 +177,8 @@ def build_app() -> gr.Blocks:
             context.states["main_tabs"] = main_tabs
             # Renders both "🎬 Caption" and its sibling "🎞️ Processing Pipeline".
             caption_tab.build(context)
+            with gr.Tab("🎙️ Transcribe", id="transcribe"):
+                transcribe_tab.build(context)
             with gr.Tab("💬 Chat", id="chat"):
                 chat_tab.build(context)
             with gr.Tab("✏️ Caption Editor", id="editor"):
@@ -194,6 +198,7 @@ def build_app() -> gr.Blocks:
         editor_tab.wire(context)
         recover_tab.wire(context)
         caption_tab.wire(context)
+        transcribe_tab.wire(context)
         chat_tab.wire(context)
         wire_preset_bar(context, demo)
 

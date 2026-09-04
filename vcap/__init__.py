@@ -12,7 +12,7 @@ from pathlib import Path
 from .core.app_settings import APP_SETTINGS_PATH, load_app_settings
 from .core.paths import normalize_path
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 APP_NAME = "SECourses Video Captioner Pro"
 APP_DIR = Path(__file__).resolve().parent.parent
 

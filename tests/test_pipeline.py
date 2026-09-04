@@ -100,7 +100,7 @@ def _settings(**overrides: Any) -> dict[str, Any]:
         "model_key": "qwen3_omni_instruct_int8",
         "prompt_preset_id": "custom",
         "user_prompt": "Describe this input.",
-        "system_prompt": None,
+        "system_prompt": "",
         "fps": 2.0,
         "max_frames": 24,
         "max_pixels": 131_072,
