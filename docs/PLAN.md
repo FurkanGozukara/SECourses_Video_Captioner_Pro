@@ -235,5 +235,5 @@ VCAP_STATUS {"key":"timechat_int4","state":"downloading","fraction":0.423,"bytes
 ## 12. v1.5.0 Whisper
 
 - `vcap/whisper/` owns the isolated faster-whisper/CTranslate2 engine, model catalog, CUDA runtime discovery, Silero VAD, transcript writers, JSON-lines worker, and cancellable parent client. The Gradio process never imports inference libraries or downloads at import time.
-- The top-level Transcribe tab resolves video/audio single files and mirrored folder batches, allocates `NNNN_whisper` bookkeeping runs, streams bounded segment previews and realtime progress, writes all selected transcript formats plus recoverable metadata, and exposes model download/verify/delete actions. Its quality preset is shipped as `Transcribe - Whisper best quality (large-v1)`.
+- The top-level Transcribe tab resolves video/audio single files and mirrored folder batches, allocates `NNNN_whisper` bookkeeping runs, streams bounded segment previews and realtime progress, writes all selected transcript formats plus recoverable metadata, and exposes model download/verify/delete actions. Its quality preset is shipped as `Whisper Quality (large-v1)`.
 - `JobSpec.transcript` enables a pre-caption subprocess stage. Its result and sidecar paths are recorded per item, overlapping speech fills `{{TRANSCRIPT}}` last for each clip, and failures warn but do not stop visual captioning.

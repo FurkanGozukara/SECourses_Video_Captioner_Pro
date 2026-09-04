@@ -73,7 +73,7 @@ prompt/prefix/hotwords, token suppression, word timestamps and punctuation,
 chunk and language-detection settings, and batched inference. Numeric UI input
 is coerced and clamped before it reaches the worker.
 
-The shipped **Transcribe - Whisper best quality (large-v1)** preset uses
+The shipped **Whisper Quality (large-v1)** preset uses
 `large-v1`, English, float16, beam 5, best-of 5, patience 1.0, temperature 0,
 repetition penalty 1.2, 30-second windows, previous-text conditioning, word
 timestamps, and batch size 1. A

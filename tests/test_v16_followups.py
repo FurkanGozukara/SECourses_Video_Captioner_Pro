@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import gradio as gr
 import pytest
 
 from vcap import PRESETS_DEFAULT_DIR
@@ -139,3 +140,22 @@ def test_result_summary_names_files_only_for_single_runs() -> None:
     _, batch_message, _, _ = caption_tab._result_summary(batch)
     assert "files:" in single_message
     assert "files:" not in batch_message
+
+
+# Chat Stop: the armed confirmation label must survive the streaming loop's ticks.
+def test_chat_stop_button_keeps_armed_label_and_stopping_state() -> None:
+    from vcap.core.subprocess_runner import CancelToken
+    from vcap.ui.tabs import chat_tab
+
+    token = CancelToken()
+    idle = chat_tab.stop_button_state(token)
+    assert idle["value"] == "⏹ Stop" and idle["interactive"] is True
+    assert chat_tab.stop_status_override(token, "live") == "live"
+    token.arm_confirmation(window_s=chat_tab.STOP_CONFIRM_WINDOW_S)
+    assert chat_tab.stop_button_state(token) == gr.skip()
+    assert chat_tab.stop_status_override(token, "live") == chat_tab.STOP_ARMED_STATUS
+    token.cancel()
+    stopping = chat_tab.stop_button_state(token)
+    assert stopping["value"] == "Stopping…" and stopping["interactive"] is False
+    assert "stop requested" in chat_tab.stop_status_override(token, "live")
+    assert chat_tab.stop_button_state(None)["interactive"] is False

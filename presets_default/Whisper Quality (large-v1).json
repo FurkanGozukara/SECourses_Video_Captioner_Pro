@@ -2,8 +2,8 @@
   "_meta": {
     "format": "secourses_vcap_preset",
     "version": 1,
-    "name": "Transcribe - Whisper best quality (large-v1)",
-    "description": "v1.5.0 Whisper preset"
+    "name": "Whisper Quality (large-v1)",
+    "description": "Proven best-quality speech transcription: large-v1, float16, beam and best-of 5, repetition penalty 1.2, 30-second windows, word timestamps with normalized cues, VAD off, all six outputs. These values are also the application's startup defaults."
   },
   "settings": {
     "batch_include_kinds": [

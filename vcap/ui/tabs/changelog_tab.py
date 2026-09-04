@@ -55,6 +55,8 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Presets that select a variant above the detected VRAM tier (the GGUF Q8 chat presets on 32 GB cards) keep that variant selected and tagged `⚠ exceeds tier` instead of leaving the model box empty with `not in the list of choices` errors.
 - `torch.compile` raises Dynamo's recompile limit for the decode loop and reports it, instead of silently falling back to eager after eight recompiles.
 - Batch status lines no longer list the last item's files; single runs still do. Segment records carry their `video_caption`/`audio_caption`/merged paths in `metadata.json`.
+- The shipped Whisper presets are now **Whisper Quality (large-v1)** (also the startup defaults of the Transcribe tab and the caption transcript stage) and **Whisper Fast (large-v3 turbo)**.
+- Chat **⏹ Stop** keeps its `⚠ Click again to confirm stop` label and hint visible while the reply streams (8-second window), shows `Stopping…` until the worker stops, and ends with `Stopped: N tokens`.
 """.strip(),
     ),
     (

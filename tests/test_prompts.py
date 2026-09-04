@@ -400,8 +400,8 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
     assert len(preset_files) == 19
 
     whisper_preset_names = {
-        "Transcribe - Whisper best quality (large-v1).json",
-        "Transcribe - Whisper large-v3 turbo (fast).json",
+        "Whisper Quality (large-v1).json",
+        "Whisper Fast (large-v3 turbo).json",
         "Caption + Whisper transcript (Qwen3-Omni Instruct).json",
     }
     dataset_preset_names = {

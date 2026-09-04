@@ -607,7 +607,7 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
                     "str",
                 )
                 gr.Markdown(
-                    "Models download automatically on first use; the first run of a model waits for the download.",
+                    "Models download automatically on first use; the first run of a model waits for the download. The startup values of this tab are the shipped **Whisper Quality (large-v1)** preset.",
                     elem_classes=["vc-help"],
                 )
                 model_info = gr.Markdown(_model_info_markdown("large-v1", ctx.models_dir))

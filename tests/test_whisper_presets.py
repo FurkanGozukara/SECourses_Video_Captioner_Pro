@@ -11,8 +11,8 @@ from vcap.whisper.models import get_model
 
 
 PRESET_NAMES = (
-    "Transcribe - Whisper best quality (large-v1)",
-    "Transcribe - Whisper large-v3 turbo (fast)",
+    "Whisper Quality (large-v1)",
+    "Whisper Fast (large-v3 turbo)",
     "Caption + Whisper transcript (Qwen3-Omni Instruct)",
 )
 
@@ -43,10 +43,10 @@ def test_shipped_whisper_presets_contain_only_registered_preset_keys(
 def test_whisper_preset_values_match_large_v1_and_turbo_defaults() -> None:
     root = Path("presets_default")
     best = json.loads(
-        (root / "Transcribe - Whisper best quality (large-v1).json").read_text(encoding="utf-8")
+        (root / "Whisper Quality (large-v1).json").read_text(encoding="utf-8")
     )["settings"]
     turbo = json.loads(
-        (root / "Transcribe - Whisper large-v3 turbo (fast).json").read_text(encoding="utf-8")
+        (root / "Whisper Fast (large-v3 turbo).json").read_text(encoding="utf-8")
     )["settings"]
     assert best["whisper_model"] == "large-v1"
     assert best["whisper_compute_type"] == "float16"

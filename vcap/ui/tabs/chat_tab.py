@@ -293,6 +293,42 @@ def chat_model_change_updates(
     )
 
 
+STOP_CONFIRM_WINDOW_S = 8.0
+STOP_ARMED_LABEL = "⚠ Click again to confirm stop"
+STOP_ARMED_STATUS = (
+    f"<span class='vc-warn'>Click Stop again within {int(STOP_CONFIRM_WINDOW_S)} seconds to stop generation.</span>"
+)
+
+
+def stop_button_state(token: CancelToken | None) -> Any:
+    """Return the Stop button update the streaming loop may emit for ``token``.
+
+    The stream re-renders the button every tick; while a stop confirmation is
+    armed the armed label must survive those ticks (``gr.skip``), and after a
+    confirmed stop the button stays on "Stopping…" until the reply ends.
+    """
+
+    if token is None:
+        return gr.update(value="⏹ Stop", interactive=False)
+    if token.is_cancelled():
+        return gr.update(value="Stopping…", interactive=False)
+    if token.is_armed():
+        return gr.skip()
+    return gr.update(value="⏹ Stop", interactive=True)
+
+
+def stop_status_override(token: CancelToken | None, live: str) -> str:
+    """Keep the armed/stopping hint visible instead of the rolling live status."""
+
+    if token is None:
+        return live
+    if token.is_cancelled():
+        return "<span class='vc-warn'>Cooperative stop requested; the loaded model will be retained.</span>"
+    if token.is_armed():
+        return STOP_ARMED_STATUS
+    return live
+
+
 def build(ctx: "UiContext") -> ChatTabHandles:
     """Render chat controls and register preset-owned generation parameters."""
 
@@ -970,12 +1006,12 @@ def wire(ctx: "UiContext") -> None:
                 yield (
                     live_display(done=False),
                     "",
-                    live_status(),
+                    stop_status_override(token, live_status()),
                     token_line,
                     current_reasoning,
                     gr.update(visible=bool(current_reasoning)),
                     state,
-                    gr.update(value="⏹ Stop", interactive=True),
+                    stop_button_state(token),
                     *keep_composer,
                 )
             thread.join()
@@ -1101,10 +1137,10 @@ def wire(ctx: "UiContext") -> None:
         if token is None or token.is_cancelled():
             return gr.update(value="⏹ Stop", interactive=False), "<span class='vc-help'>No chat response is running.</span>"
         if not token.is_armed():
-            token.arm_confirmation(window_s=6)
+            token.arm_confirmation(window_s=STOP_CONFIRM_WINDOW_S)
             return (
-                gr.update(value="⚠ Click again to confirm stop", interactive=True),
-                "<span class='vc-warn'>Click Stop again within 6 seconds to stop generation.</span>",
+                gr.update(value=STOP_ARMED_LABEL, interactive=True),
+                STOP_ARMED_STATUS,
             )
         token.cancel()
         ctx.pipeline_client.cancel(force=False)
@@ -1122,12 +1158,7 @@ def wire(ctx: "UiContext") -> None:
     )
 
     def refresh_stop() -> Any:
-        token = ctx.states.get("chat_job_token")
-        if token is None or token.is_cancelled():
-            return gr.update(value="⏹ Stop", interactive=False)
-        if token.is_armed():
-            return gr.skip()
-        return gr.update(value="⏹ Stop", interactive=True)
+        return stop_button_state(ctx.states.get("chat_job_token"))
 
     handles.stop_timer.tick(
         refresh_stop,

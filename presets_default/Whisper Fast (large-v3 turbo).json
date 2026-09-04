@@ -2,8 +2,8 @@
   "_meta": {
     "format": "secourses_vcap_preset",
     "version": 1,
-    "name": "Transcribe - Whisper large-v3 turbo (fast)",
-    "description": "v1.5.0 Whisper preset"
+    "name": "Whisper Fast (large-v3 turbo)",
+    "description": "Same decoding settings as Whisper Quality with the faster large-v3-turbo model."
   },
   "settings": {
     "batch_include_kinds": [

@@ -57,7 +57,7 @@ The **🎙️ Transcribe** tab accepts uploaded video/audio, a local file path, 
 
 The Processing Pipeline tab also has **7. Speech transcript (Whisper)**. Enabling it transcribes each video or audio item once before caption generation, writes the selected transcript sidecars beside the caption, and makes the overlapping speech available as `{{TRANSCRIPT}}` for every clip prompt. With prompt injection enabled, a wrapper is appended automatically when the selected prompt does not contain that variable.
 
-The shipped **Transcribe - Whisper best quality (large-v1)** preset reproduces the proven large-v1 defaults: float16, beam/best-of 5, temperature 0, repetition penalty 1.2, 30-second chunks, word timestamps with normalization, VAD off, and all six outputs. The turbo preset changes only the model alias. Models download automatically on first use and interrupted downloads are resumable.
+The shipped **Whisper Quality (large-v1)** preset (read-only; its values are also the application's startup defaults, so the Transcribe tab is ready without loading anything) reproduces the proven large-v1 defaults: float16, beam/best-of 5, temperature 0, repetition penalty 1.2, 30-second chunks, word timestamps with normalization, VAD off, and all six outputs. The turbo preset changes only the model alias. Models download automatically on first use and interrupted downloads are resumable.
 
 | Alias | Hugging Face repository | Download size | Note |
 |---|---|---:|---|
