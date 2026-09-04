@@ -143,7 +143,7 @@ def test_d16_upload_refreshes_empty_state_and_late_folder_scan_is_ignored(
         "_preview_updates",
         lambda paths: (None, None, None, str(paths), "tiles", "video", 1.0),
     )
-    handlers["select"](SimpleNamespace(value="folder", index=2))
+    handlers["select"](SimpleNamespace(value="folder", index=2), [], "")
     result: dict[str, tuple[Any, ...]] = {}
 
     def scan() -> None:

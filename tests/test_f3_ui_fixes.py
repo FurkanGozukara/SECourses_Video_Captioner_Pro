@@ -90,15 +90,17 @@ def test_media_mode_is_owned_by_tabs_and_scan_does_not_return_it(tmp_path: Path)
             if item.get("props", {}).get("elem_id") == "vc-input-tabs"
         )
         tab_select = _dependencies_for(config, tabs_id, "select")
+        # The Tabs-level select owns the mode state (first output) and also
+        # re-renders the preview of the newly active upload/path tab.
         mode_dependency = next(
             dependency
             for dependency in tab_select
-            if dependency["outputs"] == [handles.mode_state._id]
+            if dependency["outputs"][0] == handles.mode_state._id
         )
         handler = demo.fns[mode_dependency["id"]].fn
-        assert handler(SimpleNamespace(value="Upload files", index=0)) == "upload"
-        assert handler(SimpleNamespace(value="File path", index=1)) == "path"
-        assert handler(SimpleNamespace(value="Folder batch", index=2)) == "folder"
+        assert handler(SimpleNamespace(value="Upload files", index=0), [], "")[0] == "upload"
+        assert handler(SimpleNamespace(value="File path", index=1), [], "")[0] == "path"
+        assert handler(SimpleNamespace(value="Folder batch", index=2), [], "")[0] == "folder"
         assert input_mode_from_tab(SimpleNamespace(value="folder", index=None)) == "folder"
 
         for component in (handles.files, handles.path):
@@ -112,8 +114,11 @@ def test_media_mode_is_owned_by_tabs_and_scan_does_not_return_it(tmp_path: Path)
             and handles.info._id in event["outputs"]
         ]
         assert len(preview_select_events) >= 3
+        # Only the Tabs-level select owns the mode state (as its first output);
+        # the per-tab preview selects never write it.
         assert all(
             handles.mode_state._id not in event["outputs"]
+            or event["outputs"][0] == handles.mode_state._id
             for event in preview_select_events
         )
     finally:
@@ -327,9 +332,14 @@ def test_short_chat_stream_finishes_with_authoritative_usage() -> None:
     component_props = {
         item["id"]: item.get("props", {}) for item in config["components"]
     }
-    for key in ("model_key", "vram_preset", "attention_backend"):
+    for key in ("vram_preset", "attention_backend"):
         component = ctx.caption_handles.controls[key]
         assert component_props[component._id].get("allow_custom_value", False) is False
+    # The model dropdown accepts transient custom values (presets may select a
+    # variant before the tier filter republishes the choices); unknown values
+    # are rejected by validate_model_variant instead of a Gradio exception.
+    model_component = ctx.caption_handles.controls["model_key"]
+    assert component_props[model_component._id].get("allow_custom_value", False) is True
     dependency = next(
         item
         for item in config["dependencies"]

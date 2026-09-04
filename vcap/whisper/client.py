@@ -169,7 +169,7 @@ def _handle_event(
         _sink_call(sink, "on_item_done", payload)
         console_progress.finalize_progress_line(
             key=("whisper", payload.get("item_index", 0)),
-            final_text=str(payload.get("files", ["Transcription complete"])[0]),
+            final_text=str((payload.get("files") or ["Transcription complete"])[0]),
         )
     elif kind == "item_error":
         item_payloads.append(payload)

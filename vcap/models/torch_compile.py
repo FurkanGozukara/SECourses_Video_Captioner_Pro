@@ -904,6 +904,37 @@ def restore_eager_model(loaded_or_model: Any, exc: BaseException) -> CompileFall
     return CompileFallback(family, mode, restored, reason)
 
 
+_RECOMPILE_LIMIT = 64
+
+
+def _raise_recompile_limits(progress_cb: Any = None) -> None:
+    """Let Dynamo keep specializing the decode loop instead of falling back to eager.
+
+    Autoregressive decoding changes sequence and cache shapes every step; with the
+    stock limit of 8 recompiles Dynamo stops compiling the frame after a few
+    tokens and the rest of the run silently executes eagerly.
+    """
+
+    try:
+        import torch  # local import keeps the UI process free of torch
+    except Exception:
+        return
+    config = getattr(getattr(torch, "_dynamo", None), "config", None)
+    if config is None:
+        return
+    for name in ("cache_size_limit", "recompile_limit", "accumulated_cache_size_limit", "accumulated_recompile_limit"):
+        try:
+            current = int(getattr(config, name))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if current < _RECOMPILE_LIMIT:
+            try:
+                setattr(config, name, _RECOMPILE_LIMIT)
+            except Exception:
+                continue
+    _emit(progress_cb, f"torch.compile recompile limit set to {_RECOMPILE_LIMIT} for the decode loop")
+
+
 def apply_compile(
     model: Any,
     plan: CompilePlan,
@@ -955,6 +986,7 @@ def apply_compile(
                 pass
 
     original_forward = target.forward
+    _raise_recompile_limits(progress_cb)
     try:
         compiled_forward = torch.compile(original_forward, **plan.torch_compile_kwargs)
     except Exception as exc:

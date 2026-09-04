@@ -21,6 +21,7 @@ from vcap.core.captions_post import parse_replace_pairs, replace_pairs_to_html_c
 from vcap.core.media import MediaInfo, make_thumbnail, probe_media
 from vcap.core.logs import get_log
 from vcap.core.paths import (
+    exclude_caption_sidecars,
     guess_kind_by_extension,
     list_media_files,
     normalize_path,
@@ -735,10 +736,12 @@ def _folder_scan(
         for value in (str(item).casefold() for item in allowed_kinds)
         if value in {"video", "audio", "image", "text"}
     ) or ("video", "audio", "image", "text")
-    found = list_media_files(
-        root,
-        recursive=bool(recursive),
-        kinds=selected_kinds,
+    found = exclude_caption_sidecars(
+        list_media_files(
+            root,
+            recursive=bool(recursive),
+            kinds=selected_kinds,
+        )
     )
     try:
         # Task A owns this helper. The local import keeps the UI buildable while
@@ -1295,10 +1298,23 @@ def media_input_block(
             return tuple(gr.skip() for _ in folder_outputs)
         return (*_preview_updates(selected), selected, summary)
 
-    def select_input_mode(event: gr.SelectData) -> str:
+    def select_input_mode(event: gr.SelectData, files_value: Any, path_value: str) -> tuple[Any, ...]:
+        """Switch the input mode and re-render the preview of the newly active tab.
+
+        The Tabs-level select is the one event every tab click reliably raises,
+        so it owns the preview refresh for the upload and path modes; the folder
+        tab keeps its own select handler because it also runs the light scan.
+        """
+
         selected_mode = input_mode_from_tab(event)
         activate_mode(selected_mode)
-        return selected_mode
+        if selected_mode == "upload":
+            selected = _paths(files_value)
+            return (selected_mode, *_preview_updates(selected), selected)
+        if selected_mode == "path":
+            selected = _paths(path_value)
+            return (selected_mode, *_preview_updates(selected), selected)
+        return (selected_mode, *[gr.skip() for _ in preview_outputs], gr.skip())
 
     def choose_folder_tab(*values: Any) -> tuple[Any, ...]:
         activate_mode("folder")
@@ -1306,7 +1322,8 @@ def media_input_block(
 
     input_tabs.select(
         select_input_mode,
-        outputs=mode_state,
+        inputs=[files, path],
+        outputs=[mode_state, *preview_outputs, resolved_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",

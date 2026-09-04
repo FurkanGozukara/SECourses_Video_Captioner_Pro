@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
         "v1.6.0",
-        "2026-09-04",
+        "2026-09-05",
         """
 ### Dataset clip video and audio captions
 
@@ -47,6 +47,14 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Silent videos are skipped cleanly by Whisper and corrupt media reports a concise ffmpeg error.
 - Chat discards superseded load progress so final token statistics arrive with the answer.
 - A preset-applied model remains resident after its run unless the user selects another variant while it is busy.
+- Folder scans never treat caption sidecars (`clip.txt`, `clip_transcript.txt`, `clip_0002.txt`) or the `video_caption/` and `audio_caption/` folders as text inputs, so re-running a captioned dataset folder no longer pollutes it with `_0002` files.
+- An empty transcript-format selection (as used by the dataset presets) no longer crashes the Whisper stage; the in-memory transcript feeds the audio caption.
+- The three `Dataset clips - …` presets scan subfolders by default.
+- Chat streaming keeps pace with the worker (updates are coalesced instead of re-rendering the conversation for every token), so **⏹ Stop** takes effect within a second and the final token line arrives with the answer.
+- Task-preset token budgets are clamped to the selected family and the Maximum new tokens slider keeps a global range, so switching between Qwen3, TimeChat, and AVoCaDO (or applying the MiniMax and Wan presets) no longer raises `Value … is greater than maximum` errors.
+- Presets that select a variant above the detected VRAM tier (the GGUF Q8 chat presets on 32 GB cards) keep that variant selected and tagged `⚠ exceeds tier` instead of leaving the model box empty with `not in the list of choices` errors.
+- `torch.compile` raises Dynamo's recompile limit for the decode loop and reports it, instead of silently falling back to eager after eight recompiles.
+- Batch status lines no longer list the last item's files; single runs still do. Segment records carry their `video_caption`/`audio_caption`/merged paths in `metadata.json`.
 """.strip(),
     ),
     (

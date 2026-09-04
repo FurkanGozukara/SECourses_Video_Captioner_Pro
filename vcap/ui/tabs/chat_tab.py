@@ -961,7 +961,10 @@ def wire(ctx: "UiContext") -> None:
                     elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
                         current_status = str(event.get("text") or current_status)
                 now = time.monotonic()
-                if now - last_emit < 0.05 and saw_delta:
+                # Coalesce UI updates: the browser cannot keep up with a yield per
+                # token (each yield re-renders the conversation), so emit at most
+                # ~6 times per second; the terminal event always flushes the final state.
+                if now - last_emit < 0.15:
                     continue
                 last_emit = now
                 yield (

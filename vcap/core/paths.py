@@ -224,6 +224,47 @@ def list_media_files(
     return sort_paths_natural(found)
 
 
+_SIDECAR_SUFFIXES = frozenset({".txt", ".md"})
+
+
+def is_caption_part_path(path: str | os.PathLike[str]) -> bool:
+    """Return True when the path lives inside a ``video_caption``/``audio_caption`` folder."""
+
+    return any(part.casefold() in _CAPTION_PART_DIRECTORIES for part in Path(path).parts[:-1])
+
+
+def exclude_caption_sidecars(files: Sequence[Path]) -> list[Path]:
+    """Drop text files that are caption sidecars of media files in the same folder.
+
+    A ``.txt``/``.md`` file is a sidecar when its stem equals a media stem in the
+    same directory (``clip.txt`` beside ``clip.mp4``) or extends one with an
+    underscore suffix (``clip_transcript.txt``, ``clip_summary.txt``,
+    ``clip_0002.txt``). Files inside ``video_caption``/``audio_caption`` folders
+    are never inputs either. Media files are always kept.
+    """
+
+    media_stems: dict[Path, set[str]] = {}
+    for file in files:
+        if file.suffix.casefold() not in _SIDECAR_SUFFIXES:
+            media_stems.setdefault(file.parent, set()).add(file.stem.casefold())
+    kept: list[Path] = []
+    for file in files:
+        if file.suffix.casefold() not in _SIDECAR_SUFFIXES:
+            kept.append(file)
+            continue
+        if is_caption_part_path(file):
+            continue
+        stems = media_stems.get(file.parent, set())
+        stem = file.stem.casefold()
+        if stem in stems:
+            continue
+        base = stem.rsplit("_", 1)[0] if "_" in stem else ""
+        if base and base in stems:
+            continue
+        kept.append(file)
+    return kept
+
+
 def discover_allowed_paths() -> list[str]:
     """Return drive roots or mount points suitable for a file-serving allow-list."""
 

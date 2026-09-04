@@ -41,7 +41,7 @@ from vcap.core.media import (
     trim_media,
 )
 from vcap.core.outputs import MetadataBuilder, OutputWriter, RunLog, allocate_run_dir, model_short_name
-from vcap.core.paths import list_media_files, normalize_path, sanitize_filename
+from vcap.core.paths import exclude_caption_sidecars, list_media_files, normalize_path, sanitize_filename
 from vcap.core.preprocess import (
     AutoRejectRules,
     analyze_clip_quality,
@@ -522,17 +522,7 @@ def _resolve_inputs(spec: JobSpec, log_cb: Any | None = None) -> list[_ResolvedI
                 recursive=spec.output.recursive,
                 kinds=("video", "audio", "image", "text"),
             )
-            media_stems = {
-                (file.parent, file.stem.casefold())
-                for file in files
-                if file.suffix.casefold() not in {".txt", ".md"}
-            }
-            files = [
-                file
-                for file in files
-                if file.suffix.casefold() not in {".txt", ".md"}
-                or (file.parent, file.stem.casefold()) not in media_stems
-            ]
+            files = exclude_caption_sidecars(files)
             before_filters = len(files)
             files = filter_media_paths(
                 files,
@@ -3629,6 +3619,9 @@ def _run_merge_phase(
                     no_speech=no_speech,
                     audio_caption_source=spec.audio_caption.source,
                     sound_caption_model=result.sound_caption_model,
+                    video_caption_path=segment_outputs.get("video_caption"),
+                    audio_caption_path=segment_outputs.get("audio_caption"),
+                    merged_caption_path=segment_outputs.get("merged_caption"),
                 )
             video_caption = _combined_video_caption(records)
             transcript_text = (

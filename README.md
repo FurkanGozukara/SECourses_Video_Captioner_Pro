@@ -252,6 +252,7 @@ Fresh measurements below are three-generation means on physical GPU 0, an RTX 50
 - [Quantization quality report](docs/QUANT_REPORT.md)
 - [Consolidated benchmarks](docs/BENCHMARKS.md)
 - [Whisper speech transcription backend](docs/WHISPER.md)
+- [QA verification log v1.6.0](docs/QA_VERIFICATION_v1.6.0.md)
 - [QA verification log v1.5.0](docs/QA_VERIFICATION_v1.5.0.md)
 
 ## Troubleshooting

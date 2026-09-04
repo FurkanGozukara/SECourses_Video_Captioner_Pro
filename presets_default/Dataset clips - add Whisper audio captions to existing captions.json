@@ -13,7 +13,7 @@
       "text"
     ],
     "batch_name_filter": "",
-    "batch_recursive": false,
+    "batch_recursive": true,
     "overwrite_existing": false,
     "batch_limit_items": 0,
     "batch_save_next_to_source": true,

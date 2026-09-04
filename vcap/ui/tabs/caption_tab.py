@@ -45,7 +45,7 @@ from vcap.core.scene_split import (
     merge_short_scenes,
 )
 from vcap.core.subprocess_runner import CancelToken, CancelledError, build_child_env
-from vcap.core.gpu import resource_snapshot
+from vcap.core.gpu import _default_gpu_index, resource_snapshot
 from vcap.models import attention as attention_module
 from vcap.models.attention import ATTENTION_CHOICES
 from vcap.models.downloads import ensure_model
@@ -1788,6 +1788,10 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         value=_INITIAL_VARIANT,
                         label="Model variant",
                         info="Model family, precision/backend variant, and estimated local checkpoint size.",
+                        # Presets and tier filters can update the value and the
+                        # choices in different events; the validator below rejects
+                        # unknown values, so Gradio must not raise on a transient one.
+                        allow_custom_value=True,
                     )
                     valid_model_key_state = gr.State(_INITIAL_VARIANT)
                     ctx.states["caption_valid_model_key"] = valid_model_key_state
@@ -2551,7 +2555,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
                     max_new_tokens = gr.Slider(
                         1,
-                        int(initial_spec.limits.max_new_tokens_cap),
+                        _GLOBAL_MAX_NEW_TOKENS,
                         value=int(schema["max_new_tokens"].default),
                         step=1,
                         precision=0,
@@ -4150,7 +4154,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             token_update = gr.update(
                 value=max(1, min(int(preset.max_new_tokens), token_cap)),
                 minimum=1,
-                maximum=token_cap,
+                maximum=_GLOBAL_MAX_NEW_TOKENS,
                 step=1,
                 info=f"{token_schema.description} Selected-family maximum: {token_cap:,}.",
             )
@@ -4346,6 +4350,28 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
 
     ctx.states["preset_value_adapters"]["prompt_preset_id"] = preset_prompt_preset
 
+    def preset_model_key(settings: dict[str, Any]) -> Any:
+        """Ship the preset's variant together with choices that contain it.
+
+        A preset may select a variant the current VRAM-tier filter hides (for
+        example a GGUF Q8 build on a 32 GB card). Updating only the value would
+        make Gradio reject it on the next event, so the choices are rebuilt with
+        the preset variant included (tagged when it exceeds the tier).
+        """
+
+        value = str(settings.get("model_key") or _INITIAL_VARIANT)
+        known = {key for _, key in _variant_choices()}
+        if value not in known:
+            value = _INITIAL_VARIANT
+        try:
+            physical_tier = auto_tier(gpu_total_for(_default_gpu_index()))
+        except Exception:
+            physical_tier = 32
+        show_all = bool(settings.get("show_all_variants", False))
+        return gr.update(choices=variant_choices_for_tier(value, physical_tier, show_all), value=value)
+
+    ctx.states["preset_value_adapters"]["model_key"] = preset_model_key
+
     def preset_max_new_tokens(settings: dict[str, Any]) -> Any:
         try:
             spec = MODEL_SPECS[variant_to_family(str(settings.get("model_key") or _INITIAL_VARIANT))]
@@ -4360,7 +4386,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         return gr.update(
             value=max(1, min(value, cap)),
             minimum=1,
-            maximum=cap,
+            maximum=_GLOBAL_MAX_NEW_TOKENS,
             step=1,
             info=(
                 f"{schema_values['max_new_tokens'].description} Selected-family maximum: {cap:,}."
@@ -4387,7 +4413,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             gr.update(
                 value=kept_tokens,
                 minimum=1,
-                maximum=token_cap,
+                maximum=_GLOBAL_MAX_NEW_TOKENS,
                 step=1,
                 info=f"{values['max_new_tokens'].description} Selected-family maximum: {token_cap:,}.",
             ),
@@ -4432,7 +4458,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             gr.update(
                 value=kept_tokens,
                 minimum=1,
-                maximum=token_cap,
+                maximum=_GLOBAL_MAX_NEW_TOKENS,
                 step=1,
                 info=f"{values['max_new_tokens'].description} Selected-family maximum: {token_cap:,}.",
             ),
@@ -4504,8 +4530,20 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         description, system, user, tracked = render_selected(preset_id, *values)
         try:
             preset = get_preset(str(preset_id))
-            schema_values = {item.name: item.default for item in MODEL_SPECS[variant_to_family(variant_key)].param_schema}
+            family_spec = MODEL_SPECS[variant_to_family(variant_key)]
+            schema_values = {item.name: item.default for item in family_spec.param_schema}
             merged = {**schema_values, **preset.generation_overrides}
+            token_update: Any = gr.skip()
+            if "max_new_tokens" in merged:
+                # Prompt presets carry family-agnostic token budgets; clamp them to
+                # the selected family's cap in the same update as the slider bound
+                # so the component never holds a value above its maximum.
+                token_cap = int(family_spec.limits.max_new_tokens_cap)
+                try:
+                    requested = int(merged["max_new_tokens"])
+                except (TypeError, ValueError):
+                    requested = token_cap
+                token_update = gr.update(value=max(1, min(requested, token_cap)), maximum=_GLOBAL_MAX_NEW_TOKENS)
             return (
                 description,
                 system,
@@ -4515,12 +4553,13 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 merged.get("top_p", gr.skip()),
                 merged.get("top_k", gr.skip()),
                 merged.get("repetition_penalty", gr.skip()),
-                merged.get("max_new_tokens", gr.skip()),
+                token_update,
                 merged.get("do_sample", gr.skip()),
             )
         except Exception:
             return description, system, user, tracked, *[gr.skip() for _ in range(6)]
 
+    ctx.states["caption_prompt_select_handler"] = select_prompt
     prompt_preset.select(
         select_prompt,
         inputs=[prompt_preset, model_key, *variable_components],
@@ -5532,7 +5571,9 @@ def _result_summary(result: JobResult) -> tuple[str, str, str, str]:
     """Return terminal label, message, status class, and ETA text."""
 
     part_detail = ""
-    for item in reversed(result.items):
+    # Naming the last item's files only helps single runs; batches list them in
+    # the Items table and the run folder instead.
+    for item in (reversed(result.items) if len(result.items) == 1 else ()):
         parts: list[str] = []
         for label, raw in (
             ("video", item.video_caption_path),
