@@ -1601,9 +1601,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         # this function creates - states included - must live inside a gr.Tab.
         ctx.states["gpu_index"] = gr.State(gpu_default)
         prompt_context_state = gr.State([initial_family, _INITIAL_MODALITY])
-        prompt_auto_state = gr.State(
-            {"system": initial_system or "", "user": initial_user}
+        # Keep the provenance in the browser so Start captures it alongside the
+        # visible prompt fields, even while a task/variable render is pending.
+        prompt_auto_state = gr.JSON(
+            {"system": initial_system or "", "user": initial_user}, visible=False
         )
+        ctx.states["caption_prompt_auto"] = prompt_auto_state
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=5, min_width=500):
@@ -5346,6 +5349,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         merge: bool,
         merge_limit: float,
         fades: bool,
+        fade_level: float,
         scale: int,
         model_limit: float,
     ):
@@ -5361,6 +5365,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             merge_short_scenes=bool(merge),
             merge_below_s=float(merge_limit),
             fade_detection=bool(fades),
+            fade_threshold=float(fade_level),
             detector=str(detector_name),
             downscale=int(scale or 0),
         )
@@ -5400,7 +5405,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
 
     detect_now.click(
         scene_preview,
-        inputs=[media.resolved_state, detector, threshold, scene_min, scene_max, merge_short, merge_below, fade, downscale, max_clip],
+        inputs=[media.resolved_state, detector, threshold, scene_min, scene_max, merge_short, merge_below, fade, fade_threshold, downscale, max_clip],
         outputs=[scene_table, scene_status],
         concurrency_id="gpu_queue",
         concurrency_limit=1,
@@ -5876,11 +5881,35 @@ def wire(ctx: "UiContext") -> None:
         cached_resolved = [str(value) for value in (args[value_count] or [])]
         input_mode = str(args[value_count + 1] or "upload")
         input_modality = str(args[value_count + 2] or "unknown")
+        prompt_auto = args[value_count + 3]
         retry_state = (
-            dict(args[value_count + 3] or {})
-            if len(args) > value_count + 3 and isinstance(args[value_count + 3], Mapping)
+            dict(args[value_count + 4] or {})
+            if len(args) > value_count + 4 and isinstance(args[value_count + 4], Mapping)
             else None
         )
+        if isinstance(prompt_auto, Mapping):
+            # A user can pick a task and start before its render response arrives.
+            # Re-render automatic fields from this click's settings; preserve
+            # manual edits and prompts loaded from the personal library.
+            try:
+                _, system_update, user_update, _ = render_prompt_preserving_edits(
+                    str(settings.get("prompt_preset_id") or ""),
+                    _prompt_variables([
+                        settings.get(name) for name in (
+                            "trigger_word", "language", "source_language", "target_language",
+                            "caption_length", "avoid_list", "subject_class", "extra_instructions",
+                        )
+                    ]),
+                    str(settings.get("system_prompt") or ""),
+                    str(settings.get("user_prompt") or ""),
+                    prompt_auto,
+                )
+                if isinstance(system_update, str):
+                    settings["system_prompt"] = system_update
+                if isinstance(user_update, str):
+                    settings["user_prompt"] = user_update
+            except KeyError:
+                pass  # The compatible-preset resolution below handles unknown IDs.
         if retry_state is None:
             resolved = resolve_caption_inputs_at_start(
                 settings,
@@ -6381,6 +6410,7 @@ def wire(ctx: "UiContext") -> None:
         handles.media.resolved_state,
         handles.media.mode_state,
         handles.media.modality_state,
+        ctx.states["caption_prompt_auto"],
     ]
     start_event = handles.start.click(
         run_caption,

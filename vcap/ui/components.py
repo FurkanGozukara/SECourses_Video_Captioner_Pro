@@ -915,7 +915,7 @@ def _folder_scan(
     summary = " · ".join(count_labels[kind] for kind in selected_kinds)
     if include_caption_coverage:
         summary += (
-            f" · {len(found)} media files · {existing} already captioned (<stem>.txt)"
+            f" · {len(found)} media files · {existing} already captioned (&lt;stem&gt;.txt)"
             f" · {audio_captioned} with audio captions (audio_caption/)"
         )
     location = "next to source files" if save_next_to_source else "in output folder"
@@ -1181,6 +1181,7 @@ def media_input_block(
                         "the folder options below.",
                         elem_classes=["vc-help"],
                     )
+                    zip_status = gr.Markdown("", visible=False)
                 else:
                     zip_upload = gr.State(None)
                 default_output = str(output_folder_default or (ctx.outputs_dir / "batch_captions"))
@@ -1225,7 +1226,7 @@ def media_input_block(
                             label="File name filter",
                             placeholder="*.mp4;clip_*",
                             info=(
-                                "Optional glob on file names, for example *.mp4 or clip_*; "
+                                "Optional glob on file names, for example *.mp4; "
                                 "separate several patterns with ;. Empty includes every file."
                             ),
                             scale=3,
@@ -1548,7 +1549,8 @@ def media_input_block(
                 gr.skip(),
                 *[gr.skip() for _ in preview_outputs],
                 gr.skip(),
-                "<span class='vc-help'>Choose a ZIP archive to extract.</span>",
+                gr.skip(),
+                gr.update(value="", visible=False),
             )
         try:
             # Task F1 owns the extractor. Keep the UI importable while that
@@ -1560,7 +1562,8 @@ def media_input_block(
                 gr.skip(),
                 *[gr.skip() for _ in preview_outputs],
                 gr.skip(),
-                "<span class='vc-warn'>ZIP upload becomes available after the backend update.</span>",
+                gr.skip(),
+                gr.update(value="<span class='vc-warn'>ZIP upload becomes available after the backend update.</span>", visible=True),
             )
         try:
             source = normalize_path(str(raw), must_exist=True)
@@ -1611,7 +1614,7 @@ def media_input_block(
                     f"{preview}{extra}."
                 )
             extraction_line = (
-                f"Extracted {files} files ({total_bytes / (1024 ** 2):.2f} MB); "
+                f"Extracted {files} file{'s' if files != 1 else ''} ({total_bytes / (1024 ** 2):.2f} MB); "
                 f"using {html.escape(str(selected_folder))}"
             )
             if enabled_for_upload:
@@ -1620,13 +1623,14 @@ def media_input_block(
                 )
             else:
                 extraction_line += "."
-            message = f"<span class='vc-ok'>{extraction_line}{skipped_text}</span><br>{scan_text}"
+            message = f"<span class='vc-ok'>{extraction_line}{skipped_text}</span>"
             return (
                 str(selected_folder),
                 gr.update(value=effective_recursive),
                 *_preview_updates(selected),
                 selected,
-                message,
+                scan_text,
+                gr.update(value=message, visible=True),
             )
         except Exception as exc:
             return (
@@ -1634,7 +1638,8 @@ def media_input_block(
                 gr.skip(),
                 *[gr.skip() for _ in preview_outputs],
                 gr.skip(),
-                f"<span class='vc-err'>Could not extract ZIP: {html.escape(str(exc))}</span>",
+                gr.skip(),
+                gr.update(value=f"<span class='vc-err'>Could not extract ZIP: {html.escape(str(exc))}</span>", visible=True),
             )
 
     if show_archive_upload:
@@ -1650,8 +1655,15 @@ def media_input_block(
                 name_filter,
                 *([save_next_to_source] if save_next_to_source is not None else []),
             ],
-            outputs=[folder, recursive, *folder_outputs],
+            outputs=[folder, recursive, *folder_outputs, zip_status],
             show_progress="minimal",
+            api_visibility="private",
+        )
+        zip_upload.clear(
+            lambda: gr.update(value="", visible=False),
+            outputs=zip_status,
+            queue=False,
+            show_progress="hidden",
             api_visibility="private",
         )
 

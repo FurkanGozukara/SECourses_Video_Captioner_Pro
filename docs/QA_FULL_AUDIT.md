@@ -440,3 +440,75 @@ permutations are covered by targeted tests as well as representative UI jobs.
   `prompt_preset_id: qwen3_joint_describe` and the matching native prompt.
   Used a deliberate 16-token cap to check settings execution; its partial
   caption is not a quality benchmark. Automatic worker shutdown also passed.
+
+### Caption folder skipping, ZIP feedback, and immediate task changes
+
+- `batch_0060_qwen3` skipped the existing filtered PNG in 0.01 s. The log
+  confirmed no caption model was loaded. `batch_0061_qwen3` skipped all three
+  completed image/audio/video outputs and reported the corrupt MP4 as unsupported
+  in 0.11 s, again without loading a caption model.
+- Chrome ZIP upload selected the deepest single media folder, preserved the
+  UTF-8 filename `renk_ü.png`, and extracted below `outputs/uploaded_batches`.
+  A harmless test archive included parent traversal, a Windows absolute path,
+  and macOS metadata entries; all three were skipped and neither marker escaped
+  the extraction directory. An earlier malformed fixture accidentally contained
+  `?` in its filename due to PowerShell pipe encoding and correctly showed an
+  extraction error; it was replaced by the intended UTF-8 fixture.
+- Found two feedback bugs: literal `<stem>` was interpreted as an HTML tag,
+  hiding the rest of the scan summary, and an automatic rescan immediately
+  replaced the ZIP extraction report. Escaped the placeholder and gave ZIP
+  results their own status component. After restart, Chrome showed the full
+  coverage/overwrite summary and persistent extraction/skipped-entry details.
+  Clearing the ZIP also cleared its extraction report.
+  Simplified the glob help to one example so Gradio no longer treats paired
+  wildcard asterisks as emphasis; Chrome now visibly shows `*.mp4`.
+- `batch_0062_qwen3` saved PNG captions beside the extracted source, with run
+  metadata/logs in the numbered batch directory; completed in 38.17 s. It
+  exposed a second prompt race: immediate Start captured the selected short-image
+  task ID with the preceding joint-media prompt text, before the render callback
+  finished. This is separate from the model/input-context race fixed earlier.
+- Start now captures automatic-prompt provenance alongside the visible fields
+  and renders automatic fields from the selected task and variables. Manually
+  edited fields and personally loaded prompts are preserved. Chrome repeated
+  task selection followed immediately by a 64-token limit and Start:
+  `batch_0063_qwen3` saved matching `image_short_caption` ID/text, generated a
+  correct 17-token TV test-pattern caption with EOS, and completed in 27.97 s
+  at 12.47 tok/s. The worker exited after unloading.
+- `batch_0064_qwen3` used a manually edited prompt, sampling enabled,
+  temperature 0.6, top-p 0.9, top-k 20, and seed 1234. The image completed with
+  the requested `QA_MANUAL` prefix (41 tokens, EOS); a video with valid stream
+  headers but deliberately truncated frame data failed during PyAV decoding.
+  Chrome showed 1 done / 1 failed and enabled Retry; metadata preserved the
+  manual prompt and all sampling values. Total 30.67 s.
+- Repaired only the QA video at the same path, changed to Whole / 8 frames and
+  a compatible custom task, then clicked Retry. `batch_0065_qwen3` processed
+  only that video and produced a correct storm-street caption, 26 tokens with
+  EOS, 36.39 s total. The prior image caption's SHA-256 and modification time
+  were unchanged. The worker exited after both the partial failure and retry.
+- Added an identical image as a third file and set Limit items to 1 with
+  overwrite off. `batch_0066_qwen3` skipped the two existing outputs and
+  captioned the pending image, confirming skipped files do not consume the
+  limit. Repeating the earlier manual prompt and seed 1234 after a new worker
+  load produced identical 41-token text and the same SHA-256. Total 37.79 s;
+  Chrome showed 1 done / 2 skipped and the worker exited.
+
+### Scene preview controls
+
+- An eight-second QA fixture contains asymmetric fade-out/fade-in around a
+  two-second black interval. With Content threshold 100, minimum scene 0.2 s,
+  no merging/cap, and Detect fades enabled, Chrome displayed boundaries at
+  3.00, 4.08, and 5.04 s for both Fade threshold 12 and 100. Source inspection
+  confirmed the preview callback omitted the Fade threshold input; actual
+  caption jobs already passed the setting correctly.
+- Wired the missing preview input. After restart, Chrome showed the fade
+  boundary at 4.40 s for threshold 100, returning to 4.08 s for threshold 12.
+  The other two content boundaries were unchanged, confirming the selected
+  fade setting now reaches the detector.
+- The dedicated Threshold/fades detector at threshold 12 produced two ranges,
+  0–4.08 and 4.08–8.00 s. Merge below 5 s combined them into one 8 s range;
+  Maximum scene 2 s then produced four contiguous 2 s ranges. Setting model
+  limit 1 s displayed `will auto-split` on all four rows.
+- Adaptive threshold 3 with downscale 2 and fades/merging off produced three
+  ranges bounded by 3.00 and 5.04 s. Raising minimum scene length to 10 s
+  suppressed those cuts and displayed one 8 s range with `below minimum`
+  and `will auto-split` warnings. All checks were Chrome preview actions.
