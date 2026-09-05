@@ -240,3 +240,22 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - User preset QA_trim_regression persisted across restart and immediately
   restored the saved settings, including the 5–15 s trim. Local media paths
   were entered again explicitly for the regression.
+- Captioner INT4 ran the Audio SFX shipped preset on JFK speech in
+  `0038_qwen3`: 256-token limit, 10.92 tok/s, 48.2 s total. Captioner Chat
+  rejected Hello with the model-specific no-chat-mode explanation.
+- Captioner GGUF Q4 (`0039_qwen3`) ignored a supplied instruction exactly as
+  its prompt-free contract requires and logged the ignored prompt. 512-token
+  cap, 265.19 tok/s, 20.6 s total. Personal prompt QA_prompt_ü passed Save,
+  changed-text/Load restoration (both system and user text), and Delete.
+- Captioner GGUF Q8 (`0040_qwen3`) completed a 20-second thunderstorm WAV at
+  32.79 tok/s, EOS, 42.9 s total. It recognized thunder/rain, but invented
+  recording characteristics and called the known mono WAV stereo. This is an
+  explicit model-output quality failure despite successful inference.
+- Editor flags survived app restart. Page 2 showed items 26–27 and Prev page
+  returned to 1–25. Changing Per page to 10 and Gallery produced ten cards,
+  Page 1/3, showing 1–10 of 27.
+- Found shared input-tab state mismatch: changing main tabs restored the
+  visible Upload panel although backend mode and preview still used File path.
+  The shared select handler now synchronizes the Tabs selected property with
+  its mode state. Chrome regressions after restart passed for both Caption
+  (storm WAV) and Transcribe (French FLAC) across main-tab navigation.

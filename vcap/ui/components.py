@@ -1413,13 +1413,17 @@ def media_input_block(
 
         selected_mode = input_mode_from_tab(event)
         activate_mode(selected_mode)
+        # Keep the server-side Tabs selection in sync with its input state.
+        # Otherwise a parent-tab update can restore the initial upload panel
+        # while the worker still uses the user's path or folder selection.
+        tab_update = gr.update(selected=selected_mode)
         if selected_mode == "upload":
             selected = _paths(files_value)
-            return (selected_mode, *_preview_updates(selected), selected)
+            return (selected_mode, *_preview_updates(selected), selected, tab_update)
         if selected_mode == "path":
             selected = _paths(path_value)
-            return (selected_mode, *_preview_updates(selected), selected)
-        return (selected_mode, *[gr.skip() for _ in preview_outputs], gr.skip())
+            return (selected_mode, *_preview_updates(selected), selected, tab_update)
+        return (selected_mode, *[gr.skip() for _ in preview_outputs], gr.skip(), tab_update)
 
     def choose_folder_tab(*values: Any) -> tuple[Any, ...]:
         activate_mode("folder")
@@ -1428,7 +1432,7 @@ def media_input_block(
     input_tabs.select(
         select_input_mode,
         inputs=[files, path],
-        outputs=[mode_state, *preview_outputs, resolved_state],
+        outputs=[mode_state, *preview_outputs, resolved_state, input_tabs],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
