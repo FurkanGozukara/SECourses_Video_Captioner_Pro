@@ -149,3 +149,60 @@ permutations are covered by targeted tests as well as representative UI jobs.
   history and token/context metrics; the next reply was NO HISTORY with only
   the new pair visible and 28 prompt tokens. First GGUF conversation saved in
   `0016_chat_qwen3` (72.78 tok/s, EOS).
+- GGUF Q4 accepted image+audio together and transcribed the speech, but wrongly
+  described the image as also containing the speaker. An isolated image run
+  correctly identified the TV test pattern (with extra speculative wording).
+  This is recorded as a model-output quality failure, not a successful accuracy
+  check. The subsequent GGUF video answer accurately described the storm.
+- Qwen3 Instruct GGUF Q8 passed real video+audio chat: 53 tokens, 49.71 tok/s,
+  EOS; 32-frame cap and chronological-frame/audio warning displayed.
+- Thinking GGUF Q4 showed a collapsible thought and separate Reasoning panel;
+  calculated 3/10 correctly, reported a 768-token length stop, and saved 1,525
+  reasoning characters separately from the answer (`0019_chat_qwen3`). Turning
+  thinking off yielded just the fraction; Copy returned the answer's Markdown.
+- Thinking GGUF Q8 passed storm-video reasoning: 71 tokens, 45.28 tok/s, EOS,
+  final answer "Thunderstorm with lightning and rain." Same-family precision
+  changes retained the conversation; cross-family selection cleared history.
+  Found stale counters on cross-family changes; fixed, pending restart check.
+- System UI copied a complete environment report, detected all 21 downloaded
+  caption variants and CUDA llama.cpp b10621, reported the local Git commits
+  ahead of origin, showed loaded Thinking Q8 / fit, and verified TimeChat INT4
+  (16 files / 6.0 GiB, sizes and SHA). Runtime repair reused the external
+  executable successfully. System unload completed before Whisper tests.
+- Fresh Whisper base download (not present initially) was cancelled mid-progress
+  through Chrome and resumed to verified completion. Its RTX 5090 INT8/FP16
+  transcription passed (`0022_whisper`). BF16 + automatic language detection
+  + initial prompt/hotwords/repeated prompt + beam/best-of 3/patience 1.2 and
+  96-token window ran successfully (`0023_whisper`, detected en at 0.9453).
+  INT8/BF16 and FP32 also executed successfully. Accuracy of the small base
+  model varied: substitution and incomplete speech were observed, unlike the
+  accurate large-v1 default. These runs establish compatibility, not equal quality.
+- Base Whisper precision sweep also passed INT8 and FP16 with timestamped
+  filenames (`0026`–`0028`). Reducing repetition penalty from the large-v1
+  preset's 1.2 to 1.0 restored the complete JFK sentence in `0028_whisper`.
+  This is a parameter/model accuracy interaction, not lost UI output.
+- TimeChat BF16 (`0029_timechat`) ran fixed 10-second clips with 0.5-second
+  overlap, uniform eight-frame sampling, and saved clips. Three clips completed
+  in 50.4 s; about 32.4 tok/s, 384 total tokens. The deliberately low 128-token
+  limit truncated each model-native JSON answer before Wan paragraph conversion.
+  Uniform thumbnails showed eight correct times from 0.00 to 19.99 seconds.
+  Chrome played saved clip 2 (9.976633 s) to its end without media errors.
+- The Clips tab incorrectly retained its empty-state message above the working
+  gallery. Fixed the final update to clear the message's value as well as its
+  visibility; browser regression pending restart.
+- TimeChat BF16 Chat answered night (8 tokens, 31.16 tok/s) and storm weather
+  (18 tokens, 30.80 tok/s). Second Send replaced the first exchange as advertised.
+  Both conversations saved. Switching to AVoCaDO cleared messages and all three
+  counters, passing the cross-family counter regression after restart.
+- AVoCaDO BF16 Chat produced an accurate storm/camera description but ignored
+  the requested one-sentence brevity and reached 128 tokens. Automatic block
+  swap was active (1,024 layer transfers), about 3.66 tok/s. Conversation saved.
+- Corrected README's selectable CUDA-graphs claim: Chrome exposes Inductor
+  default and max-autotune without explicit graph replay. Legacy fallback is
+  still present internally.
+- Corrected three Distil-Whisper large catalogue/README labels from multilingual
+  to English recognition, matching the upstream model cards:
+  [v2](https://huggingface.co/distil-whisper/distil-large-v2),
+  [v3](https://huggingface.co/distil-whisper/distil-large-v3),
+  [v3.5](https://huggingface.co/distil-whisper/distil-large-v3.5).
+  Catalogue display regression pending restart.

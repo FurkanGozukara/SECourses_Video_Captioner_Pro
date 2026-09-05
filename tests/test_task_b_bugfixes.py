@@ -482,10 +482,12 @@ def test_task_b_ui_defaults_layout_hotkey_registry_cancel_and_preset_delete(
         }
         same = chat_tab.chat_model_change_updates("qwen3_omni_instruct_bf16", conversation)
         assert same[3].get("__type__") == "update"
-        assert "conversation kept" in same[-1]
+        assert "conversation kept" in same[-2]
+        assert same[-1].get("__type__") == "update"
         changed = chat_tab.chat_model_change_updates("qwen3_omni_thinking_int4", conversation)
         assert changed[3] == [] and changed[4]["messages"] == []
-        assert "conversation cleared" in changed[-1]
+        assert "conversation cleared" in changed[-2]
+        assert changed[-1] == chat_tab._tokens_line()
 
         token = CancelToken()
         ctx.activate_cancel(token)

@@ -265,7 +265,7 @@ def chat_model_change_updates(
     try:
         get_variant(str(variant_key))
     except KeyError:
-        return tuple(gr.skip() for _ in range(8))
+        return tuple(gr.skip() for _ in range(9))
     mode, note = model_chat_support(variant_key)
     family = variant_to_family(str(variant_key))
     thinking = family == "qwen3_omni_thinking"
@@ -299,6 +299,7 @@ def chat_model_change_updates(
         gr.update(info=f"Hard limit for the next assistant response; {MODEL_SPECS[family].label} caps it at {cap} tokens."),
         *conversation_outputs,
         status,
+        _tokens_line() if family_changed else gr.skip(),
     )
 
 
@@ -748,6 +749,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
             reasoning,
             reasoning_accordion,
             status,
+            tokens,
         ],
         queue=False,
         trigger_mode="multiple",
