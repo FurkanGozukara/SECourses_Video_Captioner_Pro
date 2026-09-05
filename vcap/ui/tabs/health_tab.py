@@ -230,7 +230,7 @@ def selected_model_action_key(value: Any) -> str:
 def _selected_status(key: str, message: str) -> str:
     size_bytes = _variant_disk_usage_bytes(key)
     return (
-        f"Selected: {html.escape(key)} · On disk: {size_bytes / (1024 ** 3):.2f} GB "
+        f"Selected: {html.escape(key)} · On disk: {size_bytes / 1e9:.2f} GB "
         f"({size_bytes:,} bytes)  \n{message}"
     )
 
@@ -283,7 +283,7 @@ def request_model_delete(
         "state": "confirm",
         "variant_key": key,
         "size_bytes": size_bytes,
-        "question": f"Delete {label} ({size_bytes / (1024 ** 3):.2f} GB) from disk?",
+        "question": f"Delete {label} ({size_bytes / 1e9:.2f} GB) from disk?",
     }
 
 
@@ -307,7 +307,7 @@ def delete_model_files_report(variant_key: str, delete_fn: Any = None) -> str:
         files = int(value.get("files_removed", 0) or 0)
         freed = int(value.get("bytes_freed", 0) or 0)
         errors = [str(item) for item in (value.get("errors") or [])]
-        message = f"Removed {files} file(s) and freed {freed:,} bytes ({freed / (1024 ** 3):.2f} GB) for {key}."
+        message = f"Removed {files} file(s) and freed {freed:,} bytes ({freed / 1e9:.2f} GB) for {key}."
         if errors:
             message += " Errors: " + " | ".join(errors[:6])
         css = "vc-ok" if not errors else ("vc-warn" if files else "vc-err")

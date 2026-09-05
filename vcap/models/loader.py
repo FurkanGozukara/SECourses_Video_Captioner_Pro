@@ -239,9 +239,11 @@ def _apply_vram_hard_cap(
     *,
     total_vram_bytes: int,
     other_vram_bytes: int,
+    enabled: bool = True,
 ) -> int:
     if (
-        vram_cap_env_disabled()
+        not enabled
+        or vram_cap_env_disabled()
         or getattr(torch_device, "type", None) != "cuda"
         or not torch.cuda.is_available()
         or total_vram_bytes <= 0
@@ -974,6 +976,7 @@ def load_model(
             torch_device,
             total_vram_bytes=total_vram_bytes,
             other_vram_bytes=other_vram_bytes,
+            enabled=bool(getattr(runtime, "vram_hard_cap", True)),
         )
         _install_last_token_logits_hook(model, last_token_logits)
         if budget is not None:

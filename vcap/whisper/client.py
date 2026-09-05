@@ -167,9 +167,12 @@ def _handle_event(
         if isinstance(raw_result, Mapping):
             results[int(payload.get("item_index", 0))] = TranscriptResult.from_dict(raw_result)
         _sink_call(sink, "on_item_done", payload)
+        written = [Path(str(value)).name for value in (payload.get("files") or [])]
         console_progress.finalize_progress_line(
             key=("whisper", payload.get("item_index", 0)),
-            final_text=str((payload.get("files") or ["Transcription complete"])[0]),
+            final_text=(
+                f"Transcript written: {', '.join(written)}" if written else "Transcription complete"
+            ),
         )
     elif kind == "item_error":
         item_payloads.append(payload)

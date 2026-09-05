@@ -548,7 +548,7 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
                     elem_id="vc_transcribe_cancel",
                 )
                 open_output = action_button("📂 Open Output", "cyan", interactive=False)
-                open_transcript = action_button("📝 Open Last Transcript", "blue", interactive=False)
+                open_transcript = action_button("📝 Open Transcript", "blue", interactive=False)
             with gr.Row():
                 open_editor = action_button(
                     "✏️ Open in Caption Editor",

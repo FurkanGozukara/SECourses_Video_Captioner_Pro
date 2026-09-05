@@ -203,6 +203,18 @@ def build(ctx: "UiContext") -> None:
                 "Gradio analytics are disabled by the application entry point.",
                     )
 
+    with gr.Accordion("⌨ Keyboard shortcuts", open=False):
+        gr.Markdown(
+            "| Where | Keys | Action |\n|---|---|---|\n"
+            "| Any tab | `F4` | Open or close every section of the visible tab |\n"
+            "| Caption, Processing Pipeline | `F9` | Start captioning |\n"
+            "| Caption, Processing Pipeline | `Esc` | Arm cancellation; press again within 8 s to confirm |\n"
+            "| Transcribe | `F9` / `Esc` | Start transcription / arm cancellation |\n"
+            "| Chat | `Enter` / `Shift+Enter` | Send the message / add a line |\n"
+            "| Caption Editor | `←` / `→` | Previous / next item (outside text fields) |\n"
+            "| Caption Editor | `Ctrl+S` | Save the current caption |\n"
+            "| Caption Editor | `Ctrl+Enter` / `Ctrl+Delete` | Approve / reject the current item |"
+        )
     gr.Markdown(
         "Outputs apply immediately after saving. Temporary and model directories take effect after restart.",
         elem_classes=["vc-help"],

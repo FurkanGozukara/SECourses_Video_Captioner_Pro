@@ -50,6 +50,16 @@ _STATUS_TEXT_REPLACEMENTS = {
 }
 
 
+# Third-party chatter that carries nothing a user can act on. It still reaches the
+# daily log file for diagnostics but stays out of the console and the live log.
+_NOISE_MARKERS = (
+    "Successfully loaded: 'mslk.dll'",
+    "register_constant() on Enum subclasses is deprecated",
+    "Unrecognized keys in `rope_parameters`",
+    "generation flags are not valid and may be ignored",
+)
+
+
 def setup_utf8_stdio() -> None:
     """Configure writable process streams for loss-tolerant UTF-8 output."""
 
@@ -208,11 +218,13 @@ class AppLog:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 scope_part = f" [{clean_status_text(scope)}]" if scope else ""
                 line = f"[{timestamp}]{scope_part} {raw_line}"
-                self._revision += 1
-                self._lines.append((self._revision, line))
-                rendered.append(line)
-                if console:
-                    console_progress.log(line)
+                noise = any(marker in raw_line for marker in _NOISE_MARKERS)
+                if not noise:
+                    self._revision += 1
+                    self._lines.append((self._revision, line))
+                    rendered.append(line)
+                    if console:
+                        console_progress.log(line)
                 try:
                     self._ensure_daily_file_locked()
                     assert self._daily_file is not None

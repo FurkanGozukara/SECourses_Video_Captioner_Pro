@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import html
+import itertools
+import json
 import math
 import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 import gradio as gr
 from gradio import processing_utils
@@ -50,6 +52,103 @@ def action_button(label: str, hue: str, **kwargs: Any) -> gr.Button:
     classes = list(kwargs.pop("elem_classes", []) or [])
     classes.extend(["vc-btn", f"vc-btn-{hue}"])
     return gr.Button(label, elem_classes=classes, **kwargs)
+
+
+# A dropdown pick raises ``change`` and ``input`` within the same browser task; an
+# ``input`` this long after the last ``change`` is a blur that picked nothing new.
+_PICK_WINDOW_MS = 800
+_PICK_LISTENERS = itertools.count()
+
+
+def _pick_record_js(dropdown: gr.Dropdown, key: str) -> str:
+    """JS statements binding ``store`` and ``last``, the browser-side record of ``dropdown``."""
+
+    initial = json.dumps(dropdown.value)
+    return (
+        "const store = (window.__vcapPicks = window.__vcapPicks || {}); "
+        f"const last = (store[{key!r}] = store[{key!r}] || {{seq: 0, value: String({initial}), at: -1e9}}); "
+    )
+
+
+def pick_marker(dropdown: gr.Dropdown, key: str) -> gr.Textbox:
+    """Create the hidden carrier that tells :func:`user_pick` whether an ``input`` is a pick.
+
+    Every ``change`` to a new value (user or programmatic) stamps the browser clock
+    and a sequence number; :func:`user_pick` then classifies each ``input`` in the
+    browser.
+    """
+
+    marker = gr.Textbox(value="", visible=False, elem_id=f"vc_pick_{key}")
+    dropdown.change(
+        fn=None,
+        inputs=dropdown,
+        outputs=[],
+        js=(
+            f"(value) => {{ {_pick_record_js(dropdown, key)}const next = String(value); "
+            "if (last.value !== next) Object.assign(last, {value: next, at: performance.now(), seq: last.seq + 1, verdict: undefined}); "
+            "return []; }"
+        ),
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    return marker
+
+
+def user_pick(
+    dropdown: gr.Dropdown,
+    marker: gr.Textbox,
+    fn: Callable[..., Any],
+    *,
+    inputs: Sequence[Any],
+    outputs: Any,
+    valid: Callable[[Any], bool] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Run ``fn`` when the user picks a dropdown value with the mouse or the keyboard.
+
+    Gradio's Dropdown dispatches ``select`` only for mouse picks and ``input`` on
+    every blur, so this listens to ``input``. Gradio runs the listeners of one event
+    one after another, each waiting for the previous round trip, so a browser-side
+    pre-processor decides once per ``change`` whether the ``input`` that follows is
+    a pick (the change happened moments ago) and every listener reuses that
+    verdict; blur-only events and values ``valid`` rejects are skipped. Re-picking
+    the current value is a blur. ``fn`` receives the picked value followed by
+    ``inputs``.
+    """
+
+    output_list = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
+    key = str(marker.elem_id).removeprefix("vc_pick_")
+    listener = f"{key}#{next(_PICK_LISTENERS)}"
+    # A second pick while the first is pending runs as well; deferring it would make
+    # Gradio re-dispatch the event to every listener, and dropping it loses the pick.
+    kwargs.setdefault("trigger_mode", "multiple")
+    classify = (
+        f"(...args) => {{ const values = args.slice(0, {len(inputs) + 2}); {_pick_record_js(dropdown, key)}"
+        "const seen = (store.__seen = store.__seen || {}); const value = String(values[0]); "
+        # The box already shows a new value whose ``change`` stamp has not run yet: a pick.
+        "if (last.value !== value) Object.assign(last, {value, at: performance.now(), seq: last.seq + 1, verdict: 'pick'}); "
+        f"if (seen[{listener!r}] === last.seq) {{ values[1] = 'blur'; return values; }} "
+        f"seen[{listener!r}] = last.seq; "
+        f"if (last.verdict === undefined) last.verdict = performance.now() - last.at < {_PICK_WINDOW_MS} ? 'pick' : 'blur'; "
+        "values[1] = last.verdict; return values; }"
+    )
+
+    def guarded(value: Any, marker_value: Any, *rest: Any) -> Any:
+        if str(marker_value) != "pick" or (valid is not None and not valid(value)):
+            return tuple(gr.skip() for _ in output_list) if len(output_list) > 1 else gr.skip()
+        return fn(value, *rest)
+
+    return dropdown.input(
+        guarded,
+        inputs=[dropdown, marker, *inputs],
+        outputs=output_list,
+        js=classify,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+        **kwargs,
+    )
 
 
 def context_usage_text(used: Any, limit: Any) -> str:
@@ -370,7 +469,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         return (
             *preset_values(defaults),
             gr.update(value=None),
-            "<span class='vc-ok'>Restored application defaults (defaults).</span>",
+            "<span class='vc-ok'>Restored application defaults.</span>",
             applied("", defaults),
         )
 
@@ -517,30 +616,35 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     if isinstance(auto_vram, dict):
         input_keys = list(auto_vram.get("input_keys") or [])
         output_count = len(auto_vram["outputs"])
+        # Startup and Reset apply the detected tier plan. A preset the user chose
+        # keeps every value it stores; only a variant the GPU cannot run is swapped.
+        plan_fn = auto_vram["fn"]
+        preset_fn = auto_vram.get("preset_fn") or plan_fn
 
-        def follow_up(state: dict[str, Any] | None, *values: Any) -> tuple[Any, ...]:
-            """Run the tier plan on the settings that were just applied, or skip."""
+        def follow_up(fn: Callable[..., Any]) -> Callable[..., tuple[Any, ...]]:
+            def run(state: dict[str, Any] | None, *values: Any) -> tuple[Any, ...]:
+                settings = dict((state or {}).get("settings") or {})
+                if not settings:
+                    return tuple(gr.skip() for _ in range(output_count))
+                keys = input_keys + [None] * (len(values) - len(input_keys))
+                resolved = [
+                    settings[key] if key and key in settings else value
+                    for key, value in zip(keys, values)
+                ]
+                return tuple(fn(*resolved))
 
-            settings = dict((state or {}).get("settings") or {})
-            if not settings:
-                return tuple(gr.skip() for _ in range(output_count))
-            keys = input_keys + [None] * (len(values) - len(input_keys))
-            resolved = [
-                settings[key] if key and key in settings else value
-                for key, value in zip(keys, values)
-            ]
-            return tuple(auto_vram["fn"](*resolved))
+            return run
 
-        for dependency in (
-            load_event,
-            select_event,
-            reset_event,
-            startup_event,
-            load_last_event,
-            delete_confirm_event,
+        for dependency, fn in (
+            (load_event, preset_fn),
+            (select_event, preset_fn),
+            (reset_event, plan_fn),
+            (startup_event, plan_fn),
+            (load_last_event, preset_fn),
+            (delete_confirm_event, preset_fn),
         ):
             dependency.then(
-                follow_up,
+                follow_up(fn),
                 inputs=[applied_state, *auto_vram["inputs"]],
                 outputs=auto_vram["outputs"],
                 queue=False,
@@ -1407,6 +1511,7 @@ def media_input_block(
             inputs=save_next_to_source,
             outputs=output_folder,
             queue=False,
+            trigger_mode="multiple",
             show_progress="hidden",
             api_visibility="private",
         )
@@ -1840,10 +1945,12 @@ __all__ = [
     "input_mode_from_tab",
     "log_panel",
     "media_input_block",
+    "pick_marker",
     "poll_log_value",
     "preset_bar",
     "progress_panel",
     "render_progress_html",
     "replace_words_editor",
+    "user_pick",
     "wire_preset_bar",
 ]

@@ -146,7 +146,40 @@ _CONTROL_INFO = {
         "(Transformers backends only; 0 disables). Stops looping captions at the cost of some "
         "natural repetition; 3-6 is typical. GGUF ignores it (llama.cpp has no n-gram blocking)."
     ),
+    "gguf_gpu_layers": (
+        "Decoder layers kept on the GPU (-ngl). 0 lets llama.cpp's memory fitter choose; any other "
+        "value pins the count and turns the fitter off."
+    ),
+    "gguf_n_cpu_moe": (
+        "Keeps the MoE expert weights of the first N decoder layers in system RAM (--n-cpu-moe); "
+        "0 disables. Every dozen layers frees several GB of VRAM at a lower decode speed."
+    ),
+    "vram_hard_cap": (
+        "Caps the CUDA allocator at the dedicated VRAM that was free at load, so an overrun raises a "
+        "recoverable out-of-memory error (handled by the OOM retries) instead of silently paging into "
+        "shared GPU memory, which is many times slower."
+    ),
 }
+
+# Pixel presets shared by the dropdown and the reverse lookup that keeps it in step
+# with a manually edited Maximum pixels value.
+_PIXEL_PRESETS = (
+    ("TimeChat default · 297,920", "297920"),
+    ("AVoCaDO default · 401,408", "401408"),
+    ("Qwen3 · 256·32·32", "262144"),
+    ("Low VRAM · 128·32·32", "131072"),
+    ("Custom", "custom"),
+)
+
+
+def _resolution_choice(pixels: Any) -> str:
+    """Return the pixel preset matching ``pixels`` exactly, else ``custom``."""
+
+    try:
+        key = str(int(float(pixels)))
+    except (TypeError, ValueError, OverflowError):
+        return "custom"
+    return key if any(key == value for _, value in _PIXEL_PRESETS) else "custom"
 
 
 def _frames_info(spec: Any) -> str:
@@ -201,9 +234,11 @@ from vcap.ui.components import (
     log_panel,
     media_input_block,
     newest_first,
+    pick_marker,
     progress_panel,
     render_progress_html,
     replace_words_editor,
+    user_pick,
 )
 
 if TYPE_CHECKING:
@@ -604,6 +639,10 @@ def gguf_control_updates(
         "no_repeat_ngram_size": {
             "interactive": not is_gguf,
             "info": disabled_info("no_repeat_ngram_size"),
+        },
+        "vram_hard_cap": {
+            "interactive": not is_gguf,
+            "info": disabled_info("vram_hard_cap"),
         },
     }
 
@@ -1184,7 +1223,7 @@ def _quant_line(variant_key: str) -> str:
         backend = "llama.cpp" if variant.backend == "llamacpp" else "Transformers"
         return (
             f"**Precision:** `{html.escape(variant.scheme)}` · **Backend:** {backend} · "
-            f"**Checkpoint:** {variant.size_gb:.1f} GB"
+            f"**Checkpoint:** {variant_size_gb(variant_key):.1f} GB"
         )
     except Exception as exc:
         return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
@@ -1202,6 +1241,17 @@ def _blocks_info(layer_count: int) -> str:
         "Decoder layers kept in pinned RAM and streamed through the GPU each token; "
         f"0 keeps the whole decoder resident. The selected family has {int(layer_count)} layers."
     )
+
+
+def _use_audio_update(spec: Any, value: Any = None) -> dict[str, Any]:
+    """Update kwargs for the audio toggle: locked on for families that need an audio timeline."""
+
+    if spec.limits.requires_audio_track:
+        return {"value": True, "interactive": False}
+    update: dict[str, Any] = {"interactive": "video_audio" in spec.capabilities}
+    if value is not None:
+        update["value"] = value
+    return update
 
 
 def _media_kinds(modality: Any) -> tuple[str, ...]:
@@ -1650,7 +1700,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         interactive=False,
                     )
                     open_output = action_button("📂 Open Output", "teal", scale=2)
-                    open_caption = action_button("📝 Open Last Caption", "violet", scale=2)
+                    open_caption = action_button("📝 Open Caption", "violet", scale=2)
                     reveal_clip = action_button("🎬 Reveal Clip", "amber", scale=2)
                     open_editor = action_button(
                         "✏️ Open in Caption Editor",
@@ -1795,6 +1845,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
                     valid_model_key_state = gr.State(_INITIAL_VARIANT)
                     ctx.states["caption_valid_model_key"] = valid_model_key_state
+                    picked_model = pick_marker(model_key, "model_key")
                     controls["model_key"] = ctx.reg(
                         "model_key", model_key, _INITIAL_VARIANT, section="model",
                         description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
@@ -1822,6 +1873,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             "vram_preset", vram_preset, "auto", section="model",
                             description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
                         )
+                        picked_vram = pick_marker(vram_preset, "vram_preset")
                         attention = gr.Dropdown(
                             choices=_attention_choices(),
                             value="auto",
@@ -2052,6 +2104,16 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description=_CONTROL_INFO["pinned_ram_budget_gb"],
                                 kind="float", minimum=0, maximum=1024,
                             )
+                        vram_hard_cap = gr.Checkbox(
+                            value=True,
+                            label="Cap the CUDA allocator at the VRAM free at load",
+                            info=_CONTROL_INFO["vram_hard_cap"],
+                            elem_id="vc_vram_hard_cap",
+                        )
+                        controls["vram_hard_cap"] = ctx.reg(
+                            "vram_hard_cap", vram_hard_cap, True, section="model",
+                            description=_CONTROL_INFO["vram_hard_cap"], kind="bool",
+                        )
                     with gr.Row():
                         compile_enabled = gr.Checkbox(
                             value=False,
@@ -2321,6 +2383,29 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="Maximum idle seconds while waiting for streamed llama-server generation data.",
                                 kind="int", minimum=0, maximum=3600,
                             )
+                        with gr.Row():
+                            gguf_gpu_layers = gr.Number(
+                                value=0, minimum=0, maximum=999, step=1, precision=0,
+                                label="GPU layers (-ngl, 0 = fit automatically)",
+                                info=_CONTROL_INFO["gguf_gpu_layers"],
+                                interactive=False,
+                                elem_id="vc_gguf_gpu_layers",
+                            )
+                            controls["gguf_gpu_layers"] = ctx.reg(
+                                "gguf_gpu_layers", gguf_gpu_layers, 0, section="runtime",
+                                description=_CONTROL_INFO["gguf_gpu_layers"], kind="int", minimum=0, maximum=999,
+                            )
+                            gguf_n_cpu_moe = gr.Number(
+                                value=0, minimum=0, maximum=999, step=1, precision=0,
+                                label="MoE expert layers on CPU (--n-cpu-moe)",
+                                info=_CONTROL_INFO["gguf_n_cpu_moe"],
+                                interactive=False,
+                                elem_id="vc_gguf_n_cpu_moe",
+                            )
+                            controls["gguf_n_cpu_moe"] = ctx.reg(
+                                "gguf_n_cpu_moe", gguf_n_cpu_moe, 0, section="runtime",
+                                description=_CONTROL_INFO["gguf_n_cpu_moe"], kind="int", minimum=0, maximum=999,
+                            )
                         gguf_extra_args = gr.Textbox(
                             value="", label="Extra llama-server arguments",
                             info="Extra llama-server command-line arguments appended verbatim (advanced; shell-split).",
@@ -2357,6 +2442,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         description="Built-in task and prompt preset identifier.", kind="str",
                     )
                     valid_prompt_preset_state = gr.State(initial_prompt.id)
+                    picked_prompt = pick_marker(prompt_preset, "prompt_preset")
                     prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
                     system_prompt = gr.Textbox(
                         value=initial_system or "",
@@ -2678,13 +2764,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         )
                     with gr.Row():
                         resolution_preset = gr.Dropdown(
-                            choices=[
-                                ("TimeChat default · 297,920", "297920"),
-                                ("AVoCaDO default · 401,408", "401408"),
-                                ("Qwen3 · 256·32·32", "262144"),
-                                ("Low VRAM · 128·32·32", "131072"),
-                                ("Custom", "custom"),
-                            ],
+                            choices=list(_PIXEL_PRESETS),
                             value="262144",
                             label="Pixel preset",
                             info="Sets the maximum resized area per decoded frame.",
@@ -2692,8 +2772,9 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         controls["resolution_preset"] = ctx.reg(
                             "resolution_preset", resolution_preset, "262144", section="preprocessing",
                             description="Convenient model-aware maximum-pixel preset.",
-                            choices=["297920", "401408", "262144", "131072", "custom"], kind="str",
+                            choices=[key for _, key in _PIXEL_PRESETS], kind="str",
                         )
+                        picked_resolution = pick_marker(resolution_preset, "resolution_preset")
                         max_pixels = gr.Number(
                             value=initial_spec.limits.default_max_pixels,
                             minimum=4 * 28 * 28,
@@ -3777,6 +3858,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=gpu_picker,
         outputs=ctx.states["gpu_index"],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -3898,9 +3980,15 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             and str(settings.get("audio_caption_empty_policy", "skip")) == "placeholder"
         ),
     )
+    def poll_compile_probe() -> tuple[str, Any]:
+        """Show the probe result and stop polling once it is known."""
+
+        status = _probe_compile_in_child()
+        return status, gr.Timer(active="Probing" in status)
+
     compile_probe_timer.tick(
-        _probe_compile_in_child,
-        outputs=compile_status,
+        poll_compile_probe,
+        outputs=[compile_status, compile_probe_timer],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -3918,6 +4006,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=[model_key, valid_model_key_state],
         outputs=[model_key, valid_model_key_state, vram_note],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -3931,19 +4020,23 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=model_key,
         outputs=[quant_info, ready_status],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
     # This is the first user-selection chain, so the inexpensive identity line
     # changes in the same browser turn as the dropdown instead of waiting behind
     # model-default and VRAM recalculation handlers.
-    model_key.select(
+    def known_variant(value: Any) -> bool:
+        return str(value) in {key for _, key in _variant_choices()}
+
+    user_pick(
+        model_key,
+        picked_model,
         model_identity_lines,
-        inputs=model_key,
+        inputs=[],
         outputs=[quant_info, ready_status],
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
+        valid=known_variant,
     )
 
     gguf_children = [
@@ -3962,6 +4055,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         gguf_fit_headroom_mib,
         gguf_startup_timeout_s,
         gguf_stream_idle_timeout_s,
+        gguf_gpu_layers,
+        gguf_n_cpu_moe,
         gguf_extra_args,
     ]
     backend_controls = [
@@ -3977,6 +4072,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         compile_mode,
         use_cache,
         no_repeat_ngram_size,
+        vram_hard_cap,
     ]
     backend_output_names = [
         "attention_backend",
@@ -3991,6 +4087,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         "torch_compile_mode",
         "use_cache",
         "no_repeat_ngram_size",
+        "vram_hard_cap",
     ]
 
     def apply_backend_control_state(variant_key: str, automatic_swap: bool = True) -> tuple[Any, ...]:
@@ -4013,6 +4110,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=[model_key, block_swap_auto],
         outputs=backend_outputs,
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -4021,6 +4119,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=[model_key, block_swap_auto],
         outputs=backend_outputs,
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -4028,12 +4127,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     def set_resolution(value: str) -> Any:
         return gr.skip() if value == "custom" else int(value)
 
-    # Gradio 6 dropdowns fire ``input`` on every blur; ``select`` fires only
-    # when the user actually picks an option, which is what these handlers mean.
-    resolution_preset.select(
-        set_resolution,
-        inputs=resolution_preset,
-        outputs=max_pixels,
+    user_pick(resolution_preset, picked_resolution, set_resolution, inputs=[], outputs=max_pixels)
+    # A hand-edited pixel count switches the preset to Custom (or back to a matching preset).
+    max_pixels.input(
+        _resolution_choice,
+        inputs=max_pixels,
+        outputs=resolution_preset,
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -4237,13 +4336,31 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
     ) -> tuple[Any, ...]:
         return apply_auto_vram(selected_variant, selected_tier, selected_gpu, show_all, keep_variant=False)
 
-    vram_preset.select(
-        apply_vram,
-        inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
+    def apply_auto_vram_after_preset(
+        selected_variant: str,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+    ) -> tuple[Any, ...]:
+        """Keep every value a preset stored; swap (and re-plan) only a variant the GPU cannot run."""
+
+        physical_tier = auto_tier(gpu_total_for(selected_gpu))
+        fits = selected_variant in allowed_variants(variant_to_family(selected_variant), physical_tier)
+        if selected_tier != "auto" or fits:
+            choices = variant_choices_for_tier(selected_variant, physical_tier, bool(show_all))
+            note = (
+                "<span class='vc-help'>Preset values applied as saved; the VRAM tier plan was not re-applied.</span>"
+                + tier_warning(selected_variant, physical_tier)
+            )
+            return gr.update(choices=choices, value=selected_variant), *[gr.skip() for _ in range(10)], note
+        return apply_vram_plan(selected_variant, selected_tier, selected_gpu, show_all, switch_variant=True)
+
+    user_pick(
+        vram_preset,
+        picked_vram,
+        lambda tier, variant, gpu, show_all: apply_vram(variant, tier, gpu, show_all),
+        inputs=[model_key, gpu_picker, show_all_variants],
         outputs=vram_outputs,
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
     )
 
     def filter_variant_choices(selected_variant: str, selected_gpu: int, show_all: bool) -> Any:
@@ -4266,11 +4383,13 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
         outputs=vram_outputs,
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
     ctx.states["caption_auto_vram_binding"] = {
         "fn": apply_auto_vram_startup,
+        "preset_fn": apply_auto_vram_after_preset,
         "inputs": [model_key, vram_preset, gpu_picker, show_all_variants],
         # Preset-owned inputs come from the settings a preset load just applied;
         # None keeps the live component value (the GPU choice is not in presets).
@@ -4429,7 +4548,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             ),
             gr.update(value=values["max_pixels"].default, minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS, step=values["max_pixels"].step),
             gr.update(value=spec.limits.min_pixels, minimum=_GLOBAL_MIN_PIXELS),
-            gr.update(value=values["use_audio_in_video"].default, interactive="video_audio" in spec.capabilities),
+            gr.update(**_use_audio_update(spec, values["use_audio_in_video"].default)),
             gr.update(
                 value=int(spec.limits.context_tokens),
                 minimum=1024,
@@ -4450,18 +4569,22 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         except (TypeError, ValueError):
             kept_tokens = int(values["max_new_tokens"].default)
         kept_tokens = max(1, min(kept_tokens, token_cap))
+        # Only a clamp may move the slider here: this ``change`` handler races the
+        # pick handler that applies the tier plan, and a stale value must not win.
+        token_update: dict[str, Any] = {
+            "minimum": 1,
+            "maximum": _GLOBAL_MAX_NEW_TOKENS,
+            "step": 1,
+            "info": f"{values['max_new_tokens'].description} Selected-family maximum: {token_cap:,}.",
+        }
+        if kept_tokens != current_max_tokens:
+            token_update["value"] = kept_tokens
         return (
             gr.update(minimum=0, maximum=2, step=0.01),
             gr.update(minimum=0, maximum=1, step=0.01),
             gr.update(minimum=0, maximum=200, step=1),
             gr.update(minimum=0.5, maximum=2, step=0.01),
-            gr.update(
-                value=kept_tokens,
-                minimum=1,
-                maximum=_GLOBAL_MAX_NEW_TOKENS,
-                step=1,
-                info=f"{values['max_new_tokens'].description} Selected-family maximum: {token_cap:,}.",
-            ),
+            gr.update(**token_update),
             gr.skip(),
             gr.update(
                 value=bool(thinking.default) if thinking is not None else False,
@@ -4471,7 +4594,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             gr.update(minimum=0, maximum=_GLOBAL_MAX_FRAMES, step=values["max_frames"].step, info=_frames_info(spec)),
             gr.update(minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS, step=values["max_pixels"].step),
             gr.update(minimum=_GLOBAL_MIN_PIXELS, maximum=_GLOBAL_MAX_PIXELS),
-            gr.update(interactive="video_audio" in spec.capabilities),
+            gr.update(**_use_audio_update(spec)),
             gr.update(minimum=1024, maximum=_GLOBAL_MAX_CONTEXT, info=_context_info(spec)),
         )
 
@@ -4480,25 +4603,43 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=[model_key, max_new_tokens],
         outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio, context_tokens],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
 
-    model_defaults_event = model_key.select(
-        model_defaults,
-        inputs=[model_key, max_new_tokens],
-        outputs=[temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio, context_tokens],
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
-    )
-    model_defaults_event.then(
-        apply_auto_vram,
-        inputs=[model_key, vram_preset, gpu_picker, show_all_variants],
-        outputs=vram_outputs,
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
+    model_default_outputs = [temperature, top_p, top_k, repetition, max_new_tokens, do_sample, enable_thinking, fps, max_frames, max_pixels, min_pixels, use_audio, context_tokens]
+    model_pick_outputs = [
+        *model_default_outputs,
+        *[component for component in vram_outputs if component not in model_default_outputs],
+        resolution_preset,
+    ]
+
+    def model_picked(
+        variant_key: str,
+        current_max_tokens: Any,
+        selected_tier: str,
+        selected_gpu: int,
+        show_all: bool,
+    ) -> tuple[Any, ...]:
+        """Apply the family defaults, then the automatic tier plan on top of them."""
+
+        merged = dict(zip(model_default_outputs, model_defaults(variant_key, current_max_tokens)))
+        plan = apply_auto_vram(variant_key, selected_tier, selected_gpu, show_all)
+        for component, value in zip(vram_outputs, plan):
+            if value != gr.skip():
+                merged[component] = value
+        pixels = merged[max_pixels]
+        merged[resolution_preset] = _resolution_choice(pixels.get("value") if isinstance(pixels, dict) else pixels)
+        return tuple(merged[component] for component in model_pick_outputs)
+
+    user_pick(
+        model_key,
+        picked_model,
+        model_picked,
+        inputs=[max_new_tokens, vram_preset, gpu_picker, show_all_variants],
+        outputs=model_pick_outputs,
+        valid=known_variant,
     )
     variable_components = [
         trigger_word,
@@ -4560,13 +4701,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             return description, system, user, tracked, *[gr.skip() for _ in range(6)]
 
     ctx.states["caption_prompt_select_handler"] = select_prompt
-    prompt_preset.select(
+    user_pick(
+        prompt_preset,
+        picked_prompt,
         select_prompt,
-        inputs=[prompt_preset, model_key, *variable_components],
+        inputs=[model_key, *variable_components],
         outputs=[prompt_description, system_prompt, user_prompt, prompt_auto_state, temperature, top_p, top_k, repetition, max_new_tokens, do_sample],
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
     )
     reset_prompts.click(
         render_selected,
@@ -4839,21 +4979,20 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         prompt_auto_state,
     ]
     ctx.states["caption_prompt_context_handler"] = sync_prompt_context
-    model_key.select(
+    user_pick(
+        model_key,
+        picked_model,
         sync_prompt_context,
-        inputs=prompt_sync_inputs,
+        inputs=prompt_sync_inputs[1:],
         outputs=prompt_sync_outputs,
-        queue=False,
-        trigger_mode="always_last",
-        show_progress="hidden",
-        api_visibility="private",
+        valid=known_variant,
     )
     media.modality_state.change(
         sync_prompt_context,
         inputs=prompt_sync_inputs,
         outputs=prompt_sync_outputs,
         queue=False,
-        trigger_mode="always_last",
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -4862,7 +5001,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=prompt_sync_inputs,
         outputs=prompt_sync_outputs,
         queue=False,
-        trigger_mode="always_last",
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -4910,15 +5049,6 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             return f"<span class='vc-warn'>Token estimate unavailable: {html.escape(str(exc))}</span>"
 
     budget_inputs = [model_key, fps, max_frames, max_pixels, media.duration_state, max_new_tokens, use_audio, context_tokens]
-    for event_component in budget_inputs:
-        event_component.change(
-            budget_line,
-            inputs=budget_inputs,
-            outputs=token_budget,
-            queue=False,
-            show_progress="hidden",
-            api_visibility="private",
-        )
 
     block_swap_inputs = [
         model_key,
@@ -4986,21 +5116,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             return gr.skip(), f"<span class='vc-warn'>Block swap preview unavailable: {html.escape(str(exc))}</span>"
 
     block_swap_outputs = [blocks_to_swap, block_swap_note]
-    # The slider is an output here, so it listens on ``input`` (user edits only)
-    # while every other dependency listens on ``change`` so preset loads refresh
-    # the preview too; the programmatic slider update never re-triggers itself.
-    for event_component in block_swap_inputs:
-        if event_component is blocks_to_swap:
-            continue
-        event_component.change(
-            refresh_block_swap,
-            inputs=block_swap_inputs,
-            outputs=block_swap_outputs,
-            queue=False,
-            trigger_mode="always_last",
-            show_progress="hidden",
-            api_visibility="private",
-        )
+    # The slider is an output of ``refresh_estimates`` below, so it listens on
+    # ``input`` (user edits only); the programmatic update never re-triggers it.
     blocks_to_swap.input(
         refresh_block_swap,
         inputs=block_swap_inputs,
@@ -5133,6 +5250,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         inputs=model_key,
         outputs=[],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     ).then(
@@ -5166,11 +5284,34 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         return f"Model-limit auto-split ceiling: **{limit:.1f} s** at the current FPS, pixel, audio, and output-token budget."
 
     limit_inputs = [model_key, fps, max_pixels, max_new_tokens, use_audio, context_tokens]
-    for event_component in limit_inputs:
+    estimate_inputs = [*block_swap_inputs, use_audio]
+
+    def refresh_estimates(*values: Any) -> tuple[Any, ...]:
+        """Refresh the token budget, block-swap preview, and auto-split ceiling together.
+
+        One ``change`` listener per control keeps Gradio's ``always_last`` sound: the
+        frontend re-dispatches the whole event when a deferred listener finishes, so
+        two deferred listeners on one control would re-trigger each other forever.
+        """
+
+        by_component = dict(zip(estimate_inputs, values))
+
+        def picked(components: list[Any]) -> list[Any]:
+            return [by_component[component] for component in components]
+
+        return (
+            budget_line(*picked(budget_inputs)),
+            *refresh_block_swap(*picked(block_swap_inputs)),
+            limit_line(*picked(limit_inputs)),
+        )
+
+    for event_component in estimate_inputs:
+        if event_component is blocks_to_swap:
+            continue
         event_component.change(
-            limit_line,
-            inputs=limit_inputs,
-            outputs=model_limit_info,
+            refresh_estimates,
+            inputs=estimate_inputs,
+            outputs=[token_budget, *block_swap_outputs, model_limit_info],
             queue=False,
             show_progress="hidden",
             api_visibility="private",
@@ -5247,18 +5388,18 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         api_visibility="private",
     )
 
-    def clear_caches() -> str:
+    def clear_caches() -> tuple[str, Any]:
         report = clear_inductor_caches()
         removed = len(report.get("removed") or [])
         errors = report.get("errors") or []
         ctx.app_log.log(f"Cleared {removed} compile cache location(s).", scope="compile")
         for error in errors:
             ctx.app_log.warn(error, scope="compile")
-        return _probe_compile_in_child(force=True)
+        return _probe_compile_in_child(force=True), gr.Timer(active=True)
 
     clear_compile.click(
         clear_caches,
-        outputs=compile_status,
+        outputs=[compile_status, compile_probe_timer],
         concurrency_id="gpu_queue",
         concurrency_limit=1,
         show_progress="hidden",

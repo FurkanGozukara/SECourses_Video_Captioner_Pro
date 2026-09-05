@@ -12,6 +12,24 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.7.0",
+        "2026-09-05",
+        """
+### Presets apply exactly, keyboard-safe dropdowns, and exposed backend knobs
+
+- Loading a universal preset (shipped or saved) now applies every value it stores. Previously the automatic VRAM plan ran after each load and replaced the preset's sampling FPS, frame cap, pixel cap, token limit, attention, and block-swap settings with the tier defaults (a saved 512-token LTX preset came back as 4,096 tokens). The plan still runs at startup, on Reset, and when a preset's variant cannot run on the detected GPU; that variant is swapped and the note under the VRAM preset says so.
+- The Model variant, VRAM preset, Pixel preset, and Task / prompt preset dropdowns (Caption and Chat) react to keyboard selection, typing a name or using the arrow keys plus Enter, exactly like a mouse click: family defaults, the tier plan, the rendered prompt, and the identity line all update. Gradio fires its `select` event for mouse picks only, so these reactions now listen to `input` and ignore the blur-only repeats it also produces.
+- Editing Maximum pixels by hand switches the Pixel preset to Custom, or back to the preset that matches the typed value.
+- TimeChat locks **Use video audio** on because it always needs an audio timeline, and the pipeline no longer marks a video unsupported when that toggle was off for such a family.
+- New controls for values that were environment variables only: **GPU layers (-ngl)** and **MoE expert layers on CPU (--n-cpu-moe)** in the llama.cpp options, and **Cap the CUDA allocator at the VRAM free at load** in Block swap & offload plan. `VCAP_LLAMACPP_GPU_LAYERS`, `VCAP_LLAMACPP_N_CPU_MOE`, and `VCAP_VRAM_HARD_CAP` still override them.
+- The Precision / Backend / Checkpoint line shows the measured checkpoint size like the dropdown label, System & Models reports on-disk sizes in decimal GB like its size column, and the Caption Editor mirrors an edited `.txt` caption into the `text` field of its JSON sibling.
+- Fixed a browser feedback loop that made the whole interface sluggish: Gradio 6 re-dispatches a `change` event to every listener when a deferred one finishes, so controls with several deferred listeners (Maximum new tokens, Sampling FPS, Maximum pixels, Context length, the model dropdown) kept re-running their estimate handlers forever after two quick edits, at about seven requests per second with the browser's main thread fully busy. The token budget, auto-split ceiling, and block-swap preview now refresh through one shared listener, every other control keeps at most one deferred listener, and a test guards the rule.
+- Live polls (log, resource meter, cancel state, chat stop, model health) now run only for the tab on screen. Previously every tab the user had visited kept polling in the background, up to eight requests per second with the browser's main thread about 70% busy; the Caption Editor autosave keeps a slow background tick so an edit made just before switching tabs is still written.
+- Third-party noise (`mslk.dll`, the torch Enum deprecation, `rope_parameters`, unused generation-flag warnings) stays out of the console and the live log and remains in the daily log file; the torch.compile probe stops polling once its result is known; Whisper's console line names the written transcript instead of printing a bare path.
+- Global Settings gains a **Keyboard shortcuts** reference, the result buttons read **Open Caption** / **Open Transcript**, and Reset reports "Restored application defaults." once.
+""".strip(),
+    ),
+    (
         "v1.6.0",
         "2026-09-05",
         """

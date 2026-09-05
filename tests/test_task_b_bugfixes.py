@@ -505,6 +505,6 @@ def test_task_b_ui_defaults_layout_hotkey_registry_cancel_and_preset_delete(
         assert deleted[count + 1] == ""
         reset = handlers["reset"]()
         assert reset[count]["value"] is None
-        assert "(defaults)" in reset[count + 1]
+        assert "Restored application defaults" in reset[count + 1]
     finally:
         demo.vcap_context.pipeline.shutdown()

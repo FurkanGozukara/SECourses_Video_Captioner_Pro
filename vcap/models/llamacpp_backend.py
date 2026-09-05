@@ -9,7 +9,7 @@ from __future__ import annotations
 import atexit
 import base64
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from io import BytesIO
 import json
@@ -100,6 +100,9 @@ class LlamaCppRuntimeOptions:
     fit_headroom_mib: int = 1_536
     startup_timeout_s: int = 900
     stream_idle_timeout_s: int = 120
+    # 0 keeps llama.cpp's fitter in charge of -ngl; a positive count pins the layers.
+    gpu_layers: int = 0
+    n_cpu_moe: int = 0
 
     @classmethod
     def from_spec(cls, spec: Any | None) -> "LlamaCppRuntimeOptions":
@@ -141,7 +144,18 @@ class LlamaCppRuntimeOptions:
             fit_headroom_mib=integer("gguf_fit_headroom_mib", 1_536, 0, 8_192),
             startup_timeout_s=integer("gguf_startup_timeout_s", 900, 60, 3_600),
             stream_idle_timeout_s=integer("gguf_stream_idle_timeout_s", 120, 0, 3_600),
+            gpu_layers=integer("gguf_gpu_layers", 0, 0, 999),
+            n_cpu_moe=integer("gguf_n_cpu_moe", 0, 0, 999),
         )
+
+    def place_layers(self, plan: "LlamaCppServerPlan") -> "LlamaCppServerPlan":
+        """Apply the user's -ngl / --n-cpu-moe choices; an explicit -ngl disables the fitter."""
+
+        if self.n_cpu_moe > 0:
+            plan = replace(plan, n_cpu_moe=int(self.n_cpu_moe))
+        if self.gpu_layers > 0:
+            plan = replace(plan, gpu_layers=int(self.gpu_layers), fit=False)
+        return plan
 
 
 @dataclass(frozen=True)
@@ -851,15 +865,17 @@ class LlamaCppCaptioner(BaseCaptioner):
         if not math.isfinite(self.vram_reserve_gb) or self.vram_reserve_gb < 0:
             raise ValueError("vram_reserve_gb must be a non-negative finite number")
         self.runtime_options = LlamaCppRuntimeOptions.from_spec(runtime)
-        self.server_plan = server_plan_for_vram(
-            self.vram_total_gb,
-            requested_context=self.requested_context_size,
-            q8_weights=self.variant.key.endswith("_gguf_q8"),
-            fit_target_mib=(
-                int(round(self.vram_reserve_gb * 1_024))
-                + self.runtime_options.fit_headroom_mib
-            ),
-            ignore_tier_context=self.runtime_options.ignore_tier_context,
+        self.server_plan = self.runtime_options.place_layers(
+            server_plan_for_vram(
+                self.vram_total_gb,
+                requested_context=self.requested_context_size,
+                q8_weights=self.variant.key.endswith("_gguf_q8"),
+                fit_target_mib=(
+                    int(round(self.vram_reserve_gb * 1_024))
+                    + self.runtime_options.fit_headroom_mib
+                ),
+                ignore_tier_context=self.runtime_options.ignore_tier_context,
+            )
         )
         self._active_server_plan = self.server_plan
         self.context_size = self.server_plan.context_size
@@ -923,15 +939,17 @@ class LlamaCppCaptioner(BaseCaptioner):
             )
             self.stop()
         self.runtime_options = options
-        self.server_plan = server_plan_for_vram(
-            self.vram_total_gb,
-            requested_context=self.requested_context_size,
-            q8_weights=self.variant.key.endswith("_gguf_q8"),
-            fit_target_mib=(
-                int(round(self.vram_reserve_gb * 1_024))
-                + options.fit_headroom_mib
-            ),
-            ignore_tier_context=options.ignore_tier_context,
+        self.server_plan = options.place_layers(
+            server_plan_for_vram(
+                self.vram_total_gb,
+                requested_context=self.requested_context_size,
+                q8_weights=self.variant.key.endswith("_gguf_q8"),
+                fit_target_mib=(
+                    int(round(self.vram_reserve_gb * 1_024))
+                    + options.fit_headroom_mib
+                ),
+                ignore_tier_context=options.ignore_tier_context,
+            )
         )
         self._active_server_plan = self.server_plan
         self.context_size = self.server_plan.context_size

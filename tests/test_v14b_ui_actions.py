@@ -257,7 +257,7 @@ def test_delete_model_confirm_state_and_fake_delete_report() -> None:
     confirmation = request_model_delete(
         "qwen3_omni_instruct_int4",
         {"loaded_variant": None},
-        lambda _key: 2 * 1024**3,
+        lambda _key: 2_000_000_000,
     )
     assert confirmation["state"] == "confirm"
     assert "(2.00 GB)" in confirmation["question"]

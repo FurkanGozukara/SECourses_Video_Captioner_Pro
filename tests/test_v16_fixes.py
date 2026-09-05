@@ -679,7 +679,7 @@ def test_d18_model_identity_is_first_select_chain(app: Any) -> None:
         dependency
         for dependency in config["dependencies"]
         if any(
-            target_id == model_id and event == "select"
+            target_id == model_id and event == "input"
             for target_id, event in dependency.get("targets", [])
         )
     ]

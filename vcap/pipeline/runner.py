@@ -564,8 +564,10 @@ def _required_capability(info: MediaInfo | None, item: InputItem, spec: JobSpec,
         if explicit in {"video_audio", "video", "audio", "image", "text"}:
             return explicit, explicit
     if info.kind == "video":
-        capability = "video_audio" if spec.preprocess.use_audio_in_video else "video"
-        return capability, "video"
+        # Families that always need an audio timeline (TimeChat) take the track even
+        # when the audio toggle is off; the toggle only matters where video-only exists.
+        wants_audio = spec.preprocess.use_audio_in_video or model.limits.requires_audio_track
+        return ("video_audio" if wants_audio else "video"), "video"
     if info.kind == "video_no_audio":
         capability = "video_audio" if model.limits.requires_audio_track else "video"
         return capability, "video"

@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from vcap import (
     APP_DIR,
@@ -139,6 +139,53 @@ def _gpu_summary() -> str:
     )
 
 
+def _timers_in(block: Any) -> list[gr.Timer]:
+    found: list[gr.Timer] = []
+    for child in getattr(block, "children", None) or []:
+        if isinstance(child, gr.Timer):
+            found.append(child)
+        found.extend(_timers_in(child))
+    return found
+
+
+def gate_tab_timers(tabs: gr.Tabs, background: Mapping[str, float]) -> dict[str, list[gr.Timer]]:
+    """Tick only the selected tab's timers.
+
+    Every poll round trip costs the browser tens of milliseconds of main-thread
+    work, so the live polls of every tab the user has visited would otherwise keep
+    running together. Hidden tabs stop polling; tabs listed in ``background`` (by
+    tab id) keep ticking at that slower interval instead, e.g. the editor autosave.
+    """
+
+    ordered = [tab for tab in tabs.children if isinstance(tab, gr.Tab)]
+    timers = {tab: _timers_in(tab) for tab in ordered}
+    every = [timer for found in timers.values() for timer in found]
+
+    # The tab bar's own ``select`` fires for every click; a Tab's ``select`` never
+    # fires for the tab that was open at load in Gradio 6.26. Programmatic switches
+    # (Open in Caption Editor) fire neither, so hidden tabs keep their state.
+    def selected(evt: gr.SelectData) -> list[Any]:
+        active_tab = next((tab for tab in ordered if tab.label == evt.value), None)
+        if active_tab is None and isinstance(evt.index, int) and 0 <= evt.index < len(ordered):
+            active_tab = ordered[evt.index]
+        if active_tab is None:
+            return [gr.skip() for _ in every]
+        updates: list[Any] = []
+        for tab, found in timers.items():
+            slow = background.get(str(tab.id))
+            for timer in found:
+                if tab is active_tab:
+                    updates.append(gr.Timer(value=timer.value, active=True))
+                elif slow is not None:
+                    updates.append(gr.Timer(value=slow, active=True))
+                else:
+                    updates.append(gr.Timer(active=False))
+        return updates
+
+    tabs.select(selected, inputs=None, outputs=every, queue=False, show_progress="hidden", api_visibility="private")
+    return {str(tab.id): found for tab, found in timers.items()}
+
+
 def build_app() -> gr.Blocks:
     """Construct the complete Gradio application without launching a server."""
 
@@ -203,6 +250,7 @@ def build_app() -> gr.Blocks:
         transcribe_tab.wire(context)
         chat_tab.wire(context)
         wire_preset_bar(context, demo)
+        context.states["tab_timers"] = gate_tab_timers(main_tabs, background={"editor": 3.0})
 
         history_binding = context.states.get("run_history_binding")
         if isinstance(history_binding, dict):

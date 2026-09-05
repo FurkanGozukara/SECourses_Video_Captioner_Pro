@@ -221,16 +221,38 @@ def _read_caption(path: Path) -> tuple[str, str | None]:
     except json.JSONDecodeError:
         return raw.rstrip("\r\n"), None
     if isinstance(value, Mapping):
-        for key in ("caption", "text", "final_caption", "description"):
+        for key in _JSON_CAPTION_KEYS:
             if isinstance(value.get(key), str):
                 return str(value[key]), key
     return json.dumps(value, ensure_ascii=False, indent=2), None
+
+
+_JSON_CAPTION_KEYS = ("caption", "text", "final_caption", "description")
+
+
+def _sync_json_sidecar(caption_path: Path, text: str) -> None:
+    """Mirror an edited ``.txt`` caption into the ``text``/``caption`` field of its JSON sibling."""
+
+    sidecar = caption_path.with_suffix(".json")
+    if caption_path.suffix.casefold() != ".txt" or not sidecar.is_file():
+        return
+    try:
+        document = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(document, dict):
+        return
+    key = next((name for name in _JSON_CAPTION_KEYS if isinstance(document.get(name), str)), None)
+    if key is not None and document[key] != text:
+        document[key] = text
+        OutputWriter().write_json(sidecar, document, pretty=True)
 
 
 def _write_caption(path: Path, text: str, field: str | None = None) -> Path:
     """Atomically write text while preserving common JSON caption wrappers."""
 
     value = str(text)
+    _sync_json_sidecar(path, value)
     if path.suffix.casefold() == ".json":
         existing: Any = None
         try:
@@ -1872,6 +1894,7 @@ def build(ctx: "UiContext") -> None:
         inputs=state,
         outputs=[video_caption_part, audio_caption_part],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2014,6 +2037,7 @@ def build(ctx: "UiContext") -> None:
             ],
             outputs=[regen_variant, *regeneration_prompt_outputs],
             queue=False,
+            trigger_mode="multiple",
             show_progress="hidden",
             api_visibility="private",
         )

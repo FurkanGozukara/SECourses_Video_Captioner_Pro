@@ -558,6 +558,9 @@ class RuntimeSpec:
     gguf_fit_headroom_mib: int = 1536
     gguf_startup_timeout_s: int = 900
     gguf_stream_idle_timeout_s: int = 120
+    gguf_gpu_layers: int = 0
+    gguf_n_cpu_moe: int = 0
+    vram_hard_cap: bool = True
 
     def __post_init__(self) -> None:
         primary = max(0, int(self.gpu_index))
@@ -633,6 +636,9 @@ class RuntimeSpec:
             "gguf_stream_idle_timeout_s",
             max(0, min(3600, _int(self.gguf_stream_idle_timeout_s, 120))),
         )
+        object.__setattr__(self, "gguf_gpu_layers", max(0, min(999, _int(self.gguf_gpu_layers, 0))))
+        object.__setattr__(self, "gguf_n_cpu_moe", max(0, min(999, _int(self.gguf_n_cpu_moe, 0))))
+        object.__setattr__(self, "vram_hard_cap", _bool(self.vram_hard_cap, True))
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1321,9 @@ class JobSpec:
                     _int(_setting(source, "gguf_stream_idle_timeout_s", default=120), 120),
                 ),
             ),
+            gguf_gpu_layers=_int(_setting(source, "gguf_gpu_layers", default=0), 0),
+            gguf_n_cpu_moe=_int(_setting(source, "gguf_n_cpu_moe", default=0), 0),
+            vram_hard_cap=_bool(_setting(source, "vram_hard_cap", default=True), True),
         )
         from vcap.whisper.params import WhisperParams
 

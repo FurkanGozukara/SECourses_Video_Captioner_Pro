@@ -20,7 +20,7 @@ from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
 from vcap.pipeline.chat import ChatRequest, ChatResponse, save_conversation
 from vcap.prompts.presets import default_preset_for, get_preset, list_presets, render_prompt
-from vcap.ui.components import action_button, context_usage_text
+from vcap.ui.components import action_button, context_usage_text, pick_marker, user_pick
 
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
@@ -414,6 +414,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 elem_id="vc_chat_prompt_preset",
             )
             valid_prompt_preset = gr.State(initial_prompt_id or "")
+            picked_prompt = pick_marker(prompt_preset, "chat_prompt_preset")
             system_prompt = gr.Textbox(
                 value="",
                 label="System prompt",
@@ -652,6 +653,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
             inputs=[files, path, caption_model, prompt_preset],
             outputs=[prompt_preset, valid_prompt_preset],
             queue=False,
+            trigger_mode="multiple",
             show_progress="hidden",
             api_visibility="private",
         )
@@ -717,13 +719,12 @@ def build(ctx: "UiContext") -> ChatTabHandles:
                 gr.Warning(f"Could not render chat prompt preset: {exc}")
             return gr.skip(), gr.skip()
 
-    prompt_preset.select(
+    user_pick(
+        prompt_preset,
+        picked_prompt,
         apply_chat_prompt_preset,
-        inputs=[prompt_preset, *caption_variable_components],
+        inputs=caption_variable_components,
         outputs=[system_prompt, message],
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
     )
 
     caption_model.change(
@@ -740,6 +741,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
             status,
         ],
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
