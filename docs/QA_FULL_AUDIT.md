@@ -224,3 +224,19 @@ permutations are covered by targeted tests as well as representative UI jobs.
   message while retaining the existing queue.
 - All three corrected Distil-Whisper large descriptions displayed English
   speech recognition in Chrome after restart.
+- AVoCaDO INT8 + explicit Sage attention + adaptive sampling + video audio off
+  completed `0035_avocado` in 35.6 s, 176 tokens, 31.39 tok/s, EOS. Preview
+  selected 5.00, 7.84, 12.15, 13.55 s within the selected 5–15 s range.
+- Confirmed a real input-trim bug: fast copying a requested 5–15 s range kept
+  keyframe pre-roll, yielding an 11.04 s clip labelled 5–16.04 s. This also
+  let codec padding create a redundant trainer overlap tail. Input trims now
+  re-encode precisely, and planning caps duration to the requested window;
+  later clip splitting retains the selected fast/precise behavior.
+- Chrome regression `0036_avocado`: AVoCaDO INT4, xFormers, audiovisual adaptive
+  sampling; 215 tokens, 33.30 tok/s, EOS, 34.2 s total. Saved requested 5–15 s
+  clip has 300 frames / 10.01 s (within one source frame), and a coherent storm
+  audio/visual caption. `0037_avocado` repeated the five-second Wan trainer
+  case: one clip labelled 0–5.00 s, no redundant overlap tail; 6.5 s total.
+- User preset QA_trim_regression persisted across restart and immediately
+  restored the saved settings, including the 5–15 s trim. Local media paths
+  were entered again explicitly for the regression.

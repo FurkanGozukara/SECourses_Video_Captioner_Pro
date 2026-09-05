@@ -1691,7 +1691,7 @@ def _trim_source(
     target = target_dir / f"trimmed{source.suffix or '.mp4'}"
     scope = "per-item clip" if item_trim else "single-file"
     emitter.log(
-        f"Trimming {source.name}: {start:.3f}s to {end:.3f}s ({scope} range)",
+        f"Trimming {source.name}: {start:.3f}s to {end:.3f}s ({scope} range; precise encode)",
         scope="preprocess",
     )
     trim_media(
@@ -1699,7 +1699,10 @@ def _trim_source(
         target,
         start,
         end,
-        mode=spec.split.cut_mode,
+        # Input trims define the content and timestamp origin of every later
+        # segment. Stream copy can include an earlier keyframe, shifting both.
+        # The split cut-mode setting still applies to subsequent clip splitting.
+        mode="precise",
         keep_audio=True,
         encode_codec=spec.split.encode_codec,
         encode_crf=spec.split.encode_crf,
@@ -1709,6 +1712,12 @@ def _trim_source(
     trimmed_info = probe_media(target)
     if trimmed_info.kind == "unknown":
         raise RuntimeError(f"Trimmed media could not be probed: {trimmed_info.error}")
+    # Codec/frame padding may extend the probed container by a few milliseconds.
+    # Do not turn padding into an extra overlapping trainer segment.
+    trimmed_info = replace(
+        trimmed_info,
+        duration=min(float(trimmed_info.duration or end - start), end - start),
+    )
     return target, trimmed_info, start
 
 
