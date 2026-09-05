@@ -122,3 +122,30 @@ permutations are covered by targeted tests as well as representative UI jobs.
   counts according to their manifests.
 - README corrected two advertising inconsistencies: last-used presets require
   Load Last Values, and caption cancellation confirmation lasts eight seconds.
+- Qwen3 Instruct INT4 real Chat: empty Send validated; Enter sent a text turn,
+  answered 12×7 correctly (84), and an image attached to the next turn was
+  recognized as a TV color-bar test pattern. The model remembered ORCHID from
+  the first turn. Image answer: 72 tokens, 12.42 tok/s, EOS, context 573/32768.
+- Global Settings light-theme screenshot reviewed; top theme toggle restored
+  Dark and synchronized the radio. Keyboard reference rendered correctly.
+- Browser automation detached during a chat file-chooser wait (infrastructure
+  timeout, not an app failure). Continuing in a fresh Chrome tab; prior chat
+  was not saved before the interruption.
+- Further Chat checks: uploaded JFK audio produced the correct transcript;
+  a quoted Unicode video path on the next turn produced an accurate nighttime
+  storm description. Saved JSON/Markdown in `0014_chat_qwen3` retain messages,
+  attachments, parameters, EOS/timing/context statistics (video: 57 tokens,
+  11.90 tok/s, 5521/32768 context).
+- Found two real Chrome bugs: Copy last answer wrote `[object Object]` because
+  Gradio 6 sends normalized text blocks; the Chatbot toolbar Clear erased only
+  the visual messages, and prior turns returned on the next Send. Fixed text
+  extraction and wired both Clear controls to the same state reset, including
+  the token counters. Browser regression pending restart.
+- Real Chat stop passed: double-click confirmation stopped a story at 806
+  generated tokens / 68.4 s, finish=cancelled, retaining the resident model.
+  Cancelled conversation saved in `0015_chat_qwen3`.
+- Chat fixes passed after restart with Qwen3 Instruct GGUF Q4 on GPU 0:
+  Copy last answer returned SAVED exactly; toolbar Clear reset the displayed
+  history and token/context metrics; the next reply was NO HISTORY with only
+  the new pair visible and 28 prompt tokens. First GGUF conversation saved in
+  `0016_chat_qwen3` (72.78 tok/s, EOS).

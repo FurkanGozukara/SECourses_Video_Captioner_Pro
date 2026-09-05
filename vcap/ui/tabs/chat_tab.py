@@ -178,9 +178,18 @@ def _tokens_line(tokens: Any = "—", speed: Any = "—", used: Any = None, limi
 
 
 def _last_answer(history: Sequence[Mapping[str, Any]] | None) -> str:
+    def text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, Mapping):
+            return str(content.get("text") or "")
+        if isinstance(content, (list, tuple)):
+            return "".join(text_content(part) for part in content)
+        return ""
+
     for item in reversed(list(history or [])):
         if str(item.get("role") or "") == "assistant" and not _is_thought(item):
-            return str(item.get("content") or "")
+            return text_content(item.get("content"))
     return ""
 
 
@@ -1170,31 +1179,37 @@ def wire(ctx: "UiContext") -> None:
         api_visibility="private",
     )
 
-    def clear_history() -> tuple[Any, ...]:
+    def clear_history(state: Mapping[str, Any] | None = None) -> tuple[Any, ...]:
         token = ctx.states.get("chat_job_token")
         if token is not None and not token.is_cancelled():
             return (
-                gr.skip(),
+                _chatbot_messages(list((state or {}).get("messages") or [])),
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
                 "<span class='vc-warn'>Stop the running response before clearing history.</span>",
+                gr.skip(),
             )
-        return [], dict(_INITIAL_STATE), "", gr.update(visible=False), "<span class='vc-ok'>Conversation cleared.</span>"
+        return [], dict(_INITIAL_STATE), "", gr.update(visible=False), "<span class='vc-ok'>Conversation cleared.</span>", _tokens_line()
 
-    handles.clear.click(
-        clear_history,
-        outputs=[
-            handles.chatbot,
-            handles.conversation_state,
-            handles.reasoning,
-            handles.reasoning_accordion,
-            handles.status,
-        ],
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
-    )
+    # The Chatbot toolbar has its own Clear control. It must reset the same
+    # conversation state as our button, otherwise the next turn restores history.
+    for trigger in (handles.clear.click, handles.chatbot.clear):
+        trigger(
+            clear_history,
+            inputs=handles.conversation_state,
+            outputs=[
+                handles.chatbot,
+                handles.conversation_state,
+                handles.reasoning,
+                handles.reasoning_accordion,
+                handles.status,
+                handles.tokens,
+            ],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     handles.copy_last.click(
         lambda history: (
@@ -1205,9 +1220,13 @@ def wire(ctx: "UiContext") -> None:
         inputs=handles.chatbot,
         outputs=handles.status,
         js=(
-            "(history) => { const rows = Array.isArray(history) ? history : []; "
+            "async (history) => { const rows = Array.isArray(history) ? history : []; "
             "const item = [...rows].reverse().find(x => x && x.role === 'assistant' && !(x.metadata && x.metadata.title)); "
-            "if (item && item.content) navigator.clipboard.writeText(String(item.content)); "
+            "const textOf = value => typeof value === 'string' ? value : "
+            "Array.isArray(value) ? value.map(textOf).join('') : "
+            "value && typeof value.text === 'string' ? value.text : ''; "
+            "const text = item ? textOf(item.content) : ''; "
+            "if (text) await navigator.clipboard.writeText(text); "
             "return [history]; }"
         ),
         queue=False,
