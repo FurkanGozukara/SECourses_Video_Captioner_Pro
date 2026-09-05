@@ -292,18 +292,27 @@ def build_app() -> gr.Blocks:
             show_progress="hidden",
             api_visibility="private",
         )
+        recursive_controls = [
+            context.caption_handles.media.recursive,
+            context.transcribe_handles.media.recursive,
+            context.states["editor_open_binding"]["recursive"],
+        ]
+
+        def apply_recursive_default(enabled: bool) -> list[bool]:
+            return [bool(enabled) for _ in recursive_controls]
+
         context.states["scan_subfolders_component"].input(
-            lambda enabled: bool(enabled),
+            apply_recursive_default,
             inputs=context.states["scan_subfolders_component"],
-            outputs=context.caption_handles.media.recursive,
+            outputs=recursive_controls,
             queue=False,
             show_progress="hidden",
             api_visibility="private",
         )
         demo.load(
-            lambda enabled: bool(enabled),
+            apply_recursive_default,
             inputs=context.states["scan_subfolders_component"],
-            outputs=context.caption_handles.media.recursive,
+            outputs=recursive_controls,
             queue=False,
             show_progress="hidden",
             api_visibility="private",

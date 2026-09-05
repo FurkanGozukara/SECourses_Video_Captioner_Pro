@@ -259,3 +259,29 @@ permutations are covered by targeted tests as well as representative UI jobs.
   The shared select handler now synchronizes the Tabs selected property with
   its mode state. Chrome regressions after restart passed for both Caption
   (storm WAV) and Transcribe (French FLAC) across main-tab navigation.
+- Real French audiobook fixture from Hugging Face's public audio examples:
+  [monte_cristo.flac](https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/blob/main/monte_cristo.flac),
+  16.75 s / 16 kHz mono. Downloaded only into ignored QA fixtures.
+  large-v1 French transcription (`0041_whisper`, 7.0 s) and English translation
+  (`0042`, `0043`) executed on CUDA. Translation grammar improved at repetition
+  penalty 1.0, but semantic errors remained (e.g. reins rendered as queens).
+  Full large-v3 automatically downloaded 3.09 GB on Start and translated the
+  sample in `0044_whisper` (40.0 s including download); semantic errors and an
+  invented ending remained. Translation execution passes; accuracy does not.
+- Found Global Settings' recursive default affected Caption only. Transcribe
+  and Caption Editor ignored it. Fixed both initial load and immediate changes
+  to reach all three controls. Chrome restart showed both checked; switching
+  the global preference off unchecked both immediately.
+- Saved a new global output directory and Save every processed file. Real
+  Captioner INT8 run `qa_global_runs/0001_qwen3` wrote there and retained its
+  1–10 s trimmed WAV in `storm_processed/trimmed.wav` (288,078 bytes).
+  Completed in 121.1 s, 160 tokens, 2.16 tok/s with automatic block swap.
+  Its audio caption again incorrectly described mono content as stereo.
+  Restored original output directory and the two preferences afterwards.
+- Global empty-directory validation rejected an empty output path and retained
+  the prior app_settings.json. Empty-string browser fill was unreliable in this
+  interaction; keyboard Ctrl+A/Backspace visibly cleared it before submission.
+- Restart-only path test pending: saved temporary directory
+  `temp/qa_runtime_temp` and FFmpeg path `C:/ffmpeg_latest`; will verify a real
+  run and restore them. Next launch also omits VCAP_MODELS_DIR so model discovery
+  must use the persisted Global Settings models directory.
