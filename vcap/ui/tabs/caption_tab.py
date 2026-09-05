@@ -6065,6 +6065,40 @@ def wire(ctx: "UiContext") -> None:
         terminal_items: set[int] = set()
         live_outputs: dict[str, Any] = {}
         live_dirty = False
+
+        def interrupted_state(status: str, message: str) -> dict[str, Any]:
+            now = time.monotonic()
+            for index, row in enumerate(item_rows):
+                if str(row[2]).casefold() in {"queued", "running"}:
+                    row[2] = status
+                    row[3] = message
+                    if index in item_started_at:
+                        row[4] = f"{max(0.0, now - item_started_at[index]):.1f}s"
+            state = dict(live_outputs)
+            state.update(
+                failed_paths=failed_item_paths({"items": [
+                    {"path": item.path, "status": row[2]}
+                    for item, row in zip(items, item_rows)
+                ]}),
+                output_kind=output_kind,
+                input_mode=input_mode,
+                input_modality=input_modality,
+                batch_output_folder=str(output.batch_output_dir) if output.batch_output_dir else None,
+                source_root=str(output.source_root) if output.source_root else None,
+                batch_save_next_to_source=bool(output.save_next_to_source),
+                job_finished=True,
+            )
+            if state.get("run_dir"):
+                folder = (
+                    str(output.source_root)
+                    if output_kind == "batch" and output.save_next_to_source and output.source_root
+                    else str(output.batch_output_dir)
+                    if output_kind == "batch" and output.batch_output_dir
+                    else state["run_dir"]
+                )
+                state.update(editor_dir=folder, archive_source=folder, editor_recursive=output_kind == "batch")
+            return state
+
         if waiting_for_model_release:
             starting_label = "Waiting"
             starting_status = "Waiting for the previous model to unload..."
@@ -6288,6 +6322,7 @@ def wire(ctx: "UiContext") -> None:
             )
         except (CancelledError, KeyboardInterrupt) as exc:
             ctx.app_log.warn(str(exc), scope="cancel")
+            state = interrupted_state("cancelled", str(exc))
             yield (
                 render_progress_html(last_fraction, "Cancelled", str(exc)),
                 f"<span class='vc-warn'>**Status:** {html.escape(str(exc))}</span>",
@@ -6295,34 +6330,36 @@ def wire(ctx: "UiContext") -> None:
                 f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
                 *[gr.skip() for _ in range(7)],
-                gr.skip(),
+                state,
                 _job_done_payload("Job cancelled", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
                 gr.update(interactive=True),
+                gr.update(interactive=bool(state.get("run_dir"))),
                 gr.update(interactive=False),
-                gr.update(interactive=False),
-                gr.update(interactive=False),
-                gr.update(interactive=False),
+                gr.update(interactive=bool(state.get("failed_paths"))),
+                gr.update(interactive=bool(state.get("archive_source"))),
                 gr.update(value=None, visible=False),
             )
         except BaseException as exc:
             ctx.app_log.exception(f"Caption job failed: {exc}", scope="ui")
+            state = interrupted_state("failed", str(exc))
             yield (
                 render_progress_html(last_fraction, "Failed", str(exc)),
                 f"<span class='vc-err'>**Status:** {html.escape(str(exc))}</span>",
                 "**ETA:** failed",
                 f"**Speed:** {last_speed} · **Context:** {last_context}",
                 item_rows,
-                *[gr.skip() for _ in range(8)],
+                *[gr.skip() for _ in range(7)],
+                state,
                 _job_done_payload("Job failed", settings),
                 gr.update(value="⏹ Cancel", interactive=False),
                 gr.update(visible=False),
                 gr.update(interactive=True),
+                gr.update(interactive=bool(state.get("run_dir"))),
                 gr.update(interactive=False),
-                gr.update(interactive=False),
-                gr.update(interactive=False),
-                gr.update(interactive=False),
+                gr.update(interactive=bool(state.get("failed_paths"))),
+                gr.update(interactive=bool(state.get("archive_source"))),
                 gr.update(value=None, visible=False),
             )
         finally:

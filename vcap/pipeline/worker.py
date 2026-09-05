@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import io
 import json
 import logging
@@ -447,6 +448,9 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["VCAP_WORKER_GPU"] = str(args.gpu)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     setup_utf8_stdio()
+    # Native CUDA/checkpoint failures bypass Python exception handling. Keep
+    # their thread stacks in the captured worker output for crash diagnostics.
+    faulthandler.enable(file=sys.__stderr__, all_threads=True)
     real_stdout = sys.stdout
     protocol = _ProtocolWriter(real_stdout)
     _install_redirects(protocol)

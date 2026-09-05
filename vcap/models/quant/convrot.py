@@ -98,9 +98,24 @@ def _checkpoint_path(path: str | os.PathLike[str]) -> Path:
     return value
 
 
+def _open_checkpoint(checkpoint: Path):
+    # PyTorch's writable mmap reserves Windows commit for the entire checkpoint.
+    # A 63 GB BF16 file can therefore crash in get_tensor before block swapping
+    # has loaded even its first layer. Read individual tensors without that map.
+    if os.name == "nt":
+        try:
+            return safe_open(str(checkpoint), framework="pt", device="cpu", backend="pread")
+        except TypeError as exc:
+            raise RuntimeError(
+                "Windows checkpoint loading requires safetensors >= 0.8.0. "
+                'In the application virtual environment, run: python -m pip install "safetensors>=0.8.0"'
+            ) from exc
+    return safe_open(str(checkpoint), framework="pt", device="cpu")
+
+
 def read_quant_metadata(path: str | os.PathLike[str]) -> QuantMeta | None:
     checkpoint = _checkpoint_path(path)
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+    with _open_checkpoint(checkpoint) as handle:
         encoded = (handle.metadata() or {}).get("_quantization_metadata")
     if not encoded:
         return None
@@ -131,7 +146,7 @@ def read_quant_metadata(path: str | os.PathLike[str]) -> QuantMeta | None:
 
 def iter_safetensors_tensors(path: str | os.PathLike[str]) -> Iterator[tuple[str, torch.Tensor]]:
     checkpoint = _checkpoint_path(path)
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+    with _open_checkpoint(checkpoint) as handle:
         for name in handle.keys():
             yield name, handle.get_tensor(name)
 
@@ -139,7 +154,7 @@ def iter_safetensors_tensors(path: str | os.PathLike[str]) -> Iterator[tuple[str
 def estimate_checkpoint_vram_gb(path: str | os.PathLike[str]) -> float:
     checkpoint = _checkpoint_path(path)
     total = 0
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+    with _open_checkpoint(checkpoint) as handle:
         for name in handle.keys():
             tensor = handle.get_slice(name)
             total += math.prod(tensor.get_shape()) * _DTYPE_BYTES[tensor.get_dtype()]
@@ -1615,7 +1630,7 @@ def apply_quantized_checkpoint(
             parent_device = _placement_device(parent_name, target_device, layer_device)
             _materialize_quant_experts(modules[parent_name], parent_device)
 
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+    with _open_checkpoint(checkpoint) as handle:
         names = list(handle.keys())
         total_bytes = sum(
             math.prod(handle.get_slice(name).get_shape())

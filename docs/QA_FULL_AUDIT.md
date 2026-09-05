@@ -285,3 +285,43 @@ permutations are covered by targeted tests as well as representative UI jobs.
   `temp/qa_runtime_temp` and FFmpeg path `C:/ffmpeg_latest`; will verify a real
   run and restore them. Next launch also omits VCAP_MODELS_DIR so model discovery
   must use the persisted Global Settings models directory.
+
+### Native BF16 loading and interrupted-job recovery
+
+- Qwen3 Captioner BF16 with explicit Flash Attention 2 and a 128-token cap
+  crashed three times during the first checkpoint tensor read (`0045`–`0047`).
+  Worker exit code was 3221225477 / 0xC0000005. Enabling faulthandler in the
+  worker captured the native stack at `torch.storage.__getitem__`, called by
+  safetensors `get_tensor`; this preceded GPU inference.
+- Fixed Windows checkpoint loading to use safetensors 0.8's `pread` backend,
+  avoiding PyTorch's writable map of the complete 63.4 GB checkpoint. Kept
+  Linux's mmap behavior and documented the minimum dependency and upgrade
+  command. Upstream provides this reader specifically for memory pressure and
+  slow mmap scenarios ([safetensors PR 760](https://github.com/safetensors/safetensors/pull/760)).
+- The native crash also left the item marked Running and disabled Retry failed.
+  Interrupted jobs now finalize queued/running rows, preserve run and output
+  destinations, and offer retry for failed paths. Completed rows and artifacts
+  remain available. Cancellation uses the same finalization with Cancelled status.
+  Crash logs now briefly wait for process termination so their header contains
+  the actual exit code instead of None.
+- Chrome regression `0047_qwen3` reproduced the real native crash with the new
+  failure handler: Failed row, correct native exit code, enabled Retry failed.
+  Clicking Retry failed after the loader change reran the same file, BF16
+  model, and Flash Attention 2 setting without restarting the app or browser.
+- Retry `0048_qwen3` completed: 1 done, 0 failed, 410.8 seconds total,
+  128 tokens at 0.36 tok/s. Model loading took 51.2 seconds and reported
+  25.44 GiB peak VRAM, 17 resident layers, 31 swapped layers / 35.98 GiB pinned
+  RAM, and two staging slots. Generation transferred 4,605.5 GiB through block
+  swap. This proves BF16 execution with RAM offload on GPU 0, not full residency.
+  Saved TXT/JSON/metadata exist. The output again falsely calls the mono WAV
+  stereo and truncates at the deliberately small token cap; these are explicit
+  output-quality limitations.
+- The successful run also validates persisted custom temporary/FFmpeg paths
+  and models discovery with no VCAP_MODELS_DIR environment override. Restoring
+  the temporary directory and automatic FFmpeg discovery remains pending.
+- Additional Chrome checks: Changelog expanded the initial release and collapsed
+  v1.7.0 correctly. Editor Min/Max chars=31 selected items 10–27 (18 matches).
+  Over token limit selected all 27 eight-token captions at limit 7, showed warning
+  flags, and selected zero at limit 8. A temporary narrow viewport reported no
+  horizontal document overflow; screenshot capture was unsuitable for visual
+  signoff, so responsive layout coverage remains incomplete. Viewport reset.

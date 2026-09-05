@@ -43,6 +43,7 @@ Use **Dataset clips - video + audio captions (Qwen3-Omni + Whisper)** for genera
 
 - Windows or Linux on x86-64.
 - 64-bit Python 3.12.
+- Windows checkpoint loading requires `safetensors>=0.8.0`. Its `pread` reader streams tensors without reserving writable memory for an entire large checkpoint. For an older environment, run `python -m pip install "safetensors>=0.8.0"` after activating the app's virtual environment.
 - An NVIDIA RTX 3000-series GPU or newer. Supported presets span 6 GB through 80 GB VRAM; available models and speed vary sharply by tier.
 - An NVIDIA driver and CUDA 13 environment compatible with the supplied PyTorch 2.13.0+cu130 wheels. The Windows installer also expects cuDNN 9.17 or newer.
 - Git plus `ffmpeg` and `ffprobe` available on `PATH`.

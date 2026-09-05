@@ -341,10 +341,18 @@ class PipelineClient:
         try:
             from vcap.core.logs import get_log
 
+            # Stdout may close just before Windows reports the process exit.
+            # Reap it briefly so the saved diagnostic includes its native code.
+            returncode = worker.returncode
+            if returncode is None:
+                try:
+                    returncode = worker.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
             path = get_log().write_worker_crash(
                 pid,
                 [
-                    f"Pipeline worker {pid} exited with code {worker.returncode}.",
+                    f"Pipeline worker {pid} exited with code {returncode}.",
                     *self._worker_output_tail,
                 ],
             )
