@@ -467,7 +467,10 @@ def validate_prompt_preset(
     context = [family, effective_modality]
     if selected is not None:
         preset = get_preset(selected)
-        update = gr.update(value=selected) if selected != str(value or "") else gr.skip()
+        _, selected_choices, _ = _resolve_prompt_preset(
+            variant_key, effective_modality, selected
+        )
+        update = gr.update(choices=selected_choices, value=selected)
         return update, selected, _display(preset.description), context
     fallback = str(previous_valid or "")
     if fallback not in {preset_id for _, preset_id in choices}:
@@ -4981,7 +4984,9 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         media.modality_state,
         use_audio,
         media.resolved_state,
-        prompt_preset,
+        # State is read when the callback runs. A dropdown value captured by
+        # an earlier model/input event can predate a newer user prompt pick.
+        valid_prompt_preset_state,
         prompt_context_state,
         *variable_components,
     ]

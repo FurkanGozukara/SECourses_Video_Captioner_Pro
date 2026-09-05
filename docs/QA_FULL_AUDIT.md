@@ -408,3 +408,35 @@ permutations are covered by targeted tests as well as representative UI jobs.
   The initial missing pytest package was a development dependency installed
   for the early baseline suite; no missing required runtime package has been
   found during the real Chrome checks so far.
+
+### Mixed caption batch and Whisper integration
+
+- `batch_0058_qwen3` used Instruct INT4, recursive folder scan, glob list
+  `*.mp4;*.wav;*.png`, and video/audio/image kinds with Text excluded. Chrome
+  counted four inputs: a corrupt MP4, nested PNG/WAV, and `storm ü.mp4`.
+  Output folder `qa_caption_batch_ü` preserved nested paths and Unicode names.
+  Result: 3 done, 0 failed, 1 unsupported in 87.47 s. The corrupt MP4 was
+  identified as unreadable before model processing and did not stop the batch.
+- Enabled stage 7 using Whisper base, English, repetition penalty 1,
+  SubRip/TXT/LRC sidecars, suffix `_qa_speech`, and custom injection wrapper
+  `[QA_SPEECH]\n{{TRANSCRIPT}}`. Image transcription was skipped. Speech sidecars
+  contained the full JFK sentence. The storm produced zero speech segments and
+  empty sidecars; the log explicitly injected the no-speech result for its clip.
+  Caption and transcript filenames remained distinct. The worker exited when
+  the completed batch unloaded its model.
+- Found a prompt-selection mismatch: metadata recorded `image_short_caption`
+  while the user prompt was the selected joint-media template. The image used
+  that template and truncated at 256 tokens; the audio/video received the
+  short-image preset's per-modality fallbacks. This makes recorded settings
+  misleading and can change the requested task across a mixed batch.
+- Prompt context callbacks now read the latest validated selection from session
+  state instead of a dropdown value captured by an earlier event. Validation
+  also synchronizes the dropdown choices and value. Chrome regression switched
+  Thinking INT4 to Instruct INT4, immediately selected joint-media description,
+  navigated through Pipeline and Transcribe, then changed to a filtered folder
+  batch. The joint preset and its prompt remained selected throughout.
+- Saved regression `batch_0059_qwen3` completed one nested PNG in 30.53 s with
+  `*.png` filtering and Limit items 1. Metadata now contains
+  `prompt_preset_id: qwen3_joint_describe` and the matching native prompt.
+  Used a deliberate 16-token cap to check settings execution; its partial
+  caption is not a quality benchmark. Automatic worker shutdown also passed.
