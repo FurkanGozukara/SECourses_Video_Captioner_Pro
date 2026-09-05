@@ -771,3 +771,69 @@ permutations are covered by targeted tests as well as representative UI jobs.
   EOS); Chrome and JSON both showed the expected `XY RAIN CATEND`. The job
   finished in 27.25 s and its worker exited. A temporary browser-control
   connection failure was resolved without restarting a live application job.
+
+### Remaining Whisper model catalogue checks
+
+- Chrome exposes 17 aliases. The following checks use the same 11 s JFK WAV,
+  GPU 0, float16, English, beam/best-of 5, repetition penalty 1, VAD enabled,
+  and normalized word timestamps. All six output formats are selected.
+- `0098_whisper`: tiny.en downloaded automatically (78.1 MB), then transcribed
+  the complete benchmark sentence. Total time 8.92 s, inference 0.6 s, one raw
+  segment and two normalized subtitle cues. TXT/SRT/VTT/LRC/TSV/JSON and run
+  metadata/logs exist. Manual Download / Verify returned the downloaded/ready
+  state, and the Whisper worker exited.
+- `0099_whisper`: multilingual small downloaded automatically (486.2 MB)
+  and returned the complete sentence in all six formats; 12.01 s total,
+  0.47 s inference, one raw segment/two normalized subtitle cues. Worker exited.
+- `0100_whisper`: English-only small.en downloaded automatically (486.1 MB)
+  and returned the complete sentence with all six files; 12.3 s total,
+  about 0.5 s inference. The normalized two-cue timing differed from small,
+  while the recognized words agreed. Worker exited.
+- The remaining small/medium and initial distilled-large aliases also downloaded
+  automatically and completed in Chrome on GPU 0. Each wrote all six selected
+  formats and metadata/logs. Every result retained the complete spoken sentence;
+  punctuation, raw segment boundaries and normalized cue timing varied.
+
+  | Run | Alias | Download size | Total time | Inference shown in Chrome |
+  |---|---|---:|---:|---:|
+  | 0101 | distil-small.en | 335.5 MB | 8.98 s | 0.4 s |
+  | 0102 | distil-medium.en | 792.1 MB | 18.65 s | 0.4 s |
+  | 0103 | medium | 1.53 GB | 25.60 s | 0.6 s |
+  | 0104 | medium.en | 1.53 GB | 25.42 s | 0.6 s |
+  | 0105 | distil-large-v2 | 1.52 GB | 25.29 s | 0.4 s |
+  | 0106 | distil-large-v3 | 1.52 GB | 23.37 s | 0.4 s |
+  | 0107 | distil-large-v3.5 | 1.52 GB | 22.09 s | 0.4 s |
+  | 0108 | large-v2 | 3.09 GB | 38.16 s | 0.7 s |
+
+- Confirmed the pre-existing tiny and turbo files with standalone Chrome
+  transcription: `0109` tiny took 1.19 s; `0110` large-v3-turbo took 2.48 s.
+  `0111` base.en, already used by the caption pipeline, also passed the
+  standalone tab in 1.24 s. All returned the complete sentence and six files.
+  Together with the earlier base, large-v1 and large-v3 jobs, all 17 catalogue
+  aliases now have real Chrome transcription evidence. This single English
+  sample establishes execution and output handling, not accuracy across
+  languages, speakers or acoustic conditions.
+- Custom repository input `Systran/faster-whisper-tiny.en` downloaded into
+  its separate repository-named directory and transcribed successfully in
+  `0112_whisper` (5.3 s, all six files). Delete → Keep model preserved readiness.
+  Delete → Yes removed only this QA-created custom directory (74.5 MiB);
+  the ordinary tiny.en alias remained installed. Download / Verify restored
+  it and finished with `Model ready` and `downloaded and verified` in Chrome.
+  No Whisper worker remained after the completed inference/deletion checks.
+
+### Remaining dataset export controls
+
+- Auto detection on the mixed `temp/qa_full/dataset` folder generated video
+  TOML. Wan 81f defaults set 832 × 480, 81 frames, 16 FPS and max_frames 81;
+  Chrome displayed these values in `outputs/qa_auto_wan.toml`.
+- Generated and inspected all five frame-extraction choices: head, chunk,
+  slide, uniform and full. The custom export controls survived into the
+  displayed and saved TOML: repeats 4, batch size 2, frame stride 2, frame
+  sample 3, max frames 97, source FPS 30, buckets disabled and no-upscale
+  enabled. `.json` and `.srt` caption-extension choices were also written
+  correctly. Input `17;33 17` became the deduplicated frame list `[17, 33]`.
+- Fitness Analyze displayed two source clips with one sub-split suggestion
+  and one below-minimum rejection. Write plan JSON saved timestamped plans
+  inside `temp/qa_full/dataset/clip_fitness`; repeating Analyze still returned
+  the two source videos. A second plan write produced a distinct filename
+  and visible success feedback.
