@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import heapq
 import html
 import json
 import math
@@ -80,7 +81,7 @@ def apply_replacements(
     whole_words: bool = True,
     regex: bool = False,
 ) -> str:
-    """Apply all pairs in one regex pass so replacement output never cascades."""
+    """Apply all pairs without rescanning replacement output."""
 
     normalized = parse_replace_pairs(list(pairs))
     if not normalized or not text:
@@ -93,10 +94,50 @@ def apply_replacements(
             seen.add(key)
             unique.append((find, replacement))
     unique.sort(key=lambda pair: len(pair[0]), reverse=True)
+    if regex:
+        # Keep user capture groups local to each expression. Wrapping all pairs
+        # in named capturing groups changes numeric backreferences and can make
+        # otherwise valid expressions fail to compile.
+        patterns = []
+        iterators = []
+        pending = []
+        flags = re.IGNORECASE if case_insensitive else 0
+        for index, (find, _) in enumerate(unique):
+            expression = rf"(?<!\w)(?:{find})(?!\w)" if whole_words else find
+            pattern = re.compile(expression, flags)
+            patterns.append(pattern)
+            iterator = pattern.finditer(str(text))
+            iterators.append(iterator)
+            match = next(iterator, None)
+            if match is not None:
+                heapq.heappush(pending, (match.start(), index, match))
+        parts: list[str] = []
+        consumed = 0
+        last_empty: int | None = None
+        while pending:
+            start, index, match = heapq.heappop(pending)
+            if start < consumed:
+                # Another pair won an overlapping match. Resume this expression
+                # at the consumed boundary so a later overlapping match survives.
+                iterators[index] = patterns[index].finditer(str(text), consumed)
+                following = next(iterators[index], None)
+                if following is not None:
+                    heapq.heappush(pending, (following.start(), index, following))
+                continue
+            end = match.end()
+            if not (start == end == last_empty):
+                parts.extend((str(text)[consumed:start], unique[index][1]))
+                consumed = end
+                last_empty = start if start == end else None
+            following = next(iterators[index], None)
+            if following is not None:
+                heapq.heappush(pending, (following.start(), index, following))
+        parts.append(str(text)[consumed:])
+        return "".join(parts)
     alternatives: list[str] = []
     replacements: dict[str, str] = {}
     for index, (find, replacement) in enumerate(unique):
-        expression = find if regex else re.escape(find)
+        expression = re.escape(find)
         if whole_words:
             expression = rf"(?<!\w)(?:{expression})(?!\w)"
         name = f"vcap_pair_{index}"
@@ -108,7 +149,7 @@ def apply_replacements(
     def replace_match(match: re.Match[str]) -> str:
         group = match.lastgroup
         replacement = replacements.get(group or "", match.group(0))
-        if regex or not case_insensitive or any(character.isupper() for character in replacement):
+        if not case_insensitive or any(character.isupper() for character in replacement):
             return replacement
 
         matched = match.group(0)

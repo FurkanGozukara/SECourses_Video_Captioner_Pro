@@ -1,4 +1,4 @@
-# Full application QA audit — 2026-09-05
+# Full application QA audit — 2026-09-05 onward
 
 Status: in progress. This log distinguishes real Chrome checks, automated
 regressions, source review, and checks that require an unavailable environment.
@@ -6,7 +6,8 @@ No claim of universal correctness is made from a passing sample.
 
 Baseline: commit `68fa49e`, app 1.7.0, Windows, Python 3.12.10,
 Gradio 6.26.0, PyTorch 2.13.0+cu130, RTX 5090 32 GB and RTX 3090 24 GB.
-Chrome opens the actual app at http://127.0.0.1:7860. Models are reused from
+Chrome opens the actual local app (initially port 7860; port 7861 from September
+6, after another application occupied 7860). Models are reused from
 the existing distribution; QA media and outputs live in this checkout.
 
 ## Coverage inventory
@@ -706,3 +707,67 @@ permutations are covered by targeted tests as well as representative UI jobs.
   9 words over 0–5.5 s; clip 2 contains 14 overlapping words over 0–4.8 s.
   The boundary word appears in both because its word interval crosses the cut.
   All regression workers exited after their jobs.
+
+### Editor regeneration with separate caption parts
+
+- Opened the two generated HEVC clips from `0085` in Chrome's editor. The
+  disabled Video caption and Audio caption fields showed the clean visual text
+  and local timestamped transcript, while the main caption remained editable.
+- `batch_0086_qwen3` regenerated the selected clip with an explicit `QA_REGEN`
+  prompt (29.23 s). The diff and visible parts updated, but its JSON sidecar
+  lost the transcript and separate-part fields. Revert restored TXT and the
+  video part but left the regenerated JSON, proving a file consistency defect.
+- Exercised both branches of the bulk confirmation. The accepted two-item
+  pass (`0087`/`0088`, 28.89/21.66 s) replaced main captions with visual text
+  alone and left the clean video parts stale. Audio files themselves survived.
+- Single and bulk regeneration now share an update path that preserves
+  existing JSON metadata, updates video/merged fields, and leaves audio intact.
+  All affected caption artifacts are captured and restored on Revert or a
+  failed regeneration; unsuccessful results are no longer counted as updates.
+  The editor recognizes `merged_caption` as the editable JSON field and reads
+  UTF-8 BOM captions. Its HEVC poster hint now describes the preview fallback
+  without claiming Chrome cannot play the format.
+- Restored the QA clips from their original run metadata for comparison.
+  `0089` (28.69 s) retained transcript fields and matched TXT, video and audio
+  parts after regeneration. Clicking Revert restored every recorded caption
+  artifact byte for byte, including JSON. The QA worker exited.
+- Regeneration had also inherited Save clips and produced nested video copies.
+  It now disables saving clips/processed media. The next scan included those
+  two existing copies, so the bulk regression covered four items (`0090`–`0093`).
+  Chrome reported 4/4 regenerated, 0 failed. Both original split captions
+  retained their exact transcript/audio data; JSON and merged/video text agreed.
+  All four existing video files and their modification times were unchanged,
+  and no additional video was created. The final worker exited.
+- A clean two-clip fixture passed Keep new (`0094`); a subsequent Revert said
+  no decision was pending and retained the new caption. Arrow navigation,
+  Ctrl+Enter approval (with automatic advance), Ctrl+Delete rejection, and
+  Ctrl+S with autosave disabled worked. TXT and merged JSON agreed after the
+  keyboard save, while transcript metadata and clean parts remained intact.
+- Min/Max token filters selected the expected caption, and a 30-token warning
+  limit produced both the warning marker and Over token limit filtering.
+  Filtered prefix/suffix/trigger edits changed only the selected scope; trigger
+  Prefix, Suffix, and None worked, as did All items, Strip edges, and Collapse
+  newlines. Regex/literal replacement previews preserved files until Apply.
+  Filtered versus all-item scope, case sensitivity, whole-word matching, and
+  malformed-regex errors behaved as shown by their 0/1/2-match previews.
+- Filter application cleared the selected media preview. It now loads the
+  selected preview, verified in Chrome with a filtered HEVC clip.
+- A valid repeated-word expression, `(\b\w+)\s+\1`, failed once it matched text:
+  the shared post-processor's extra capture group changed its backreference.
+  Regex pairs now retain their own capture numbering and are merged by match
+  position without rescanning replacement output. Chrome with Whole word on
+  previewed two replacements in `rain rain cloud cloud` and saved
+  `REPEATED REPEATED`. Replacement strings remain literal, as before.
+- `0095` was an additional default-prompt clip regeneration (52.10 s,
+  intentional 64-token cap); it was reverted. `0096` used a real truncated
+  MP4 that retained valid stream headers but failed packet decoding. Chrome
+  reported that no caption was produced and previous files were preserved.
+  Both original TXT and JSON hashes were unchanged; the 25.61 s failed job
+  unloaded its model and exited the worker.
+- `0097_qwen3` exercised the same post-processor through the main Caption tab
+  on text input. Six rules covered overlapping alternatives, numeric and named
+  backreferences, a rule that must not reprocess inserted text, and an empty
+  end-of-string match. The model returned `aaa rain rain cat cat` (6 tokens,
+  EOS); Chrome and JSON both showed the expected `XY RAIN CATEND`. The job
+  finished in 27.25 s and its worker exited. A temporary browser-control
+  connection failure was resolved without restarting a live application job.

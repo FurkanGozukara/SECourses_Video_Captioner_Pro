@@ -211,7 +211,7 @@ def _walk_caption_files(root: Path, recursive: bool) -> list[Path]:
 
 def _read_caption(path: Path) -> tuple[str, str | None]:
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return "", None
     if path.suffix.casefold() != ".json":
@@ -227,7 +227,7 @@ def _read_caption(path: Path) -> tuple[str, str | None]:
     return json.dumps(value, ensure_ascii=False, indent=2), None
 
 
-_JSON_CAPTION_KEYS = ("caption", "text", "final_caption", "description")
+_JSON_CAPTION_KEYS = ("merged_caption", "caption", "text", "final_caption", "description")
 
 
 def _sync_json_sidecar(caption_path: Path, text: str) -> None:
@@ -1217,7 +1217,7 @@ def _selection_payload(
                 if safe_path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                     image = gr.update(value=safe, visible=True)
                     placeholder = gr.update(
-                        value="Preview shows the first frame; this video is not browser-playable.",
+                        value="Preview uses the first frame for this format.",
                         visible=True,
                     )
                 else:
@@ -1469,7 +1469,7 @@ def editor_filter_handler(
         next_state,
         rows,
         page_text,
-        *_selection_payload(next_state, Path(preview_cache), load_preview=False),
+        *_selection_payload(next_state, Path(preview_cache)),
         f"Filter matched {len(matches)} item(s).",
     )
 
@@ -1665,6 +1665,8 @@ def build_editor_regeneration_spec(
         scene_detect_enabled=False,
         audio_caption_source="none",
         video_caption_source="generate",
+        save_clips=False,
+        save_processed_files=False,
     )
     override_prompt = str(override or "").strip()
     if override_prompt:
@@ -1733,7 +1735,66 @@ def rebuild_caption_parts_after_regeneration(
         },
     )
     _write_caption(caption_path, merged, item.get("caption_field"))
+    sidecar = caption_path.with_suffix(".json")
+    if sidecar.is_file():
+        try:
+            document = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            document = None
+        if isinstance(document, dict):
+            document.update(
+                video_caption=video_text,
+                audio_caption=audio_text,
+                merged_caption=merged,
+            )
+            OutputWriter().write_json(sidecar, document, pretty=True)
     return merged
+
+
+def _regeneration_file_backup(item: Mapping[str, Any]) -> dict[str, bytes | None]:
+    """Capture every caption artifact that regeneration can replace."""
+
+    caption_path = Path(str(item["caption_path"]))
+    paths = {caption_path.with_suffix(suffix) for suffix in CAPTION_EXTENSIONS}
+    paths.add(caption_path)
+    paths.update(Path(str(path)) for path in item.get("caption_formats") or [])
+    if item.get("video_caption_path"):
+        paths.add(Path(str(item["video_caption_path"])))
+    return {str(path): path.read_bytes() if path.is_file() else None for path in paths}
+
+
+def _restore_regeneration_files(files: Mapping[str, bytes | None]) -> None:
+    writer = OutputWriter()
+    for raw_path, data in files.items():
+        path = Path(raw_path)
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            writer.atomic_write(path, data)
+
+
+def _accept_regeneration_result(
+    settings: Mapping[str, Any],
+    item: dict[str, Any],
+    files: Mapping[str, bytes | None],
+) -> str:
+    """Keep new text while preserving the existing structured sidecar metadata."""
+
+    caption_path = Path(str(item["caption_path"]))
+    generated, generated_field = _read_caption(caption_path)
+    for raw_path, data in files.items():
+        if data is not None and Path(raw_path).suffix.casefold() == ".json":
+            OutputWriter().atomic_write(raw_path, data)
+    field = _read_caption(caption_path)[1] if caption_path.suffix.casefold() == ".json" else None
+    item["caption_field"] = field or generated_field or item.get("caption_field")
+    if item.get("video_caption_path"):
+        new = rebuild_caption_parts_after_regeneration(settings, item, generated)
+        item["video_caption"] = generated
+    else:
+        _write_caption(caption_path, generated, item.get("caption_field"))
+        new = generated
+    _refresh_item(item, new)
+    return new
 
 
 def build(ctx: "UiContext") -> None:
@@ -2956,6 +3017,7 @@ def build(ctx: "UiContext") -> None:
         try:
             settings = registry.values_to_dict(runtime_values)
             caption_paths = [Path(str(item["caption_path"])) for item in target_items]
+            file_backups = [_regeneration_file_backup(item) for item in target_items]
             variant_to_family(variant)
             specs: list[tuple[JobSpec, str]] = []
             for target_item in target_items:
@@ -3013,19 +3075,25 @@ def build(ctx: "UiContext") -> None:
             yield gr.skip(), html.escape(str(payload)), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
         if "error" in terminal:
             exc = terminal["error"]
+            for files in file_backups:
+                _restore_regeneration_files(files)
             ctx.app_log.error(f"Editor filtered regeneration failed: {exc}", scope="editor")
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", next_state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), []
             return
 
         changed = 0
-        for index, caption_path in zip(indices, caption_paths):
+        for index, caption_path, files, result in zip(
+            indices, caption_paths, file_backups, terminal.get("results", [])
+        ):
             try:
-                new_caption, field = _read_caption(caption_path)
+                if not int(dict(getattr(result, "counts", {}) or {}).get("done", 0)):
+                    _restore_regeneration_files(files)
+                    continue
                 item = next_state["items"][index]
-                item["caption_field"] = field or item.get("caption_field")
-                _refresh_item(item, new_caption)
+                _accept_regeneration_result(settings, item, files)
                 changed += 1
             except Exception as exc:
+                _restore_regeneration_files(files)
                 ctx.app_log.warn(f"Could not refresh regenerated caption {caption_path}: {exc}", scope="editor")
         next_state["dirty"] = False
         rows, _ = _page_rows(next_state)
@@ -3082,25 +3150,16 @@ def build(ctx: "UiContext") -> None:
         if next_state.get("dirty"):
             _write_caption(caption_path, old, item.get("caption_field"))
             next_state["dirty"], next_state["draft_caption"] = False, None
-        try:
-            old_raw = caption_path.read_text(encoding="utf-8")
-        except OSError:
-            old_raw = None
         old_field = item.get("caption_field")
-        old_video_raw: str | None = None
         video_part_path = (
             Path(str(item["video_caption_path"]))
             if item.get("video_caption_path")
             else None
         )
-        if video_part_path is not None:
-            try:
-                old_video_raw = video_part_path.read_text(encoding="utf-8")
-            except OSError:
-                old_video_raw = None
         try:
+            file_backup = _regeneration_file_backup(item)
             settings = registry.values_to_dict(runtime_values)
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
             return
         try:
@@ -3146,34 +3205,36 @@ def build(ctx: "UiContext") -> None:
             yield gr.skip(), html.escape(str(payload)), *(gr.skip() for _ in range(6))
         if "error" in terminal:
             exc = terminal["error"]
+            _restore_regeneration_files(file_backup)
             ctx.app_log.error(f"Editor regeneration failed: {exc}", scope="editor")
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
             return
         try:
-            generated, field = _read_caption(caption_path)
-            new = rebuild_caption_parts_after_regeneration(settings, item, generated)
+            result = terminal.get("result")
+            if not int(dict(getattr(result, "counts", {}) or {}).get("done", 0)):
+                _restore_regeneration_files(file_backup)
+                yield gr.skip(), "Regeneration did not produce a caption; previous files were preserved.", *(gr.skip() for _ in range(6))
+                return
+            new = _accept_regeneration_result(settings, item, file_backup)
             if video_part_path is not None:
-                item["video_caption"] = generated
                 ctx.app_log.log(
                     f"Updated {video_part_path} and rebuilt {caption_path.name} with its audio caption.",
                     scope="editor",
                 )
-            item["caption_field"] = field or item.get("caption_field")
-            _refresh_item(item, new)
             next_state["dirty"] = False
             rows, _ = _page_rows(next_state)
             backup = {
                 "caption_path": str(caption_path),
                 "old": old,
-                "raw": old_raw,
+                "files": file_backup,
                 "field": old_field,
                 "video_caption_path": str(video_part_path) if video_part_path is not None else None,
-                "video_raw": old_video_raw,
             }
             message = f"Regenerated {caption_path.name}. Review the diff, then keep or revert."
             ctx.app_log.log(message, scope="editor")
             yield diff_html(old, new), message, next_state, new, _stats_markdown(item, _state_token_limit(next_state)), rows, _counter_markdown(next_state), backup
         except Exception as exc:
+            _restore_regeneration_files(file_backup)
             ctx.app_log.error(f"Could not load regenerated caption: {exc}", scope="editor")
             yield gr.skip(), f"<span class='vc-err'>{html.escape(str(exc))}</span>", *(gr.skip() for _ in range(6))
 
@@ -3194,7 +3255,9 @@ def build(ctx: "UiContext") -> None:
         next_state = deepcopy(current or initial_state)
         try:
             path, old = Path(str(backup["caption_path"])), str(backup.get("old") or "")
-            if backup.get("raw") is not None:
+            if backup.get("files") is not None:
+                _restore_regeneration_files(backup["files"])
+            elif backup.get("raw") is not None:
                 OutputWriter().write_text(path, str(backup["raw"]))
             else:
                 _write_caption(path, old, backup.get("field"))
