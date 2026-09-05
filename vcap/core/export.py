@@ -164,7 +164,7 @@ def write_kohya_musubi_toml(
     folders = [
         folder
         for folder in discovered
-        if folder.kind == selected_kind or (folder.kind == "mixed" and selected_kind == "video")
+        if folder.kind in {selected_kind, "mixed"}
     ]
     if not folders:
         raise ValueError(f"No {selected_kind} dataset folders found in {root}")

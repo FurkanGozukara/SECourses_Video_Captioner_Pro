@@ -878,6 +878,19 @@ def _modality_for_inputs(paths: Sequence[str], fallback: str) -> str:
     )
 
 
+def _allows_text_only_caption(settings: Mapping[str, Any], input_mode: str) -> bool:
+    """Only an intentional text task may run without attached media."""
+    if str(input_mode).casefold() == "folder":
+        return False
+    if not str(settings.get("user_prompt") or "").strip():
+        return False
+    try:
+        preset = get_preset(str(settings.get("prompt_preset_id") or ""))
+    except (KeyError, ValueError):
+        return False
+    return "text" in preset.modalities
+
+
 def retry_failed_inputs(state: Mapping[str, Any] | None) -> tuple[list[str], str, str | None]:
     """Derive retry paths, output kind, and prior batch destination from result state."""
 
@@ -5891,6 +5904,7 @@ def wire(ctx: "UiContext") -> None:
             if (
                 retry_state is not None
                 or "text" not in MODEL_SPECS[family].capabilities
+                or not _allows_text_only_caption(settings, input_mode)
                 or (
                     str(settings.get("audio_caption_source", "none")) != "none"
                     and str(settings.get("video_caption_source", "generate")) == "existing"
@@ -5899,7 +5913,8 @@ def wire(ctx: "UiContext") -> None:
                 message = (
                     "No failed items are available to retry."
                     if retry_state is not None
-                    else "Select at least one input. Text-only queries require a Qwen3-Omni Instruct or Thinking model."
+                    else "Select at least one input. For a text-only query, choose Custom in Task / prompt preset "
+                    "and enter a prompt with a Qwen3-Omni Instruct or Thinking model. Folder batches require matching files."
                 )
                 yield (
                     render_progress_html(0, "Input required", message),

@@ -571,8 +571,10 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
                     interactive=False,
                     elem_id="vc_transcribe_zip_download",
                 )
-            hotkey_start = gr.Button("Start transcription hotkey", visible=False, elem_id="hk_transcribe_start")
-            hotkey_cancel = gr.Button("Cancel transcription hotkey", visible=False, elem_id="hk_transcribe_cancel")
+            # Keep shortcut targets mounted; visible=False removes them from
+            # Gradio's DOM, so the keyboard handler cannot click them.
+            hotkey_start = gr.Button("Start transcription hotkey", visible="hidden", elem_id="hk_transcribe_start")
+            hotkey_cancel = gr.Button("Cancel transcription hotkey", visible="hidden", elem_id="hk_transcribe_cancel")
             cancel_timer = gr.Timer(1.0)
             progress = progress_panel(
                 ctx,
@@ -1508,8 +1510,12 @@ def wire(ctx: "UiContext") -> None:
                 *view_values,
                 state,
                 done_hook,
-                gr.update(value="⏹ Cancel", interactive=not terminal),
-                gr.update(visible=False),
+                (
+                    gr.skip()
+                    if not terminal and (token.is_armed() or token.is_cancelled())
+                    else gr.update(value="⏹ Cancel", interactive=not terminal)
+                ),
+                gr.update(visible=False) if terminal else gr.skip(),
                 gr.update(interactive=terminal),
                 gr.update(interactive=terminal and bool(produced_files or plan.run_dir.exists())),
                 gr.update(interactive=terminal and bool(produced_files)),
@@ -1875,6 +1881,16 @@ def wire(ctx: "UiContext") -> None:
 
     ctx.states["transcribe_run_handler"] = run_transcription
     run_inputs = [*registry_components, handles.media.resolved_state, handles.media.mode_state]
+    # A previous run's ZIP must not appear to belong to a new run (including a
+    # failed/cancelled retry). Rebuild it explicitly from the new result state.
+    for trigger in (handles.start.click, handles.hotkey_start.click, handles.retry_failed.click):
+        trigger(
+            lambda: gr.update(value=None, visible=False),
+            outputs=handles.results_zip_file,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
     start_event = handles.start.click(
         run_transcription,
         inputs=run_inputs,

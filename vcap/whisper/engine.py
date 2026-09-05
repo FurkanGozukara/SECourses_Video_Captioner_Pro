@@ -508,15 +508,23 @@ class WhisperEngine:
         audio: Any,
         chunk_length: int | None,
         sampling_rate: int,
-    ) -> list[dict[str, int]]:
+    ) -> list[dict[str, float]]:
+        """Build public batched-pipeline clip windows in seconds, not samples.
+
+        faster-whisper converts explicitly supplied timestamps to samples itself;
+        its internal VAD chunk dictionaries use different units.
+        """
         total_samples = int(audio.shape[-1]) if getattr(audio, "size", 0) else 0
         if total_samples <= 0:
             return []
         if chunk_length is None or chunk_length <= 0:
-            return [{"start": 0, "end": total_samples}]
+            return [{"start": 0.0, "end": total_samples / sampling_rate}]
         chunk_samples = max(1, int(chunk_length * sampling_rate))
         return [
-            {"start": start, "end": min(start + chunk_samples, total_samples)}
+            {
+                "start": start / sampling_rate,
+                "end": min(start + chunk_samples, total_samples) / sampling_rate,
+            }
             for start in range(0, total_samples, chunk_samples)
         ]
 

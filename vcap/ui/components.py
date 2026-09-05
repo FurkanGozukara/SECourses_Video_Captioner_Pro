@@ -89,6 +89,7 @@ def pick_marker(dropdown: gr.Dropdown, key: str) -> gr.Textbox:
             "return []; }"
         ),
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )

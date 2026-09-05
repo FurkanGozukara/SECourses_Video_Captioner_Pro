@@ -492,12 +492,14 @@ HOTKEYS_HEAD = r"""
       if (send && !send.disabled) send.click();
       return;
     }
-    if (isDropdownSearch(target)) return;
+    // Function keys never enter dropdown search text. Keep them usable after
+    // selecting a model/device; Escape and arrows still belong to the dropdown.
+    if (isDropdownSearch(target) && !['F4', 'F9'].includes(event.key)) return;
     const tab = activeMainTab();
     const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
     const primary = (event.ctrlKey || event.metaKey) && !event.altKey;
 
-    if (plain && !isTextEntry(target) && event.key === 'F4') {
+    if (plain && event.key === 'F4') {
       event.preventDefault();
       window.__vcapToggleAccordions();
       return;

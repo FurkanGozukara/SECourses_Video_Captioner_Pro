@@ -133,7 +133,7 @@ def test_at_most_one_deferred_listener_per_event(app: Any) -> None:
     config = app.get_config_file()
     deferred: dict[tuple[int, str], int] = {}
     for dependency in config["dependencies"]:
-        if dependency.get("backend_fn") and dependency.get("trigger_mode") == "always_last":
+        if dependency.get("trigger_mode") == "always_last":
             for target_id, event in dependency.get("targets", []):
                 if target_id is not None:
                     deferred[(target_id, event)] = deferred.get((target_id, event), 0) + 1

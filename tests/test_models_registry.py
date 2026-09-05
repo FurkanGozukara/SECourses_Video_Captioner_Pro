@@ -9,6 +9,7 @@ import pytest
 from vcap.models import attention
 from vcap.models.offload import OffloadPlan
 from vcap.models.registry import (
+    MODELS_DIR,
     MODEL_SPECS,
     all_variant_choices,
     resolve_model_dir,
@@ -65,7 +66,9 @@ def test_variant_choices_are_complete_and_stable() -> None:
 
 
 def test_local_model_info_source_repositories() -> None:
-    models_root = Path(__file__).parents[1] / "models"
+    models_root = Path(MODELS_DIR)
+    if not models_root.is_dir():
+        pytest.skip("No local model collection is configured")
     expected = {
         "timechat": "yaolily/TimeChat-Captioner-GRPO-7B",
         "avocado": "AVoCaDO-Captioner/AVoCaDO",

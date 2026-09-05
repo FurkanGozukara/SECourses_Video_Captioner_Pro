@@ -2285,6 +2285,7 @@ def build(ctx: "UiContext") -> None:
         }
         """,
         queue=False,
+        trigger_mode="multiple",
         show_progress="hidden",
         api_visibility="private",
     )
@@ -2522,11 +2523,16 @@ def build(ctx: "UiContext") -> None:
         api_visibility="private",
     )
 
-    def mark_dirty(current: EditorState, text: str) -> tuple[EditorState, str, list[list[Any]]]:
+    def mark_dirty(current: EditorState, text: str) -> tuple[Any, ...]:
         next_state = deepcopy(current or initial_state)
         selected = next_state.get("selected_index")
         if selected is not None and 0 <= int(selected) < len(next_state.get("items") or []):
             item = next_state["items"][int(selected)]
+            # Value changes include paste, drag/drop and accessibility input.
+            # Programmatic selection/save updates already agree with the item;
+            # don't turn those into edits or restart the autosave debounce.
+            if str(text or "") == str(item.get("caption") or ""):
+                return (gr.skip(),) * 3
             _refresh_item(item, str(text or ""))
             next_state.update(dirty=True, draft_caption=str(text or ""), last_edit=time.monotonic())
             rows, _ = _page_rows(next_state)
@@ -2534,7 +2540,7 @@ def build(ctx: "UiContext") -> None:
         rows, _ = _page_rows(next_state)
         return next_state, _stats_markdown(None), rows
 
-    caption.input(
+    caption.change(
         mark_dirty, inputs=[state, caption], outputs=[state, stats, table],
         queue=False, show_progress="hidden", trigger_mode="always_last", api_visibility="private",
     )

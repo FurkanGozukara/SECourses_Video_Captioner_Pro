@@ -141,8 +141,8 @@ def test_batched_path_passes_windows_and_disables_native_vad(
     engine.transcribe(media)
 
     assert captured["clip_timestamps"] == [
-        {"start": 0, "end": 32_000},
-        {"start": 32_000, "end": 64_000},
+        {"start": 0.0, "end": 2.0},
+        {"start": 2.0, "end": 4.0},
     ]
     assert captured["batch_size"] == 4
     assert captured["vad_filter"] is False
