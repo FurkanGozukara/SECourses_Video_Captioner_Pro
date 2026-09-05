@@ -601,6 +601,8 @@ class PipelineClient:
                 self._release_after_selection_change(
                     worker_spec.model.variant_key
                 )
+                if not worker_spec.runtime.keep_model_loaded:
+                    self._stop_worker(graceful=True)
                 if self._console_active:
                     console_progress.finalize_progress_line(self._console_key)
                     self._console_active = False
@@ -753,6 +755,8 @@ class PipelineClient:
                     self._external_cancel_at = None
                     self._idle_unloaded = not keep_loaded
                 self._release_after_selection_change(used_variant)
+                if not keep_loaded:
+                    self._stop_worker(graceful=True)
                 console_progress.finalize_progress_line(console_key)
 
     def cancel(self, force: bool = False) -> None:
@@ -783,7 +787,7 @@ class PipelineClient:
         timeout_s: float = 30.0,
         lock_timeout_s: float = 2.0,
     ) -> dict[str, Any]:
-        """Release the resident model while keeping an idle worker available."""
+        """Release the resident model and its subprocess allocations."""
 
         with self._state_lock:
             if self._busy:
@@ -864,6 +868,11 @@ class PipelineClient:
                                     self._idle_unloaded = True
                                     self._resident_variant = None
                                     self._last_activity = time.monotonic()
+                            if not result.get("skipped"):
+                                # CUDA/native host allocators may retain many
+                                # GiB after every Python tensor is gone. A new
+                                # job can recreate this now-empty worker.
+                                self._stop_worker(graceful=True)
                             return result
                         if kind == "error":
                             return {
@@ -925,22 +934,7 @@ class PipelineClient:
 
     def unload(self) -> None:
         """Release the idle worker or in-app model cache."""
-
-        with self._state_lock:
-            worker = self._worker
-            busy = self._busy
-        if worker is not None and worker.is_alive() and not busy:
-            worker.send({"cmd": "unload"})
-            with self._state_lock:
-                self._idle_unloaded = True
-                self._resident_variant = None
-        elif not busy and not self.subprocess_mode:
-            from .runner import unload_cached_model
-
-            unload_cached_model()
-            with self._state_lock:
-                self._idle_unloaded = True
-                self._resident_variant = None
+        self.release_model()
 
     def ping(self, timeout_s: float = 0.6) -> dict[str, Any]:
         """Report the resident model and its block-swap summary without loading anything.
@@ -1037,18 +1031,21 @@ class PipelineClient:
                 continue
             if not unloaded and idle_for >= threshold:
                 try:
-                    worker.send({"cmd": "unload"})
+                    outcome = self.release_model(lock_timeout_s=0.0)
+                    if outcome.get("busy") or outcome.get("error"):
+                        continue
                     with self._state_lock:
                         self._idle_unloaded = True
+                        self._idle_exited = True
                         self._resident_variant = None
                         self._idle_released_variant = resident_variant
                     if resident_variant:
                         _relay_app_log(
-                            f"Idle for {idle_minutes:g} min: released {resident_variant}; "
-                            "the worker remains ready for reuse",
+                            f"Idle for {idle_minutes:g} min: released {resident_variant} "
+                            "and stopped the worker",
                             scope="models",
                         )
-                    released_variant = resident_variant
+                    continue
                 except Exception:
                     pass
             if not exited and idle_for >= threshold * 2.0:
@@ -1064,10 +1061,9 @@ class PipelineClient:
                 except Exception:
                     worker.kill_tree(grace=0.25)
 
-    def shutdown(self) -> None:
-        """Stop the idle timer and terminate the persistent worker tree."""
+    def release_session(self) -> None:
+        """Release browser-session resources while allowing a later connection."""
 
-        self._shutdown.set()
         self._stop_worker(graceful=True)
         if not self.subprocess_mode:
             try:
@@ -1076,6 +1072,12 @@ class PipelineClient:
                 unload_cached_model()
             except Exception:
                 pass
+
+    def shutdown(self) -> None:
+        """Stop the idle timer and terminate the persistent worker tree."""
+
+        self._shutdown.set()
+        self.release_session()
         if self._idle_thread is not threading.current_thread():
             self._idle_thread.join(timeout=1.0)
 

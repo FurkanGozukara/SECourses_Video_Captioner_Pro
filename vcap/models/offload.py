@@ -142,6 +142,7 @@ class BlockSwapBudget:
     allocator_slack_bytes: int = 0
     stage_towers: bool = False
     tower_bytes: int = 0
+    pageable_bytes: int = 0
 
     def summary(self) -> dict[str, Any]:
         """Return a JSON-safe summary with GiB values rounded to two decimals."""
@@ -165,6 +166,7 @@ class BlockSwapBudget:
             "total_vram_gib": round(self.total_vram_bytes / gib, 2),
             "expected_peak_gib": round(self.expected_peak_bytes / gib, 2),
             "pinned_gib": round(self.pinned_bytes / gib, 2),
+            "pageable_gib": round(self.pageable_bytes / gib, 2),
             "notes": list(self.notes),
         }
 
@@ -801,12 +803,15 @@ def plan_block_swap(
     phase_bytes = phase_staged if stage_towers else activation
     resident_weight_bytes = dense_bytes + (resident + slots) * layer_bytes
     expected_peak_bytes = resident_weight_bytes + phase_bytes + slack
-    pinned_bytes = swapped * layer_bytes
+    host_bytes = swapped * layer_bytes
+    pinned_bytes = host_bytes if plan.pin_cpu else 0
+    pageable_bytes = 0 if plan.pin_cpu else host_bytes
 
     if swapped > 0:
         summary = (
             f"Block swap: {resident}/{layer_count} decoder layers resident, {swapped} swapped "
-            f"({pinned_bytes / gib:.2f} GiB pinned), {slots} slots x {layer_bytes / mib:.0f} MiB; "
+            f"({host_bytes / gib:.2f} GiB {'pinned' if plan.pin_cpu else 'pageable'}), "
+            f"{slots} slots x {layer_bytes / mib:.0f} MiB; "
             f"GPU weights {resident_weight_bytes / gib:.1f} GiB; activation estimate "
             f"{activation / gib:.1f} GiB; allocator slack {slack / gib:.1f} GiB; reserve "
             f"{reserve / gib:.1f} GiB; expected peak {expected_peak_bytes / gib:.1f} of "
@@ -883,6 +888,7 @@ def plan_block_swap(
         total_vram_bytes=total,
         expected_peak_bytes=expected_peak_bytes,
         pinned_bytes=pinned_bytes,
+        pageable_bytes=pageable_bytes,
         mode=mode,
         notes=tuple(notes),
         allocator_slack_bytes=slack,

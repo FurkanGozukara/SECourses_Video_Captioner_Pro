@@ -1251,7 +1251,7 @@ _BLOCK_SWAP_SLIDER_MAX = max(family_layer_count(family) for family in MODEL_SPEC
 
 def _blocks_info(layer_count: int) -> str:
     return (
-        "Decoder layers kept in pinned RAM and streamed through the GPU each token; "
+        "Decoder layers kept in system RAM and streamed through the GPU each token; "
         f"0 keeps the whole decoder resident. The selected family has {int(layer_count)} layers."
     )
 
@@ -1441,7 +1441,9 @@ def block_swap_preview(
     label = "Automatic plan (estimate)" if auto else "Manual plan"
     head = f"<strong>{label}:</strong> {resident} of {total_layers} decoder layers on GPU"
     if swapped > 0:
-        head += f", <strong>{swapped} block-swapped</strong> ({budget.pinned_bytes / _GIB:.1f} GiB pinned RAM)"
+        host_gib = swapped * budget.layer_bytes / _GIB
+        host_kind = "pinned" if plan.pin_cpu else "pageable"
+        head += f", <strong>{swapped} block-swapped</strong> ({host_gib:.1f} GiB {host_kind} RAM)"
     else:
         head += ", <strong>no block swap</strong>"
     parts = [
@@ -2028,7 +2030,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             )
                             controls["blocks_to_swap"] = ctx.reg(
                                 "blocks_to_swap", blocks_to_swap, 0, section="model",
-                                description="Decoder layers kept in pinned RAM when automatic block swap is off.",
+                                description="Decoder layers kept in system RAM when automatic block swap is off.",
                                 kind="int", minimum=0, maximum=_BLOCK_SWAP_SLIDER_MAX,
                             )
                         block_swap_note = gr.Markdown(

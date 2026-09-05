@@ -318,7 +318,9 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
 
-    demo.unload(context.pipeline_client.shutdown)
+    # A tab reload disconnects its session, but this shared client must remain
+    # usable by the replacement page, including its automatic idle timer.
+    demo.unload(context.pipeline_client.release_session)
     # Intentional public inspection handles for smoke tests and future T7 tabs.
     demo.vcap_context = context  # type: ignore[attr-defined]
     demo.settings_registry = context.settings_registry  # type: ignore[attr-defined]

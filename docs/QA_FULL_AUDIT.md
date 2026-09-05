@@ -32,7 +32,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
 | Global Settings | Paths, FFmpeg, all preferences, save/reload, folder actions, theme synchronization, shortcuts reference |
 | Recover Settings | Metadata file/path/recent refresh; diff; apply all/model+prompt; path opt-in; malformed input; missing GPU |
 | System & Models | Environment/GPU/RAM/disk, worker ping/unload, model inventory, verify/download/cancel, delete confirmation, llama.cpp install/runtime, update check |
-| Distribution/docs | Windows launcher/install scripts, requirements, advertised behavior consistency; Linux-specific paths assessed separately |
+| Distribution/docs | Use the user's fresh installation as baseline; flag setup failures encountered during app use and check advertised behavior. Fresh-install and launcher reruns excluded by the user's follow-up instruction. |
 
 ## Evidence and findings
 
@@ -281,10 +281,10 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - Global empty-directory validation rejected an empty output path and retained
   the prior app_settings.json. Empty-string browser fill was unreliable in this
   interaction; keyboard Ctrl+A/Backspace visibly cleared it before submission.
-- Restart-only path test pending: saved temporary directory
-  `temp/qa_runtime_temp` and FFmpeg path `C:/ffmpeg_latest`; will verify a real
-  run and restore them. Next launch also omits VCAP_MODELS_DIR so model discovery
-  must use the persisted Global Settings models directory.
+- Restart-only path test: saved temporary directory `temp/qa_runtime_temp`
+  and FFmpeg path `C:/ffmpeg_latest`. Run `0048_qwen3` subsequently verified
+  them with no VCAP_MODELS_DIR override. Restored `temp` and automatic FFmpeg
+  discovery through Chrome, saved, restarted, and verified System environment.
 
 ### Native BF16 loading and interrupted-job recovery
 
@@ -293,11 +293,13 @@ permutations are covered by targeted tests as well as representative UI jobs.
   Worker exit code was 3221225477 / 0xC0000005. Enabling faulthandler in the
   worker captured the native stack at `torch.storage.__getitem__`, called by
   safetensors `get_tensor`; this preceded GPU inference.
-- Fixed Windows checkpoint loading to use safetensors 0.8's `pread` backend,
+- Initially changed Windows checkpoint loading to safetensors 0.8's `pread` backend,
   avoiding PyTorch's writable map of the complete 63.4 GB checkpoint. Kept
   Linux's mmap behavior and documented the minimum dependency and upgrade
   command. Upstream provides this reader specifically for memory pressure and
   slow mmap scenarios ([safetensors PR 760](https://github.com/safetensors/safetensors/pull/760)).
+  The model-switch stress check below exposed a remaining header-map reservation;
+  the final reader now uses unmapped file I/O for headers and tensors.
 - The native crash also left the item marked Running and disabled Retry failed.
   Interrupted jobs now finalize queued/running rows, preserve run and output
   destinations, and offer retry for failed paths. Completed rows and artifacts
@@ -317,11 +319,92 @@ permutations are covered by targeted tests as well as representative UI jobs.
   stereo and truncates at the deliberately small token cap; these are explicit
   output-quality limitations.
 - The successful run also validates persisted custom temporary/FFmpeg paths
-  and models discovery with no VCAP_MODELS_DIR environment override. Restoring
-  the temporary directory and automatic FFmpeg discovery remains pending.
+  and models discovery with no VCAP_MODELS_DIR environment override. The
+  temporary directory and automatic FFmpeg discovery were subsequently restored.
 - Additional Chrome checks: Changelog expanded the initial release and collapsed
   v1.7.0 correctly. Editor Min/Max chars=31 selected items 10–27 (18 matches).
   Over token limit selected all 27 eight-token captions at limit 7, showed warning
   flags, and selected zero at limit 8. A temporary narrow viewport reported no
   horizontal document overflow; screenshot capture was unsuitable for visual
   signoff, so responsive layout coverage remains incomplete. Viewport reset.
+
+### Checkpoint streaming, unload memory, and remaining Qwen variants
+
+- Instruct BF16 with explicit eager attention completed `0049_qwen3` on the
+  test-pattern image: 15 tokens, EOS, correct short caption, 97.95 s total,
+  53.5 s loading, 0.36 tok/s, 17 resident and 31 swapped decoder layers.
+- Switching to Instruct INT8 released 25.78 GiB VRAM, but private host memory
+  remained 42.76 GiB. The following INT8 load (`0050_qwen3`) failed with Windows
+  error 1455 at checkpoint open and retained about 23 GiB of GPU allocation.
+  Terminated that QA worker after the failed job to release its resources.
+- Upstream safetensors 0.8 source creates a temporary copy-on-write mapping of
+  the complete file even with `backend="pread"`, to parse the header. Replaced
+  the Windows path with a bounded reader that validates the header, dtype,
+  shapes, offsets, complete coverage, and file bounds, then reads each tensor
+  directly into owned Torch memory. Linux continues to use safetensors mmap.
+  See [upstream open implementation](https://github.com/safetensors/safetensors/blob/v0.8.0/bindings/python/src/lib.rs).
+- Chrome Retry failed completed `0051_qwen3` with the same Instruct INT8 model,
+  12 manually swapped layers, three slots, and pinning disabled: 47.79 s total,
+  15 tokens, EOS, 1.29 tok/s, correct test-pattern caption. Explicit unload freed
+  26.28 GiB VRAM, but host memory still remained at 13.40 GiB; investigation
+  continues. A removed block-swap manager now drops its packs and layer refs.
+- Thinking INT8 with automatic block swap completed `0052_qwen3`: 102.61 s,
+  128 tokens at 1.95 tok/s. The limit interrupted its reasoning, leaving an
+  empty final caption and a populated Reasoning tab. This is an incomplete
+  output, not a correct caption. Unload freed 26.88 GiB VRAM, but host private
+  memory remained 13.18 GiB. Temporary diagnostics found zero surviving Python
+  host-owner objects; checking remaining tensor storage/native memory next.
+- Fixed the plan preview/log to say pageable RAM when pinning is disabled,
+  report zero pinned bytes, and omit the inapplicable pin-budget warning.
+  Chrome displayed 10.5 GiB pageable RAM with pinning disabled.
+- Added cleanup of completed traceback frames after failed model loads, so
+  exception logging cannot keep partially loaded GPU/RAM tensors alive.
+  Further real-browser load-failure verification remains pending.
+- The user requested QA instances be terminated after use. QA workers are now
+  terminated after their completed checks; the QA app will also be stopped
+  when the complete audit finishes. GPU 1 remains outside the test scope.
+- Thinking INT8 with thinking disabled and the short-image task completed
+  `0053_qwen3`: correct caption, 37 tokens, EOS, 1.67 tok/s, 59.39 s total.
+  Keep model loaded off invoked unload automatically. Diagnostics then found
+  zero live large CPU tensor storages, yet private host memory remained 12.29 GiB.
+  Removed the temporary diagnostics after capturing this evidence.
+- Subprocess cleanup now stops the empty worker after explicit/model-selection
+  unload, idle expiry, and jobs/chat turns with Keep model loaded disabled.
+  This releases native allocations that outlive Python tensor cleanup. Models
+  remain reusable between jobs when Keep model loaded is on.
+- Thinking BF16 completed `0054_qwen3` with the new unmapped reader: 109.83 s
+  total, 49.2 s load, 25.44 GiB peak VRAM, 19 tokens at 0.35 tok/s, EOS, correct
+  test-pattern caption. Automatic placement kept 17 layers resident and 31
+  swapped (35.98 GiB pinned). Keep model loaded off stopped worker PID 17672
+  and wrapper 79548 after the run; both disappeared and GPU 0 returned to
+  2,159 MiB. This releases the 39.59 GiB of private host memory still reported
+  immediately after the in-worker unload.
+- Thinking INT4 completed `0055_qwen3`: 31.60 s, 22 tokens, 4.71 tok/s, EOS.
+  This completes real Chrome inference coverage of all 21 caption variants.
+  Used KV cache off, no-repeat n-gram size 3, thinking off, and short-image task.
+  Regex replacement changed "test pattern" to "calibration chart"; whole-word
+  `color` did not affect `colorful`/`colors`. Prefix/suffix joined with ` | `
+  correctly. TXT, JSON, and Dataset JSONL contain the processed caption.
+  SRT/VTT were selected but not produced for this image input; their timestamp
+  wrapping remains covered by the earlier video test, not this image run.
+  Explicit Unload freed 17.08 GiB VRAM and stopped the worker automatically.
+- Run `0056_qwen3` verified an empty join separator and Maximum caption
+  characters 80: the result had 77 characters and ended at a word boundary.
+  It completed in 27.55 s, 18 tokens, 7.58 tok/s with KV cache enabled.
+  Idle unload set to 0.1 minutes failed to trigger after the job. Source review
+  found browser reload called permanent client shutdown, killing its idle
+  monitor. Browser disconnect now releases session resources while keeping the
+  monitor alive; full shutdown remains separate.
+- Chrome regression after a real page reload completed `0057_qwen3` in 34.57 s,
+  33 tokens, EOS, correct image caption. With idle unload at 0.1 minutes, the
+  job ended at 20:19:40, unload completed at 20:19:47, and the worker stopped
+  by 20:19:49. The idle log confirmed release; the app had no worker child
+  process afterward. Explicit unload, post-job automatic unload, and idle
+  unload after reload have now passed with actual model jobs.
+- Load Last Values after a fresh page restored the last-used universal preset
+  (Audio SFX captions), matching the documented behavior; it restores that
+  preset rather than unsaved individual controls.
+- Per the user's follow-up, fresh-install and launcher reruns are excluded.
+  The initial missing pytest package was a development dependency installed
+  for the early baseline suite; no missing required runtime package has been
+  found during the real Chrome checks so far.

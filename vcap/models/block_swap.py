@@ -529,6 +529,12 @@ class BlockSwapManager:
         self._forward_done_event = None
         self._unregister_host_ranges()
 
+        # A removed manager may outlive the root (for example through a saved
+        # hook or traceback). Modules now own their CPU views; the manager must
+        # no longer retain whole host packs or decoder layers itself.
+        self._layer_packs.clear()
+        self._layers = ()
+
     def _attach(self, root: nn.Module) -> None:
         self._root_ref = weakref.ref(root)
         root._vcap_block_swap = True
@@ -786,6 +792,9 @@ class BlockSwapManager:
         self._kickoff_event = None
         self._forward_done_event = None
         self._unregister_host_ranges()
+
+        self._layer_packs.clear()
+        self._layers = ()
 
     def summary(self) -> dict[str, Any]:
         """Return a JSON-safe description of the swap layout."""

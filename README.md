@@ -43,7 +43,7 @@ Use **Dataset clips - video + audio captions (Qwen3-Omni + Whisper)** for genera
 
 - Windows or Linux on x86-64.
 - 64-bit Python 3.12.
-- Windows checkpoint loading requires `safetensors>=0.8.0`. Its `pread` reader streams tensors without reserving writable memory for an entire large checkpoint. For an older environment, run `python -m pip install "safetensors>=0.8.0"` after activating the app's virtual environment.
+- Windows checkpoint loading reads the safetensors header and streams individual tensors without mapping the entire checkpoint, avoiding a full-checkpoint memory commit reservation. Swapped decoder layers still require available system RAM.
 - An NVIDIA RTX 3000-series GPU or newer. Supported presets span 6 GB through 80 GB VRAM; available models and speed vary sharply by tier.
 - An NVIDIA driver and CUDA 13 environment compatible with the supplied PyTorch 2.13.0+cu130 wheels. The Windows installer also expects cuDNN 9.17 or newer.
 - Git plus `ffmpeg` and `ffprobe` available on `PATH`.
@@ -138,6 +138,12 @@ Both shell installers use `apt-get` for Git, FFmpeg, CMake, build-essential, and
 `Windows_Run_Video_Captioner_Pro.bat` opens the local app at `http://127.0.0.1:7860`, or the next free port if 7860 is taken; pass `--server-name` and `--server-port` to pin a specific address and port. The terminal prints the URL actually used. A missing model is downloaded and validated when it is first used for captioning; interrupted downloads retain their resumable `.part` state.
 
 Selecting a different model variant unloads the resident model right away, or as soon as the running job finishes. The release covers VRAM, pinned RAM, compiled graphs, and the GGUF `llama-server` process before the new model loads.
+
+In subprocess mode, unloading also stops the empty worker so native host-memory
+allocations are returned to the operating system. This applies to the Unload
+button, model changes, the idle timer, and completed jobs with Keep model loaded
+disabled. The next job starts a fresh worker; keeping a model loaded still
+reuses it between jobs.
 
 To choose models in advance or resume downloads manually, run this from the distribution folder:
 

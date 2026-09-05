@@ -99,17 +99,10 @@ def _checkpoint_path(path: str | os.PathLike[str]) -> Path:
 
 
 def _open_checkpoint(checkpoint: Path):
-    # PyTorch's writable mmap reserves Windows commit for the entire checkpoint.
-    # A 63 GB BF16 file can therefore crash in get_tensor before block swapping
-    # has loaded even its first layer. Read individual tensors without that map.
     if os.name == "nt":
-        try:
-            return safe_open(str(checkpoint), framework="pt", device="cpu", backend="pread")
-        except TypeError as exc:
-            raise RuntimeError(
-                "Windows checkpoint loading requires safetensors >= 0.8.0. "
-                'In the application virtual environment, run: python -m pip install "safetensors>=0.8.0"'
-            ) from exc
+        from .checkpoint import StreamCheckpoint
+
+        return StreamCheckpoint(checkpoint)
     return safe_open(str(checkpoint), framework="pt", device="cpu")
 
 

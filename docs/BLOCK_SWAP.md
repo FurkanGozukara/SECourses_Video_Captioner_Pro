@@ -5,10 +5,12 @@ paging. The first `R` decoder layers stay on the selected GPU. The remaining `S 
 layers live in host memory and are copied through a ring of `K` fixed GPU slots during each
 forward pass.
 
-On Windows, checkpoint reads use safetensors' `pread` backend (version 0.8.0 or
-newer). The default PyTorch memory map reserves commit for the entire checkpoint,
-which can cause a native access violation while reading a 63 GB BF16 file before
-any layers reach the GPU. Reading one tensor at a time avoids that reservation;
+On Windows, checkpoint reads use ordinary file I/O for both the validated
+safetensors header and each tensor, read directly into an owned Torch allocation.
+The default PyTorch memory map reserves commit for the entire checkpoint; even
+safetensors 0.8's `pread` backend briefly creates that map to inspect the header.
+These reservations can cause a native access violation or Windows error 1455
+while loading a large checkpoint. The unmapped reader avoids that reservation;
 the swapped layers still need enough available system RAM. Linux retains mmap.
 
 Each swapped layer is packed into a flat host byte buffer with 256-byte-aligned tensor offsets.

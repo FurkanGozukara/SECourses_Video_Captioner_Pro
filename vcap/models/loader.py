@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Callable
 import weakref
 
@@ -1393,7 +1394,6 @@ class ModelCache:
                 except (AttributeError, TypeError):
                     pass
                 return self._loaded
-            released_old = False
             if self._loaded is not None:
                 old_fields = dict(self._key or ())
                 new_fields = dict(key)
@@ -1412,21 +1412,31 @@ class ModelCache:
                     )
                 self._loaded = None
                 self._key = None
-                released_old = True
             try:
                 self._loaded = load_model(variant_key, **kwargs)
-            except Exception:
+            except Exception as exc:
                 self._loaded = None
                 self._key = None
-                if released_old:
-                    gc.collect()
-                    try:
-                        import torch
+                # A failed streaming load can already own most of a model's
+                # GPU/RAM allocations. Its traceback keeps those frame locals
+                # alive through logging and otherwise defeats cache cleanup.
+                error = exc
+                seen: set[int] = set()
+                while error is not None and id(error) not in seen:
+                    seen.add(id(error))
+                    traceback.clear_frames(error.__traceback__)
+                    error = error.__cause__ or error.__context__
+                gc.collect()
+                try:
+                    import torch
 
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+                    if callable(host_empty_cache):
+                        host_empty_cache()
+                except Exception:
+                    pass
                 raise
             self._key = key
             if self._loaded.model is not None:
