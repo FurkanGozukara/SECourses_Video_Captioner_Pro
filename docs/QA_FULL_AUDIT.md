@@ -512,3 +512,27 @@ permutations are covered by targeted tests as well as representative UI jobs.
   ranges bounded by 3.00 and 5.04 s. Raising minimum scene length to 10 s
   suppressed those cuts and displayed one 8 s range with `below minimum`
   and `will auto-split` warnings. All checks were Chrome preview actions.
+
+### Automatic quality rejection
+
+- `batch_0067_qwen3` enabled all six rules: minimum duration 2 s, maximum
+  black ratio 0.98 at luma 16, minimum motion 0.01, minimum sharpness 100,
+  required audio, maximum silence ratio 0.95 at RMS 0.001, and 8 analysis
+  frames. Four QA clips were rejected in 0.90 s with no caption model load.
+  Black/silent media measured black ratio 1, motion 0, sharpness 0, silence 1
+  and fired all four corresponding reasons. Blurred moving media measured
+  sharpness 2.10 and failed only sharpness; a clip without audio failed the
+  audio requirement; a 1 s clip failed minimum duration. Chrome showed all
+  four as skipped and retained each reason in the log and metadata.
+- Added a 4 s moving test pattern with sound. Under the same settings,
+  `batch_0068_qwen3` completed 1 clip and rejected the other 4 in 70.90 s.
+  The accepted clip measured motion 7.14, sharpness 667.77, negligible black
+  pixels, and silence ratio 0. The deliberately short 64-token generation
+  limit produced partial text; this run validates quality filtering and batch
+  continuation, not complete caption quality. The worker exited afterward.
+- A typed Quality frames value of 3 was rejected by Gradio's minimum-4 input
+  validation before a new job/model load. Corrected to 4 and set black luma
+  255 plus silence RMS 0.1, with overwrite enabled for the accepted control.
+  `batch_0069_qwen3` then measured black/silence ratios 1 and rejected it for
+  both reasons in 0.33 s. Metadata recorded all three changed parameters;
+  Chrome displayed 0 done / 1 skipped without a caption model load.
