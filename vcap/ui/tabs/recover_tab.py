@@ -45,6 +45,10 @@ _OPTIONAL_PATH_KEYS = {
     "input_path",
     "batch_input_folder",
     "batch_output_folder",
+    "whisper_input_files",
+    "whisper_input_path",
+    "whisper_batch_input_folder",
+    "whisper_batch_output_dir",
 }
 _GPU_KEYS = {"gpu_index", "gpu_indices"}
 _RECOVERY_KEY_MAP = {
@@ -155,6 +159,7 @@ def _recovery_settings_details(
     document = _metadata_document(metadata)
     source = _map_recovery_keys(extract_metadata_settings(document), registry)
     coerced, warnings = registry.coerce(source)
+    metadata_keys = {entry.key for entry in registry.entries() if entry.in_metadata}
     allowed = {
         entry.key
         for entry in registry.entries()
@@ -171,7 +176,10 @@ def _recovery_settings_details(
     for key in source:
         if key not in allowed or key not in coerced:
             continue
-        if key in _ALWAYS_SKIPPED_KEYS:
+        # Older caption runs included transient controls despite their registry
+        # flags. Restoring an empty/deleted personal-prompt selection would put
+        # an invalid value in the dropdown and break subsequent UI actions.
+        if key in _ALWAYS_SKIPPED_KEYS or key not in metadata_keys:
             skipped.append(key)
             continue
         if key in _OPTIONAL_PATH_KEYS and not restore_paths:

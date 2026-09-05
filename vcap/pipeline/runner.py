@@ -3097,7 +3097,7 @@ def _existing_video_caption(
         seen.add(identity)
         if not candidate.is_file():
             continue
-        text = candidate.read_text(encoding="utf-8", errors="replace")
+        text = candidate.read_text(encoding="utf-8-sig", errors="replace")
         if candidate != paths.video:
             OutputWriter().write_text(paths.video, text)
             emitter.log(
@@ -3429,7 +3429,12 @@ def _render_and_write_unit(
                 emitter.log(f"Could not remove stale audio caption {paths.audio}: {exc}", "warning", "dataset_captions")
         emitter.log(
             (
-                f"No speech detected in {filename}; merged caption is the video caption only"
+                f"No speech detected in {filename}; "
+                + (
+                    "merged caption is the video caption only"
+                    if spec.audio_caption.write_merged and allow_merged
+                    else "audio caption skipped"
+                )
                 if no_speech
                 else f"Audio caption template rendered empty for {filename}; merged caption uses video only"
             ),
@@ -3671,12 +3676,15 @@ def _run_merge_phase(
             result.merged_caption_path = outputs.get("merged_caption")
             result.audio_caption_source = spec.audio_caption.source
             if existing_missing:
-                result.message = f"No existing video caption for {entry.path.name if entry.path else entry.stem}; audio caption saved separately"
+                audio_status = "audio caption saved separately" if audio_text else "no audio caption produced"
+                result.message = f"No existing video caption for {entry.path.name if entry.path else entry.stem}; {audio_status}"
             else:
                 result.message = (
                     f"Captioned {len(records)} segment(s); audio caption saved"
                     if audio_text
                     else f"Captioned {len(records)} segment(s); merged caption uses video only"
+                    if spec.audio_caption.write_merged
+                    else f"Captioned {len(records)} segment(s); video caption saved without an audio part"
                 )
             if no_speech:
                 for record in records:

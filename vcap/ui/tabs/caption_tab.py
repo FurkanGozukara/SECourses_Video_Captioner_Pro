@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from collections.abc import Mapping
@@ -2911,7 +2911,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         normalize_clip = gr.Checkbox(
                             value=False,
                             label="Normalize clip",
-                            info="Create deterministic H.264, exact-FPS, model-divisible media before inference.",
+                            info="Use the selected video codec, exact FPS, and model-divisible dimensions before inference.",
                         )
                         controls["normalize_clip"] = ctx.reg(
                             "normalize_clip", normalize_clip, False, section="preprocessing",
@@ -6057,6 +6057,7 @@ def wire(ctx: "UiContext") -> None:
                     raise
                 output_kwargs.pop(unknown, None)
         spec = JobSpec.from_settings(settings, items, output)
+        spec = replace(spec, settings=ctx.settings_registry.metadata_subset(spec.settings))
         set_mode = ctx.states.get("set_subprocess_mode")
         if callable(set_mode):
             set_mode(bool(settings.get("subprocess_mode", True)))

@@ -536,3 +536,122 @@ permutations are covered by targeted tests as well as representative UI jobs.
   `batch_0069_qwen3` then measured black/silence ratios 1 and rejected it for
   both reasons in 0.33 s. Metadata recorded all three changed parameters;
   Chrome displayed 0 done / 1 skipped without a caption model load.
+
+### Caption cancellation and resume
+
+- `batch_0070_qwen3` requested a long description of two QA images. The
+  confirmation remained visible through streaming updates, expired safely
+  without stopping the job, and its Keep running action dismissed it while
+  generation continued. Yes, cancel stopped the second image after the first
+  had completed: 1 done / 1 cancelled in 124.58 s. The completed caption
+  remained available; the cancelled partial generation was not saved as a
+  finished caption. The worker exited and released its model allocation.
+- Added a third QA image and disabled overwrite. `batch_0071_qwen3` skipped
+  the existing caption, then Yes, cancel stopped the active image and marked
+  the queued image `Cancelled before processing`: 1 skipped / 2 cancelled in
+  33.40 s. Retry failed correctly remained disabled because neither was a
+  failure. Chrome showed the cancelled terminal state and Results ZIP.
+- Restarting with a short prompt and the same overwrite-off folder settings
+  resumed the unfinished files in `batch_0072_qwen3`: 2 done / 1 skipped in
+  36.04 s, both generations ending at EOS. The original caption's SHA-256
+  and modification time stayed unchanged through cancellation and resume.
+  All three jobs used only GPU 0 and Keep model loaded off.
+
+### Split transcripts, context carry, summary, and HEVC
+
+- `0073_qwen3` processed the 11 s speech-video fixture as two precise fixed
+  clips, with no overlap, libx265 / CRF 25 / veryfast, saved clips,
+  normalization at 2 FPS, 48 kHz normalized audio, and a 524,288 total pixel
+  cap. Both clips and the separate summary ended at EOS; the job completed
+  in 60.17 s and the worker exited. A typed context-carry size of 8 was
+  rejected before job creation; the corrected supported minimum was 10.
+- Whisper `base.en` was absent initially, downloaded automatically (147.8 MB),
+  loaded on isolated GPU 0, and transcribed the complete JFK sentence with
+  22 words. All six sidecars were written with `_qa_all_speech` suffix.
+  An explicit `{{TRANSCRIPT}}` token worked with automatic prompt appending
+  disabled: the two clips recorded different local speech windows (9 and
+  14 words, sharing the boundary word), both marked injected. The captions
+  quoted portions of the supplied speech, not every transcribed word.
+- Context carry used 10 words and custom `QA_PREVIOUS: {{CONTEXT}}` wording;
+  the run log confirmed application to clip 2. The custom summary prompt
+  produced `QA_SUMMARY` plus two timestamped chapter lines (143 tokens),
+  saved in `_summary.txt`, the output JSON, and metadata. The caption table
+  settled at 259 total tokens, including the two captions and summary.
+- The pixel-cap log reported reduction from 262,144 to 131,072 pixels per
+  sampled frame. Normalized artifacts were HEVC at 672×384 / exactly 2 FPS
+  with AAC 48 kHz; persistent splits were HEVC at source geometry/cadence.
+  Chrome played the second HEVC clip to its 5.4945 s end without an error.
+- The split verifier warned that clip 2 contained 161 rather than 165 frames.
+  Artifact inspection traced this to the fixture: its source video contains
+  326 frames and ends at 10.8775 s, while audio/container duration is 11 s.
+  The two outputs preserve all 326 source frames (165 + 161).
+- Normalization correctly honored libx265, exposing an outdated H.264-only
+  help string. Updated it to describe the selected codec, FPS, and dimensions;
+  the corrected text was verified in Chrome after restart. Input previews use
+  Gradio's conservative codec check and therefore show an HEVC first frame,
+  although this Chrome can play HEVC in the clip gallery. Corrected the input
+  note to describe that fallback without claiming HEVC is unplayable; verified
+  the new note on a recovered HEVC folder after another restart.
+
+### Settings recovery
+
+- Loaded `0073_qwen3` through Recent run: 43 stored values differed after a
+  restart. Model + prompt only restored the Custom prompt while preserving
+  pipeline defaults (128 frames, normalization off, 16 kHz). Apply to UI
+  restored 8 frames, fixed 5.5 s clips, libx265, normalization, 48 kHz, and
+  10-word context carry. Without path opt-in, the input remained empty.
+- Full recovery exposed an invalid-dropdown bug: caption metadata included
+  the transient personal-prompt selection despite its registry exclusion.
+  Recovery coerced its empty value to an invalid choice, breaking subsequent
+  metadata Load/upload and other registry-wide actions. Caption runs now
+  honor `in_metadata`; recovery also ignores excluded controls from older
+  files. Extended the input/output path opt-in to all four Whisper path fields.
+- After restart, applied the same old metadata, uploaded a modified copy,
+  and loaded/applied it successfully. The fixture contained an obsolete
+  personal-prompt name, unavailable GPU 9999, and distinct Caption/Whisper
+  and machine paths. Chrome skipped the obsolete selection, warned and
+  defaulted the unavailable GPU to GPU 0, and removed 9999 from the GPU list.
+  GPU 1 remained unselected. Whisper paths stayed empty without opt-in and
+  restored correctly when opted in. Outputs, temp, models, logs, and FFmpeg
+  machine paths remained unchanged, as verified in Global Settings.
+- New `batch_0074_qwen3` metadata excludes personal-library controls, chat
+  controls, logs/FFmpeg paths, and theme. Cleared the upload, refreshed Recent
+  run, loaded `batch_0077_qwen3` using the run-folder path, and applied it
+  without an error (zero settings differences). Recovery also restored this
+  layout after the next application restart.
+
+### Existing video captions and Whisper audio parts
+
+- `batch_0074_qwen3`: three clips with existing captions, Whisper-only audio
+  source, timestamped transcript style, custom filename/audio/merge templates,
+  and placeholder policy. Completed in 3.74 s with three audio parts and
+  merged captions, without loading the main caption model. All six transcript
+  sidecars were written even with stage 7 disabled, as documented for stage 8.
+  Whisper base.en without VAD hallucinated a period on the silent clip;
+  this is not counted as correct transcription of silence.
+- `batch_0075_qwen3` reran with overwrite off: three skipped in 0.09 s,
+  with no caption-model load. `batch_0076_qwen3` enabled Silero VAD, selected
+  one-segment-per-line rendering, and overwrote the layout in 3.66 s. Silence
+  produced zero words and exactly `QA_NO_SPEECH` in its audio part. The
+  template's empty sound token collapsed without residual template syntax.
+- A Windows UTF-8 BOM in the existing silent caption leaked into the merged
+  text. Changed existing-caption reading to UTF-8 with optional BOM removal;
+  the same Chrome overwrite run produced clean video and merged parts.
+  `batch_0077_qwen3` repeated the merge in 3.45 s; all 12 TXT artifacts were
+  byte-identical, proving that existing clean video parts prevent duplicate
+  audio appending.
+- `batch_0078_qwen3` used a fresh output directory, plain-paragraph speech,
+  merged files off, skip-empty policy, and an additional clip without a
+  video caption. Completed four items in 4.68 s. There were three video
+  parts and three audio parts, no main caption TXT files, no silent audio
+  part, and no fabricated video part for the orphan clip. The orphan's
+  speech was saved separately with a diagnostic message.
+- `batch_0079_qwen3` with overwrite off skipped the three existing audio
+  parts and processed the silent file again. This matches the documented
+  existing-caption skip rule, which requires an audio part; a skipped empty
+  audio part therefore does not suppress future transcription attempts.
+- Corrected messages that claimed a merged caption was written in parts-only
+  mode, and that audio had been saved when both parts were absent.
+  `batch_0080_qwen3` verified both cases after restart: two silent items,
+  0 audio captions / 2 no-speech in 1.98 s, with accurate per-item messages.
+  These jobs released their workers after completion.

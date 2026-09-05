@@ -787,8 +787,8 @@ def _preview_updates(paths: list[str]) -> tuple[Any, ...]:
             video_codec = info.video_codec or "unknown video"
             audio_codec = info.audio_codec or "no audio"
             preview_note = (
-                "Preview shows the first frame: "
-                f"{container}/{video_codec}/{audio_codec} is not browser-playable. "
+                "Input preview uses the first frame for this format "
+                f"({container}/{video_codec}/{audio_codec}). "
                 "Trim range still works."
             )
             details += f"<br><span class='vc-help'>{html.escape(preview_note)}</span>"
