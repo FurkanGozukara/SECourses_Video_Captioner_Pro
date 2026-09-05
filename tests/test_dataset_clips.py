@@ -638,7 +638,7 @@ def test_captioner_audio_is_split_into_at_most_30_second_windows(
         extracted.append((float(kwargs["start"]), float(kwargs["end"])))
         target = Path(dst)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"wav")
+        _write_wav(target, 0.02)
         assert kwargs["sample_rate"] == 16_000
         assert kwargs["mono"] is True
         assert isinstance(kwargs["cancel_token"], CancelToken)

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+import wave
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -798,10 +799,16 @@ def _metadata_finish_reason(items: Sequence[ItemResult]) -> str | list[str] | No
     reasons: list[str] = []
     for item in items:
         for segment in item.segments:
-            usage = segment.get("usage")
-            reason = usage.get("finish_reason") if isinstance(usage, Mapping) else None
-            if reason not in {None, ""} and str(reason) not in reasons:
-                reasons.append(str(reason))
+            usages = [segment.get("usage")]
+            usages.extend(
+                window.get("usage")
+                for window in segment.get("sound_caption_windows", [])
+                if isinstance(window, Mapping)
+            )
+            for usage in usages:
+                reason = usage.get("finish_reason") if isinstance(usage, Mapping) else None
+                if reason not in {None, ""} and str(reason) not in reasons:
+                    reasons.append(str(reason))
     if not reasons:
         return None
     return reasons[0] if len(reasons) == 1 else reasons
@@ -3231,6 +3238,22 @@ def _finalize_sound_text(spec: JobSpec, text: str) -> str:
     )
 
 
+def _pcm_window_is_silent(path: Path) -> bool:
+    """Recognize digital silence in the PCM16 WAV made by extract_audio.
+
+    Do not apply a loudness threshold: even very quiet nonzero sound should
+    still reach the sound captioner.
+    """
+
+    with wave.open(str(path), "rb") as audio:
+        if audio.getsampwidth() != 2 or audio.getcomptype() != "NONE":
+            return False
+        while chunk := audio.readframes(65_536):
+            if any(chunk):
+                return False
+    return True
+
+
 def _caption_sound_windows(
     spec: JobSpec,
     session: _ModelSession,
@@ -3242,6 +3265,8 @@ def _caption_sound_windows(
     cancel: CancelToken,
     *,
     unit_label: str,
+    progress: Any = None,
+    window_records: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Caption one audio timeline in prompt-free windows no longer than 30 seconds."""
 
@@ -3265,9 +3290,8 @@ def _caption_sound_windows(
         f"{unit_label}: {len(windows)} Captioner audio window(s), maximum 30 s each",
         scope="sound_captions",
     )
-    from vcap.models.base import Callbacks, MediaInput, PromptSpec as ModelPromptSpec
+    from vcap.models.base import MediaInput, PromptSpec as ModelPromptSpec
 
-    captioner = session.ensure()
     captioner_model = MODEL_SPECS["qwen3_omni_captioner"]
     work_dir.mkdir(parents=True, exist_ok=True)
     texts: list[str] = []
@@ -3283,15 +3307,40 @@ def _caption_sound_windows(
             end=window_end,
             cancel_token=cancel,
         )
-        result = captioner.caption(
+        window_record: dict[str, Any] = {
+            "index": index,
+            "start_s": window_start,
+            "end_s": window_end,
+        }
+        if _pcm_window_is_silent(audio_path):
+            window_record.update(status="skipped", reason="digital_silence", usage={"new_tokens": 0})
+            if window_records is not None:
+                window_records.append(window_record)
+            emitter.log(
+                f"{unit_label}: sound window {index}/{len(windows)} is digital silence; skipped before model loading",
+                scope="sound_captions",
+            )
+            continue
+
+        def report_window(*args: Any) -> None:
+            if not callable(progress):
+                return
+            message = str(args[0]) if args else "Generating sound caption"
+            data = dict(args[1]) if len(args) > 1 and isinstance(args[1], Mapping) else {}
+            progress(
+                f"{unit_label} · sound window {index}/{len(windows)}: {message}",
+                {**data, "audio_window_index": index, "audio_window_total": len(windows)},
+            )
+
+        result = _caption_with_oom_recovery(
+            spec,
+            captioner_model,
+            session,
+            ModelPromptSpec(),
             MediaInput(path=audio_path, kind="audio"),
-            prompt=ModelPromptSpec(),
-            gen=_model_gen(spec),
-            pre=_model_pre(
-                replace(spec, preprocess=replace(spec.preprocess, max_frames=0, use_audio_in_video=False)),
-                captioner_model,
-            ),
-            cb=Callbacks(cancel=cancel),
+            report_window,
+            cancel,
+            emitter,
         )
         if isinstance(result, str):
             value = result
@@ -3299,6 +3348,14 @@ def _caption_sound_windows(
             if getattr(result, "cancelled", False):
                 raise CancelledError("Sound caption generation cancelled")
             value = str(getattr(result, "text", "") or "")
+        window_record.update(
+            status="done",
+            usage=_record_value(getattr(result, "usage", None)),
+            timing=_record_value(getattr(result, "timing", None)),
+            peak_vram_gb=float(getattr(result, "peak_vram_gb", 0.0) or 0.0),
+        )
+        if window_records is not None:
+            window_records.append(window_record)
         if value.strip():
             texts.append(value.strip())
     return _finalize_sound_text(spec, " ".join(texts)), len(windows)
@@ -3527,6 +3584,19 @@ def _run_sound_caption_phase(
         media_path = Path(str(record["media_path"]))
         unit_work = run_dir / ".work" / "sound_captions" / f"{entry.result_index:04d}_{int(record.get('index', 1)):04d}"
         result.sound_caption_model = variant
+        window_records: list[dict[str, Any]] = []
+
+        def sound_progress(message: str, data: Mapping[str, Any]) -> None:
+            emitter.progress(
+                entry.tracker_index,
+                entry.result_index,
+                message,
+                0.86 + 0.08 * (position - 0.5) / max(1, len(units)),
+                step_index=7,
+                data={"phase": "sound_captions", **data},
+            )
+
+        sound_started = time.perf_counter()
         try:
             sound, windows = _caption_sound_windows(
                 sound_spec,
@@ -3538,6 +3608,8 @@ def _run_sound_caption_phase(
                 emitter,
                 cancel,
                 unit_label=media_path.name,
+                progress=sound_progress,
+                window_records=window_records,
             )
             record["sound_caption"] = sound
             record["audio_windows"] = windows
@@ -3555,6 +3627,17 @@ def _run_sound_caption_phase(
                 "sound_captions",
             )
         finally:
+            result.elapsed += time.perf_counter() - sound_started
+            record["sound_caption_windows"] = window_records
+            record["sound_caption_usage"] = {
+                key: sum(int(window.get("usage", {}).get(key, 0) or 0) for window in window_records)
+                for key in ("prompt_tokens", "new_tokens")
+            }
+            sound_session.peak_vram_gb = max(
+                sound_session.peak_vram_gb,
+                max((float(window.get("peak_vram_gb", 0.0)) for window in window_records), default=0.0),
+            )
+            result.peak_vram_gb = max(result.peak_vram_gb, sound_session.peak_vram_gb)
             sound_session.sample_shared_gpu_memory()
             shutil.rmtree(unit_work, ignore_errors=True)
     if (

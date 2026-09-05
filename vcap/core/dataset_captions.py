@@ -99,7 +99,7 @@ def transcript_segments(
     start_s: float = 0.0,
     end_s: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Return overlapping Whisper segments with timestamps local to the window."""
+    """Return clip-local speech, trimming words as well as their timestamps."""
 
     raw_segments: Iterable[Any]
     if source is None:
@@ -119,6 +119,20 @@ def transcript_segments(
         absolute_end = max(absolute_start, float(_segment_value(segment, "end", absolute_start) or absolute_start))
         if absolute_end <= window_start or absolute_start >= window_end:
             continue
+        words = _segment_value(segment, "words", ()) or ()
+        if words:
+            overlapping_words = [
+                word for word in words
+                if float(_segment_value(word, "end", 0.0) or 0.0) > window_start
+                and float(_segment_value(word, "start", 0.0) or 0.0) < window_end
+            ]
+            if not overlapping_words:
+                continue
+            text = "".join(str(_segment_value(word, "word", "") or "") for word in overlapping_words).strip()
+            if not text:
+                continue
+            absolute_start = max(0.0, float(_segment_value(overlapping_words[0], "start", absolute_start)))
+            absolute_end = max(absolute_start, float(_segment_value(overlapping_words[-1], "end", absolute_end)))
         local_start = max(absolute_start, window_start) - window_start
         local_end = min(absolute_end, window_end) - window_start
         result.append({"start": local_start, "end": max(local_start, local_end), "text": text})

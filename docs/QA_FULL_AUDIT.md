@@ -655,3 +655,54 @@ permutations are covered by targeted tests as well as representative UI jobs.
   `batch_0080_qwen3` verified both cases after restart: two silent items,
   0 audio captions / 2 no-speech in 1.98 s, with accurate per-item messages.
   These jobs released their workers after completion.
+
+### Sound windows, progress, and generated caption parts
+
+- `batch_0081_qwen3` used existing video captions and auto-selected Captioner
+  INT4 for a 35 s storm recording, an audio-free video, and digital silence.
+  The long recording split into 30 s and 5 s windows; no-audio returned empty.
+  The silent fixture decoded to exactly 64,000 zero samples, but was sent to
+  Captioner and produced 512 tokens of invented synthesizer/music description.
+  The run took 145.88 s. The sound phase also lacked live progress and usage
+  accounting, leaving the UI at a loading/phase message and zero final tokens.
+- Added a PCM16 exact-zero check after extraction and before model loading.
+  Quiet nonzero samples remain eligible. Sound windows now use the common
+  generation path and forward window number, token progress, speed, and
+  context to the UI. Metadata records each window's bounds, usage, timing,
+  finish reason, and peak memory; item totals include sound generation.
+  Updated an existing mock-extraction fixture to write valid PCM WAV data.
+  Feature verification remained through Chrome, without running a backend suite.
+- `batch_0082_qwen3` overwrote the same silent/no-audio outputs in 0.36 s:
+  0 audio captions / 2 no-speech, no Captioner model load, the old invented
+  silent audio part removed, and merged files equal to the clean video parts.
+- `batch_0083_qwen3` used the 35 s recording with an intentional 128-token
+  limit per window. Chrome displayed window 2/2 with streaming tokens,
+  12.8 tok/s, and context usage, then 256 total tokens. Metadata recorded
+  0–30 and 30–35 s windows, 128 tokens each, and `length` finish reasons.
+  The 46.31 s run validates windowing and progress; both texts are partial.
+  An item timing of 0.0 s exposed a second accounting omission, fixed by
+  including sound-phase time and peak memory in the item result.
+- `0084_qwen3` generated two precise 5.5 s HEVC clips with Instruct INT4,
+  transcribed speech using base.en/VAD in memory, then switched to explicitly
+  selected Captioner GGUF Q4. The Instruct model unloaded before GGUF loading.
+  Video generations used 18 + 33 tokens; sound used 470 + 426, all ending at
+  EOS. Chrome displayed 947 tokens and 54.9 s item time, consistent with
+  metadata (54.85 s item / 57.50 s job, 25.53 GiB peak). Separate video/audio
+  parts and merged captions exist for both clips and the combined item.
+  Empty stage-7 format selection produced no transcript sidecars.
+- Sound descriptions are not reliable ground truth: the storm output included
+  unsupported metallic-friction claims, and GGUF speech descriptions inferred
+  acoustic spaces, historical context, and recording provenance beyond the
+  observable speech. Successful execution and EOS are not accuracy guarantees.
+- `0084` exposed a transcript-boundary defect: stage-8 audio parts copied an
+  entire overlapping Whisper sentence into both clips despite available word
+  timestamps. The prompt-injection text already selected local words correctly.
+  Updated caption-part rendering to select overlapping words and shift their
+  timestamps to the clip origin, retaining segment fallback when word timing
+  is unavailable.
+- `0085_qwen3` repeated the split workflow with Whisper-only audio parts and
+  timestamped rendering: 40.36 s, two video generations ending at EOS, no
+  sidecars, and correct local transcript files. Clip 1 contains the opening
+  9 words over 0–5.5 s; clip 2 contains 14 overlapping words over 0–4.8 s.
+  The boundary word appears in both because its word interval crosses the cut.
+  All regression workers exited after their jobs.

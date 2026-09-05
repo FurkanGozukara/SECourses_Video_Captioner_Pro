@@ -6312,9 +6312,10 @@ def wire(ctx: "UiContext") -> None:
                     break
                 usage_tokens = 0
                 for segment in result_item.segments:
-                    usage = segment.get("usage") if isinstance(segment, Mapping) else None
-                    if isinstance(usage, Mapping):
-                        usage_tokens += int(usage.get("new_tokens", usage.get("completion_tokens", 0)) or 0)
+                    for usage_key in ("usage", "sound_caption_usage"):
+                        usage = segment.get(usage_key) if isinstance(segment, Mapping) else None
+                        if isinstance(usage, Mapping):
+                            usage_tokens += int(usage.get("new_tokens", usage.get("completion_tokens", 0)) or 0)
                 if isinstance(result_item.summary_usage, Mapping):
                     usage_tokens += int(result_item.summary_usage.get("new_tokens", 0) or 0)
                 item_rows[index][5] = usage_tokens
