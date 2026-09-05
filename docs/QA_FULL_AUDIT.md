@@ -206,3 +206,21 @@ permutations are covered by targeted tests as well as representative UI jobs.
   [v3](https://huggingface.co/distil-whisper/distil-large-v3),
   [v3.5](https://huggingface.co/distil-whisper/distil-large-v3.5).
   Catalogue display regression pending restart.
+- TimeChat INT8 scene mode (`0033_timechat`) detected and captioned five scenes
+  at 0–5.105, 5.105–9.510, 9.510–11.812, 11.812–16.750, 16.750–20.020 s.
+  Completed in 124.2 s, final decode 26.22 tok/s, EOS. The 1,024-token budget
+  permitted native structured output conversion to motion paragraphs.
+  Saved five clips; the corrected empty-state message disappeared in Chrome.
+- TimeChat INT4 + explicit SDPA + Inductor default ran in Chrome
+  (`0034_timechat`): trim 0–5 s, keyframe preview, normalize, Wan trainer mode.
+  Completed 2 segments in 142.3 s, final decode 21.22 tok/s, 512-token caps;
+  no runtime compilation fallback. Keyframe preview showed 0.00 and 4.14 s.
+  Quality failure: first caption invented a close-up person wearing a hoodie.
+  Trainer splitting also produced an overlap tail of only 0.5 s; inspect trim
+  and frame-quantization behavior before final signoff.
+- Editor regex `item0[12]` narrowed the 27-item queue to two. Approving item01
+  advanced to item02; Reject set item02 rejected. Rejected filter showed only
+  item02. Invalid regex `[` produced an explicit unterminated-character-set
+  message while retaining the existing queue.
+- All three corrected Distil-Whisper large descriptions displayed English
+  speech recognition in Chrome after restart.

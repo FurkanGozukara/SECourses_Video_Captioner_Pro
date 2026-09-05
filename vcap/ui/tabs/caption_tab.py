@@ -6091,8 +6091,7 @@ def wire(ctx: "UiContext") -> None:
             gr.update(visible=False),
             gr.update(value=[], visible=False),
             gr.update(
-                value='No clips were saved for this run. Enable "Save produced clips" in '
-                "Processing Pipeline → 5. Scene detection & splitting.",
+                value="Saved clips will appear here when the run finishes.",
                 visible=True,
             ),
             {},
@@ -6269,7 +6268,13 @@ def wire(ctx: "UiContext") -> None:
                 reasoning_text,
                 gr.update(visible=bool(reasoning_text)),
                 gr.update(value=gallery, visible=bool(gallery)),
-                gr.update(visible=not bool(gallery)),
+                gr.update(
+                    value="" if gallery else (
+                        'No clips were saved for this run. Enable "Save produced clips" in '
+                        "Processing Pipeline → 5. Scene detection & splitting."
+                    ),
+                    visible=not bool(gallery),
+                ),
                 state,
                 _job_done_payload(_job_done_message(result), settings),
                 gr.update(value="⏹ Cancel", interactive=False),
