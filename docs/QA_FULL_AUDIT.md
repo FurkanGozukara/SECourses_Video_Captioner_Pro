@@ -873,3 +873,38 @@ permutations are covered by targeted tests as well as representative UI jobs.
   English and the expanded request, with no unresolved ordinary variable.
   The worker exited after the job. The QA app now uses port 7862 because other
   applications occupied 7860 and 7861 after the earlier QA process stopped.
+
+
+### Individual task catalogue and immediate media updates
+
+- Selected all 39 Qwen3 Instruct task presets through Chrome, covering the
+  video/audio, audio-only, image-only, and Custom menus. Every selection showed
+  its intended rendered request and generation limit; deterministic presets
+  disabled sampling. Custom cleared both prompt fields. These are UI/default
+  checks, not 39 separate accuracy benchmarks.
+- All eight ordinary template variables passed direct editing checks: Turkish
+  caption language, very detailed length, Unicode trigger `qaürx`, subject
+  class `robot`, German source, Japanese target, an avoid list, and extra
+  instructions. Avoid text became a complete sentence, changes survived task
+  switches, and the Whisper-guided template retained `{{TRANSCRIPT}}` for its
+  later per-clip substitution.
+- Found an immediate media-filter defect: selecting an audio file updated its
+  waveform and details but left the video task catalogue visible, hiding the
+  audio-only tasks. Changing input tabs did not repair it. The installed
+  Gradio 6 client omits server-side State change notifications for non-queued
+  callbacks. Modality and duration are now hidden ordinary components so their
+  UI change events refresh prompt choices and token/offload estimates.
+- After restarting, entering `jfk.wav` immediately exposed detailed audio,
+  sound events, music analysis/appreciation, and effects/instruments. Replacing
+  it with `image.png` immediately exposed image dense/short, OCR, description,
+  and Booru tags. The intentional previous task remained selected with the
+  per-item fallback explanation when incompatible with the new input.
+- Switching to the 11-second audiovisual fixture restored the video tasks and
+  updated the live estimate to 2,959 input tokens / 22 frames. Setting the frame
+  cap to eight immediately changed the estimate to 1,167 tokens / eight frames.
+- `0114_qwen3`: Booru tags on the test-pattern image generated 512 tokens to
+  the length limit in 74.6 s, 11.52 tok/s. The UI and saved JSON showed a
+  normalized array matching the comma-separated TXT, and the worker exited.
+  Output quality failed: plausible opening tags degraded into unsupported
+  `partial_*` associations, including sound tags for a still image. This is a
+  successful format-conversion check, not an accurate tag set.

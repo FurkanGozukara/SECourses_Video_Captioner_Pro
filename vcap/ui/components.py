@@ -681,8 +681,8 @@ class MediaInputHandles:
     gallery: gr.HTML
     resolved_state: gr.State
     mode_state: gr.State
-    modality_state: gr.State
-    duration_state: gr.State
+    modality_state: gr.Textbox
+    duration_state: gr.Number
     save_next_to_source: Any = None
     existing_extension_state: Any = None
     scan_fn: Callable[..., tuple[Any, ...]] | None = None
@@ -1108,8 +1108,11 @@ def media_input_block(
 
     resolved_state = gr.State([])
     mode_state = gr.State("upload")
-    modality_state = gr.State("video_audio")
-    duration_state = gr.State(0.0)
+    # The Gradio 6 non-queued client response does not dispatch State.change.
+    # These values drive prompt filtering and live token/offload estimates, so
+    # carry them in hidden components whose ordinary change events do fire.
+    modality_state = gr.Textbox(value="video_audio", visible=False)
+    duration_state = gr.Number(value=0.0, visible=False)
     existing_extension_state = gr.State(str(default_existing_extension or ".txt"))
     ctx.states.update(
         {
