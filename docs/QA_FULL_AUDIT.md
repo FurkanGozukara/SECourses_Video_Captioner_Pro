@@ -33,19 +33,18 @@ permutations are covered by targeted tests as well as representative UI jobs.
 | Global Settings | Paths, FFmpeg, all preferences, save/reload, folder actions, theme synchronization, shortcuts reference |
 | Recover Settings | Metadata file/path/recent refresh; diff; apply all/model+prompt; path opt-in; malformed input; missing GPU |
 | System & Models | Environment/GPU/RAM/disk, worker ping/unload, model inventory, verify/download/cancel, delete confirmation, llama.cpp install/runtime, update check |
-| Distribution/docs | Use the user's fresh installation as baseline; flag setup failures encountered during app use and check advertised behavior. Fresh-install and launcher reruns excluded by the user's follow-up instruction. |
+| Distribution/docs | Use a fresh installation as baseline; flag setup failures encountered during app use and check advertised behavior. Fresh-install and launcher reruns are out of scope for this audit. |
 
 ## Evidence and findings
 
 - Initial Chrome screenshot reviewed: desktop layout renders correctly, default
   model is Qwen3 Instruct INT4 on the detected 32 GB tier, existing model ready.
-- Test environment initially lacked pytest; installed it in this checkout's venv.
 - Baseline suite: 575 passed, 8 skipped, one failure from a test assuming the
   checkout contains a `models/` directory. Fixed the test to honor MODELS_DIR.
-  Per the user's clarification, automated checks are not feature signoff:
+  Automated checks are not feature signoff:
   every feature result in this report must have a Chrome interaction.
-- User hardware constraint: only RTX 5090 / GPU 0. Multi-GPU execution is
-  excluded from live signoff.
+- Hardware: a single RTX 5090. Multi-GPU execution is excluded from live
+  signoff.
 - Real Chrome run `outputs/0002_qwen3`: Qwen3 Instruct INT4, quoted Windows
   video path, Whole, 160 tokens, prefix/suffix, TXT/JSON/SRT/VTT/JSONL,
   42-character subtitle wrapping. Completed in 19.49 s, 12.21 tok/s,
@@ -361,9 +360,9 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - Added cleanup of completed traceback frames after failed model loads, so
   exception logging cannot keep partially loaded GPU/RAM tensors alive.
   Further real-browser load-failure verification remains pending.
-- The user requested QA instances be terminated after use. QA workers are now
-  terminated after their completed checks; the QA app will also be stopped
-  when the complete audit finishes. GPU 1 remains outside the test scope.
+- QA workers are terminated after their completed checks, and the QA app is
+  stopped when the complete audit finishes. A second GPU remains outside the
+  test scope.
 - Thinking INT8 with thinking disabled and the short-image task completed
   `0053_qwen3`: correct caption, 37 tokens, EOS, 1.67 tok/s, 59.39 s total.
   Keep model loaded off invoked unload automatically. Diagnostics then found
@@ -405,10 +404,8 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - Load Last Values after a fresh page restored the last-used universal preset
   (Audio SFX captions), matching the documented behavior; it restores that
   preset rather than unsaved individual controls.
-- Per the user's follow-up, fresh-install and launcher reruns are excluded.
-  The initial missing pytest package was a development dependency installed
-  for the early baseline suite; no missing required runtime package has been
-  found during the real Chrome checks so far.
+- Fresh-install and launcher reruns are excluded from this audit. No missing
+  required runtime package has been found during the real Chrome checks so far.
 
 ### Mixed caption batch and Whisper integration
 

@@ -10,7 +10,7 @@ build in the same browser session.
 | Item | Value |
 |---|---|
 | OS / Python / torch / transformers / gradio | Windows 11 Pro 10.0.26200 / 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
-| GPU | GPU 0, RTX 5090 32 GB (GPU 1 untouched) |
+| GPU | RTX 5090 32 GB (single GPU) |
 | Test media | `temp/qa_media` (20 s storm video, 11 s JFK WAV, 18 s MP3, PNG), `temp/qa_batch_ünicode` (Unicode names, nested folders, corrupt MP4, WAV, PNG), `temp/qa_dataset_clips` |
 | Automated suite | `pytest tests -q`: v1.6.0 baseline 562 passed, 8 skipped; v1.7.0 final 576 passed, 8 skipped (adds `tests/test_v17_fixes.py`, 14 tests, including a node-driven check of the browser-side pick classifier) |
 

@@ -238,8 +238,8 @@ Reading the table:
 
 To test whether the eager ceiling above could be lifted, `tools/bench/static_cache_probe.py` loaded six resident
 variants through the application loader (production 32 GB profile, greedy, 256 new tokens, 20 s storm video or 18 s
-MP3) and compared four decode paths on the same prepared inputs. Full report: `temp/codex_v14/REPORT_S.md`; raw
-results: `tools/bench/results/v14_probe_<variant>.json`.
+MP3) and compared four decode paths on the same prepared inputs. Raw results:
+`tools/bench/results/v14_probe_<variant>.json`.
 
 | Variant | Eager dynamic (production) | Eager static cache | Inductor default | Reduce-overhead + static |
 |---|---:|---:|---:|---:|

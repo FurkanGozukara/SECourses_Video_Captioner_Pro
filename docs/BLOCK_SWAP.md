@@ -165,8 +165,7 @@ added 1.6-2.5 GB to every prefill.
 
 ## Measured results (RTX 5090 32 GB, Windows 11, 2026-09-01)
 
-All runs used `temp/codex_BS/verify_run.py` through the application's real loader and caption
-wrapper with greedy decoding, the 20 s `lightning_storm_20s.mp4` (5,415 Qwen3 / 7,561 Qwen2.5
+All runs went through the application's real loader and caption wrapper with greedy decoding, the 20 s `lightning_storm_20s.mp4` (5,415 Qwen3 / 7,561 Qwen2.5
 prompt tokens), an 18 s MP3, or a 960x540 image. "Free after" is `cudaMemGetInfo` free memory
 right after generation; "Shared" is the WDDM per-process counter, which equals the pinned bytes
 plus a ~0.08 GiB driver baseline when nothing is paged.

@@ -15,8 +15,8 @@ below the workspace. Numeric Trim range remains available for video/audio.
 
 ## Chrome verification
 
-Tested the production app at `http://127.0.0.1:7870` in installed Google Chrome,
-with Gradio 6.26.0, Python 3.12.10, Windows, and an RTX 5090. Real caption runs
+Tested in Google Chrome with Gradio 6.26.0, Python 3.12.10, Windows, and an
+RTX 5090. Real caption runs
 used the locally installed Qwen3-Omni Instruct INT4 model.
 
 | Check | Result |
@@ -31,8 +31,6 @@ used the locally installed Qwen3-Omni Instruct INT4 model.
 | Desktop layout | At 1440×1000 and 1366×768, caption and primary actions are to the right of the media; settings are below both columns. At 1366×768, the focused image workspace fits its preview, source control, caption, Start/Cancel/Copy, and Trim range into one view. |
 | Narrow layout | At 600×900, media and results stack vertically, controls remain usable, and there is no horizontal page overflow. |
 | Secondary results and themes | Additional results expands with the existing JSON/subtitle/file/clip tabs and export actions; Files displays the generated outputs. Light and dark layouts remain legible. |
-
-Screenshots and browser diagnostics are retained locally in `output/playwright/`.
 
 ## Automated verification
 

@@ -1,15 +1,14 @@
 # SECourses Video Captioner Pro — Master Plan (v1)
 
-Owner/orchestrator: Claude (planner, verifier). Implementers: codex (gpt-5.6-sol, YOLO) tasks.
-Knowledge base: `scratchpad/reports/*.md` (reference-app analyses + model research). Every implementer MUST read the reports relevant to its task and open the referenced source files to copy proven code.
+Internal engineering plan. Implementation was split into tasks with strict file ownership; every task builds on the reference-app analyses and model research gathered up front and copies proven code from the referenced sources.
 
 ## 0. Environment facts (do not re-derive)
-- Working root (distribution folder): `G:\SECourses_Video_Captioner_Pro_v1\` — holds `Windows_*.bat`, `Massed_Compute_Install.sh`, `RunPod_Install_*.sh`, instruction txts, `video_caption_requirements.txt`, `Models_Downloader.py` (canonical downloader lives HERE, outside the git repo, exactly like the Upscaler app; the app resolves it via `APP_DIR.parent / "Models_Downloader.py"` with env override `SECOURSES_VCAP_DOWNLOADER`).
-- Git repo (app code): `G:\SECourses_Video_Captioner_Pro_v1\SECourses_Video_Captioner_Pro\` → remote `https://github.com/FurkanGozukara/SECourses_Video_Captioner_Pro` (branch `main`, no commits yet). Never commit `venv/`, `models/`, `outputs/`, `temp/`, `logs/`, `presets/` (user presets), media.
-- venv: `SECourses_Video_Captioner_Pro\venv` — Python 3.12.10, torch 2.13.0+cu130, gradio 6.26.0, flash_attn 2.8.3 (sm86/sm89/sm120a), sageattention 2.2.0, xformers 0.0.35, torchao 0.18.0, triton-windows 3.7.1, transformers 5.16.x (installed by us). NO pinned versions in requirements except what already exists.
-- GPU for all tests/benchmarks: **GPU 0 = RTX 5090 32 GB (sm120)**. GPU 1 (RTX 3090) must NOT be used.
-- ffmpeg/ffprobe on PATH (n8.1). Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe`.
-- Temp/work folder for everything non-repo: `F:\SECourses_Video_Captioner_Pro_TEMP\` (`originals/` = HF downloads of the 5 base repos, `converted/`, `logs/`, `test_media/` incl. unicode-named files & `batch_ünicode_folder/`). Scratch for small files: the Claude scratchpad dir.
+- Working root (distribution folder): the folder that contains the git checkout — holds `Windows_*.bat`, `Massed_Compute_Install.sh`, `RunPod_Install_*.sh`, instruction txts, `video_caption_requirements.txt`, `Models_Downloader.py` (canonical downloader lives HERE, outside the git repo, exactly like the Upscaler app; the app resolves it via `APP_DIR.parent / "Models_Downloader.py"` with env override `SECOURSES_VCAP_DOWNLOADER`).
+- Git repo (app code): `SECourses_Video_Captioner_Pro\` inside the distribution folder → remote `https://github.com/FurkanGozukara/SECourses_Video_Captioner_Pro` (branch `main`). Never commit `venv/`, `models/`, `outputs/`, `temp/`, `logs/`, `presets/` (user presets), media.
+- venv: `SECourses_Video_Captioner_Pro\venv` — Python 3.12.10, torch 2.13.0+cu130, gradio 6.26.0, flash_attn 2.8.3 (sm86/sm89/sm120a), sageattention 2.2.0, xformers 0.0.35, torchao 0.18.0, triton-windows 3.7.1, transformers 5.16.x. NO pinned versions in requirements except what already exists.
+- GPU for all tests/benchmarks: a single **RTX 5090 32 GB (sm120)**.
+- ffmpeg/ffprobe on PATH (n8.1).
+- Temp/work folder for everything non-repo lives outside the checkout (`originals/` = HF downloads of the 5 base repos, `converted/`, `logs/`, `test_media/` incl. unicode-named files & `batch_ünicode_folder/`).
 - Models local layout (runtime): `SECourses_Video_Captioner_Pro\models\<model_key>\` (e.g. `models\qwen3_omni_instruct_int8\`). Each folder is a self-contained HF-loadable dir: `config.json`, `generation_config.json`, `preprocessor_config.json`, tokenizer files, `chat_template.*`, plus ONE weight file `model.safetensors` (bf16 single-file, or int8/int4 ConvRot single-file with `_quantization_metadata` header) or `model.gguf`.
 - HF layout (user uploads after we produce files): `MonsterMMORPG/Wan_GGUF/Video_Captioner_Pro/<model_key>/<same files>` — 1:1 mirror of the local folder so `Models_Downloader.py` maps trivially. Downloader must verify size+sha (LFS etag) and resume.
 
@@ -164,7 +163,7 @@ Wan 2.2 T2V dense · Wan T2V sparse · Wan I2V motion-only · Hunyuan dense cine
 
 Whisper-guided captioning additionally reserves `{{TRANSCRIPT}}`, filled from clip-local speech only after the ordinary prompt variables render.
 
-## 7. Work breakdown (codex tasks; parallel where independent)
+## 7. Work breakdown (tasks; parallel where independent)
 - T1 Core foundation: `vcap/core/{paths,logs,progress,gpu,media,outputs,presets,registry,subprocess_runner}.py` + tests. (reports 01,03,05,02)
 - T2 Scene split + preprocess + clip fitness + captions_post + export: `core/{scene_split,preprocess,clip_fitness,captions_post,export}.py` + tests. (reports 05,06)
 - T3 Models layer: registry/base/loader/attention/offload/vram_presets + TimeChat + AVoCaDO + Qwen3-Omni wrappers + downloads bridge. (reports 10,11,12,07,04)
@@ -174,7 +173,7 @@ Whisper-guided captioning additionally reserves `{{TRANSCRIPT}}`, filled from cl
 - T7 UI: Editor tab, Dataset tab, Settings, Recover, Health, Changelog. (reports 08,02)
 - T8 Models_Downloader.py rewrite for our catalog + bat/sh installers + docs. (reports 01,05)
 - T9 Prompt presets + default presets JSON. (reports 10,11,12)
-- T10 Integration, Chrome-driven QA, benchmark, fixes. (Claude + codex)
+- T10 Integration, Chrome-driven QA, benchmark, fixes.
 Order: T1,T2,T4(start conversions early),T9 in parallel → T3,T5 → T6,T7,T8 → T10.
 
 ## 8. Quality bars for implementers

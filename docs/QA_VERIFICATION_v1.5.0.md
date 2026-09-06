@@ -2,9 +2,9 @@
 
 Every feature of the application was exercised through the real interface in Google Chrome on Windows 11, first on the
 v1.4.1 build (baseline defect hunt) and then on the integrated v1.5.0 build started from `Windows_Run_Video_Captioner_Pro.bat`
-(port 7860). Physical GPU 0 (RTX 5090, 32 GB) was the only GPU used. Implementation and fixes were delegated to
-codex (`gpt-5.6-sol`) tasks W1/W2 (Whisper backend + UI/pipeline), B (baseline defects), F (Transcribe-tab defects found on
-the integrated build), and G (regressions); every task ran CPU-only tests, and the orchestrator verified each result in Chrome.
+(port 7860) on a single RTX 5090 (32 GB). Work was split into tasks W1/W2 (Whisper backend + UI/pipeline), B (baseline
+defects), F (Transcribe-tab defects found on the integrated build), and G (regressions); every task ran CPU-only tests, and
+each result was then verified in Chrome.
 
 ## Environment
 
@@ -12,7 +12,7 @@ the integrated build), and G (regressions); every task ran CPU-only tests, and t
 |---|---|
 | OS / Python / torch / transformers / gradio | Windows 11 Pro 10.0.26200 / 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
 | New runtime | faster-whisper 1.2.1, ctranslate2 4.8.2 (bundled cuDNN 9), onnxruntime 1.29.0, nvidia-cublas-cu12 12.9.2.10 |
-| GPU | GPU 0, RTX 5090 (GPU 1 untouched) |
+| GPU | RTX 5090 (single GPU) |
 | Test media | `temp/qa_media` (20 s storm video, 18 s MP3, PNG, 11 s JFK WAV, 5:14 talk-radio MP3/MP4, 28:01 tutorial MP3/MP4 VP9+Opus), `temp/qa_batch_ünicode` (Unicode names, nested folders, a corrupt MP4) |
 | Automated suite | `pytest tests -q`: **493 passed, 8 skipped** (baseline v1.4.1: 398 passed, 7 skipped) |
 
@@ -76,4 +76,4 @@ Settings save, Recover load/apply, System & Models unload/update check, light an
 - Whisper large-v1 with the shipped defaults produces lowercase, lightly punctuated text on talk-radio audio; this matches the
   reference application for identical parameters (large-v3 / large-v3-turbo produce capitalized, punctuated output).
 - Editor edits update the `.txt` sidecars; `.json` sidecars keep the model's original text.
-- Data-parallel batches on GPU 1 were not exercised (GPU 1 is excluded from testing on this machine).
+- Data-parallel batches across two GPUs were not exercised in this pass.

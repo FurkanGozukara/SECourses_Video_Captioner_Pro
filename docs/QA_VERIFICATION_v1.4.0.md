@@ -11,7 +11,7 @@ are listed at the end.
 |---|---|
 | OS | Windows 11 Pro 10.0.26200 |
 | Python / torch / transformers / gradio | 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
-| GPU used | GPU 0, RTX 5090, driver 610.88 (GPU 1 untouched) |
+| GPU used | RTX 5090, driver 610.88 |
 | llama.cpp | b10621 Windows CUDA build (`llamacpp/b10621`) |
 | Test media | `F:\SECourses_Video_Captioner_Pro_TEMP\test_media` (20 s storm video, 78 s Unicode-named launch video, 18 s MP3, WAV, PNG, Unicode batch folders) |
 

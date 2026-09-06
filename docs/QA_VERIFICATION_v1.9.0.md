@@ -18,11 +18,8 @@ sections *Plain .txt-only captions* and *Custom model overrides*.
 
 ## Chrome verification
 
-Tested a fresh instance of the app (`secourses_app.py --server-port 62155`) in
-installed Google Chrome with Gradio 6.26.0, Python 3.12.10, Windows 11. GPU 0
-(RTX 5090, 31.8 GB) had about 12 GB free because other processes were resident,
-so every model below ran partially from host memory; timings are therefore
-slow and are not performance numbers.
+Tested in Google Chrome with Gradio 6.26.0, Python 3.12.10, Windows 11, and an
+RTX 5090. Durations in this log are smoke-test timings, not benchmarks.
 
 | Check | Result |
 | --- | --- |
@@ -32,14 +29,11 @@ slow and are not performance numbers.
 | txt-only batch, next to source | Two 5-second clips (`storm one.mp4`, `storm two.mp4`) with the Dataset preset, save next to source, txt-only on, Qwen3-Omni Instruct INT4 + Whisper large-v1. Result folder: only `storm one.txt` and `storm two.txt` beside the videos; no `.json`, no `video_caption/` or `audio_caption/`, no transcript sidecars. Each `.txt` holds the video caption followed by the Whisper text. `metadata.json`, `run_log.txt`, `summary.json`, and `captions_index.json` stayed in `outputs/batch_0147_qwen3`; metadata records `caption_txt_only: true`, `audio_captions: 2`, and only the merged path per item. |
 | Override status line | Pointing **Video / main caption model override** at `models/custom_qwen2.5vl/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` showed "✓ ... (GGUF (llama.cpp), 4.7 GB) + mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf" (projector auto-detected beside the model). |
 | Qwen2.5-VL GGUF override (cross-architecture) | Base variant Qwen3-Omni Instruct INT4 (Transformers). The run switched to llama.cpp, logged "Custom GGUF override", read `/props` (`modalities: vision`), warned "The loaded model has no audio encoder; the video's audio track was not sent", sent 11 frames, and finished in 16.5 s (`outputs/0148_qwen3`). Caption: "A car drives down the street." (8 tokens; the shipped Qwen3-Omni prompt presets are not tuned for this model). `model_info.override` records kind, path, mmproj, and size. |
-| Qwen3-Omni Q4 GGUF override on a Transformers base | Same base variant with `models/qwen3_omni_instruct_gguf_q4/Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf`. The cache logged the override switch, llama-server reported `modalities: vision, audio`, and the clip received a 105-token detailed night-street caption stopped by EOS (`outputs/0149_qwen3`, 2,916 prompt tokens, 0.58 tok/s with most weights fitted to host memory on the crowded GPU). |
+| Qwen3-Omni Q4 GGUF override on a Transformers base | Same base variant with `models/qwen3_omni_instruct_gguf_q4/Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf`. The cache logged the override switch, llama-server reported `modalities: vision, audio`, and the clip received a 105-token detailed night-street caption stopped by EOS (`outputs/0149_qwen3`, 2,916 prompt tokens). |
 | Invalid path plus Whisper folder | With the video override set to `D:\nope\missing-model.gguf` and the audio override set to `models/whisper/large-v3-turbo`, the status line showed "✗ Video / main model: The override path does not exist: ..." and "✓ Audio caption model: large-v3-turbo (Whisper CTranslate2 model, 1.6 GB)". |
 | Start refuses a bad override | Start Captioning stopped immediately with the progress title "Model override" and the message "Video / main model override: The override path does not exist: ..."; no run directory, worker, or download was created. |
 | Transcribe tab note | With the Whisper folder override set, the Transcribe tab's Model section showed "⚠ Custom Whisper model folder in use: ...\models\whisper\large-v3-turbo" with the explanation that the dropdown is ignored until the field is cleared. |
 | Clearing the fields | Emptying both override fields returned the status line to "No override set; the registered files of the selected variant are used." and hid the Transcribe note. |
-
-Screenshots were reviewed live during the session; browser diagnostics are not
-retained for this version.
 
 ## Automated verification
 
@@ -63,10 +57,9 @@ retained for this version.
 
 ## v1.9.1 follow-up (2026-09-07)
 
-A second pass over the v1.9.0 commit, again through
-`Windows_Run_Video_Captioner_Pro.bat` and installed Google Chrome 152 (GPU 0
-free at start: about 31 GB). Every v1.9.0 check above was repeated on a
-fresh instance and passed: folder-panel mirror and Post-processing switch in
+A second pass over v1.9.0 through `Windows_Run_Video_Captioner_Pro.bat` and
+Google Chrome. Every v1.9.0 check above was repeated on a fresh instance and
+passed: folder-panel mirror and Post-processing switch in
 both directions, a txt-only batch of two clips beside their sources (only the
 two `.txt` files; `metadata.json` records `caption_txt_only: true`), a regular
 run still writing `.txt` + `.json`, override status lines for a valid GGUF, a
@@ -90,8 +83,3 @@ text-only GGUF, missing path, wrong family, and Transformers overrides).
 `pytest tests -q`: **611 passed, 9 skipped, 8 failed** (110 s); the 8
 failures are the same pre-existing ones and reproduce with identical
 assertions on the untouched v1.8.1 tree.
-
-Environment note: the user's own Chrome profile refused every loopback
-connection during this session (`ERR_CONNECTION_REFUSED` for this app and for
-an unrelated local Gradio server, while `curl` reached both), so the checks
-ran in a second instance of the same installed Chrome executable.

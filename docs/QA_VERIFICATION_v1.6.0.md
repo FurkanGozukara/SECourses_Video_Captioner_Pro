@@ -2,9 +2,9 @@
 
 Every feature of the application was exercised again through the real interface in Google Chrome on Windows 11, first on the
 v1.5.0 build (defect hunt) and then on the v1.6.0 build (dataset clip captions + fixes), started each time from
-`Windows_Run_Video_Captioner_Pro.bat --server-port 7860`. Physical GPU 0 (RTX 5090, 32 GB) was the only GPU used.
-Implementation was delegated to codex (`gpt-5.6-sol`) tasks N1 (dataset clip captions), B (defects found in the v1.5.0
-pass), and N2 (follow-ups found while verifying N1 with real models); the orchestrator verified every result in Chrome.
+`Windows_Run_Video_Captioner_Pro.bat --server-port 7860` on a single RTX 5090 (32 GB). Work was split into tasks N1
+(dataset clip captions), B (defects found in the v1.5.0 pass), and N2 (follow-ups found while verifying N1 with real
+models); every result was then verified in Chrome.
 
 ## Environment
 
@@ -12,7 +12,7 @@ pass), and N2 (follow-ups found while verifying N1 with real models); the orches
 |---|---|
 | OS / Python / torch / transformers / gradio | Windows 11 Pro 10.0.26200 / 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
 | Whisper runtime | faster-whisper 1.2.1, ctranslate2 4.8.2, onnxruntime 1.29.0 |
-| GPU | GPU 0, RTX 5090 (GPU 1 untouched) |
+| GPU | RTX 5090 (single GPU) |
 | Test media | `temp/qa_media` (20 s storm video, 18 s MP3, PNG, 11 s JFK WAV), `temp/qa_batch_ünicode` (Unicode names, nested folders, a corrupt MP4, silent videos), `temp/qa_dataset_clips` (four pre-cut 8 s clips with narration cut from the Voyager launch film, one silent clip, one Unicode-named clip in a Unicode subfolder), `F:\…\test_media\vöyager ünicode 日本語 テスト.mp4` (78 s) |
 | Automated suite | `pytest tests -q`: **561 passed, 8 skipped** (v1.5.0 baseline: 493 passed, 8 skipped) |
 

@@ -1,4 +1,4 @@
-# Verified integration probes (run on this machine, transformers 5.16.1)
+# Verified integration probes (transformers 5.16.1)
 
 These were executed for real against the downloaded checkpoints' processors on 2026-08-30. Build on them; do not re-derive.
 
@@ -36,5 +36,5 @@ proc(text=..., images=[img1080p], size={"shortest_edge":4*32*32,"longest_edge":1
 - `scenedetect` 0.7.1 has no `[opencv]` extra — depend on `scenedetect` + `opencv-python` separately.
 - `qwen-omni-utils` 0.0.9's video readers are unusable here, but its `smart_resize` math and constants remain the reference.
 - venv has: transformers 5.16.1, accelerate 1.14, safetensors 0.8, av 18.1, librosa 1.0, soundfile 0.14, audioread, psutil 7.2.2, nvidia-ml-py, gguf 0.19, einops, opencv-python 5.0, scenedetect 0.7.1, tomli-w, imageio(-ffmpeg), sentencepiece, tiktoken, protobuf. Do NOT add torchcodec/decord.
-- GPU 0 = RTX 5090 32 GB (sm120), GPU 1 = RTX 3090 (DO NOT USE). ffmpeg n8.1 on PATH.
+- Probes ran on a single RTX 5090 32 GB (sm120) with ffmpeg n8.1 on PATH.
 - The GitHub remote `origin` (SECourses_Video_Captioner_Pro) is reachable; repo currently has no commits.

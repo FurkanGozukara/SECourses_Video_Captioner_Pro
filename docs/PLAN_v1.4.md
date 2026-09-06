@@ -1,6 +1,6 @@
 # SECourses Video Captioner Pro — v1.4.0 goal plan
 
-Date: 2026-09-02. Orchestrator: Claude (planner, verifier, Chrome QA). Implementers: codex (gpt-5.6-sol, YOLO) tasks A, P, U, I running in parallel with strict file ownership (see `temp/codex_v14/CONTRACT.md`).
+Date: 2026-09-02. Work was split into tasks A, P, U, I running in parallel with strict file ownership, followed by integration and Chrome QA.
 
 ## 1. Where v1.3.2 stands (verified 2026-09-02)
 
@@ -28,7 +28,7 @@ Date: 2026-09-02. Orchestrator: Claude (planner, verifier, Chrome QA). Implement
 | P — performance | `vcap/models/llamacpp_backend.py`, `vcap/models/quant/convrot.py`, `omni_common.py::_stopping` only, `runner.py::_Emitter.progress/_emit_running_item` only, `tools/bench/*` | Throttled progress; SSE fix; GGUF flags/frames/seed/options; gate/up fusion; Hadamard hoist; before/after benchmark table |
 | U — UI | `vcap/ui/**`, new `vcap/core/caption_stats.py`, `vcap/core/archive.py` | All new controls with descriptions and best defaults; GGUF-aware enabling; cancel confirm; unload; open-in-editor; editor/dataset/chat features; prompt-edit preservation |
 | I — installers | `Massed_Compute_Install.sh`, `RunPod_Install_*.sh`, instruction txts, `Windows_Run_*.bat`, `vcap/models/llamacpp_install.py`, README install sections | Upscaler-v8 flow; Linux llama.cpp build; docs |
-| Final (Claude) | version, changelog, README, BENCHMARKS, PLAN, QA doc | Integration, full pytest, Chrome QA of everything, GPU release |
+| Final integration | version, changelog, README, BENCHMARKS, PLAN, QA doc | Integration, full pytest, Chrome QA of everything, GPU release |
 
 ## 4. Verification plan (Chrome, GPU 0 only)
 
@@ -46,14 +46,14 @@ Date: 2026-09-02. Orchestrator: Claude (planner, verifier, Chrome QA). Implement
 
 ## 5. Status (2026-09-02, integration)
 
-- Tasks A, U, I: complete (see `temp/codex_v14/codex_{A,U,I}_log.txt` final reports). Task P: code complete; its final
+- Tasks A, U, I: complete. Task P: code complete; its final
   benchmark table is in `docs/QUANT_PERF.md` ("v1.4.0 host-overhead removal").
-- Round 2 (tasks F1 backend, F2 UI; contract `temp/codex_v14/CONTRACT_F.md`, audit `AUDIT_EXPOSURES.md`): complete.
+- Round 2 (tasks F1 backend, F2 UI): complete.
   Full suite after integration: 375 passed, 7 skipped.
 - Task S (static KV cache + CUDA graphs): measured; see `docs/QUANT_PERF.md` ("v1.4.0 static cache / CUDA graph probe").
-- Fix rounds from the Chrome verification: F3 (`temp/codex_v14/TASK_F3.md`: preset delete confirmation, ZIP
+- Fix rounds from the Chrome verification: F3 (preset delete confirmation, ZIP
   single-folder descent, dropdown custom values, prompt-preset label, retry of unreadable items, input-mode race,
-  case-preserving replacements, chat final stats) and F4 (`TASK_F4.md`: live-log panel after cancel, first Start after
+  case-preserving replacements, chat final stats) and F4 (live-log panel after cancel, first Start after
   a model change, editor regenerate input count, recent-run refresh), F5 (status counts), F6 (incompatible
   regenerate pairs, hidden-tab note), F7 (regenerate prompt-preset population). Final suite: 393 passed, 7 skipped.
 - Chrome verification: `docs/QA_VERIFICATION_v1.4.0.md`.
