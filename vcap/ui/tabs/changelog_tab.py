@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.8.1",
+        "2026-09-06",
+        """
+### Caption actions above the output, with options close at hand
+
+- **Start Captioning**, **Cancel**, and **Copy caption** now share one row above **Output caption**. File loading and the media preview stay on the left; narrow screens stack the workspace vertically while keeping the action buttons together.
+- **Caption options** sits directly below the output and opens with **User prompt** followed by **System prompt**. Task/prompt presets, model, and generation controls are grouped into nested sections. The options panel scrolls independently so long prompts and expanded controls leave the caption and its actions in place.
+- The cancellation confirmation opens directly below the action buttons. Run progress and status span the area below both columns, while **Additional results** keeps extra formats and export tools accessible beneath the options.
+""".strip(),
+    ),
+    (
         "v1.8.0",
         "2026-09-06",
         """
