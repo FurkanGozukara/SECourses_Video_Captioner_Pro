@@ -908,3 +908,29 @@ permutations are covered by targeted tests as well as representative UI jobs.
   Output quality failed: plausible opening tags degraded into unsupported
   `partial_*` associations, including sound tags for a still image. This is a
   successful format-conversion check, not an accurate tag set.
+- `0115_qwen3`: search-index JSON on the audiovisual speech fixture completed
+  two detected scenes with 451 tokens to EOS in 75.3 s, final 11.46 tok/s.
+  Both scene results parsed into objects and saved as valid JSON. Output
+  quality/schema failed: heard speech was also reported as OCR, and `speech`
+  and `ocr_text` were strings instead of the requested arrays. The parser
+  preserves model output; it does not enforce the search-index schema.
+- `0116_qwen3`: the lyrics preset on the spoken JFK control returned the full
+  quote as three unpunctuated lines and a matching three-string JSON array
+  (25 tokens, EOS, 2.34 s, 12.79 tok/s). This is a speech control, not a sung
+  lyrics accuracy benchmark. `0117_qwen3` used a manually supplied three-line
+  literal request; TXT retained all three line breaks and punctuation and JSON
+  held the same three strings (21 tokens, EOS, 2.28 s, 11.31 tok/s).
+- Personal prompt `QA_formatter_ü` passed Save, changed-text/Load, persistence
+  across app restart, and preservation after a caption-language edit. Changing
+  the selected media from audio to video initially overwrote the loaded prompt
+  with canonical wording despite retaining the same task. Fixed context
+  refreshes to preserve prompt fields whenever the task remains selected.
+  Chrome repeated that media switch and a variable edit without losing either
+  prompt field. Explicit Reset prompts restored the canonical task wording;
+  Delete removed the temporary personal prompt.
+- Checked all ten tabs at a requested 390×844 viewport (effective 312×675 CSS
+  pixels at the existing browser zoom): the header/actions and form columns
+  stacked, the overflow menu reached every tab, and the document had no
+  horizontal overflow (300-pixel document width). System report/table content
+  scrolled within its own widgets. Reviewed screenshots of each tab and
+  restored the original desktop viewport afterward.

@@ -5003,8 +5003,11 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             )
             description = f"{description}<br><span class='vc-help'>{html.escape(hint)}</span>"
             ctx.app_log.log(hint, scope="prompts")
-        same_context = list(previous_context or []) == context
-        if same_context and preset.id == str(current_preset_id or ""):
+        # Media/model changes refresh the menu, but a retained task must keep
+        # its prompt text, including manual edits and personal-library loads.
+        # Variable edits have their own preserving renderer; only a different
+        # task needs its canonical prompt installed here.
+        if preset.id == str(current_preset_id or ""):
             system: Any = gr.skip()
             user: Any = gr.skip()
             tracked: Any = gr.skip()
