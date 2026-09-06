@@ -615,6 +615,15 @@ def build(ctx: "UiContext") -> TranscribeTabHandles:
                     elem_classes=["vc-help"],
                 )
                 model_info = gr.Markdown(_model_info_markdown("large-v1", ctx.models_dir))
+                # Filled by the Caption tab when its audio override names a
+                # faster-whisper folder, which then replaces the dropdown model here too.
+                whisper_override_note = gr.Markdown(
+                    "",
+                    visible=False,
+                    elem_classes=["vc-status"],
+                    elem_id="vc_whisper_override_note",
+                )
+                ctx.states["whisper_override_note"] = whisper_override_note
                 description = "Numeric precision used by CTranslate2; float16 is the proven CUDA default."
                 controls["whisper_compute_type"] = _registered(
                     ctx,

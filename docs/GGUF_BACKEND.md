@@ -94,6 +94,26 @@ Captioner variants, while the Transformers processor preserves native temporal
 A/V token interleaving and a much larger frame sample. Automatically trading
 that fidelity for the GGUF frame-plus-audio fallback would be surprising.
 
+## Custom GGUF overrides
+
+**Caption > Model > Override model loading (experimental)** starts the same
+private `llama-server` with an arbitrary local GGUF instead of a registered
+variant. Point the video / main override at a `.gguf` file or a folder that
+holds one; an `mmproj*.gguf` beside the model is picked up automatically and
+the optional mmproj field replaces it. The selected Qwen3-Omni variant stays
+the base for prompts, limits, and generation controls, while the server plan,
+fitting, context clamp, and runtime options are applied exactly as for the
+registered GGUFs; no file is downloaded or hash-checked. Split GGUFs are
+loaded from their first `-00001-of-NNNNN` shard.
+
+After `GET /health` succeeds the backend reads `GET /props` and keeps the
+advertised `modalities`. A model whose projector has no audio encoder (for
+example Qwen2.5-VL) is captioned from its sampled frames only, with a warning
+in the run log; a server that still rejects `input_audio` is retried once
+without the audio part. A GGUF without any projector is text-only and refuses
+media input with a clear message. Overrides for TimeChat or AVoCaDO bases are
+refused because this backend is built around the Qwen3-Omni chat template.
+
 ## VRAM-tier server plan
 
 The backend keeps the tier-specific context limits but delegates weight

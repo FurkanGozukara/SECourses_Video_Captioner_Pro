@@ -355,6 +355,20 @@ class WhisperEngine:
         """Download the selected model when its visible folder is incomplete."""
 
         self._check_cancel()
+        custom = str(self.params.model_path or "").strip()
+        if custom:
+            target = Path(custom).expanduser().resolve(strict=False)
+            if not target.is_dir():
+                raise FileNotFoundError(f"Custom Whisper model folder does not exist: {target}")
+            missing = [name for name in ("model.bin", "config.json") if not (target / name).is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    f"Custom Whisper model folder {target} is missing {', '.join(missing)}; "
+                    "point at a faster-whisper (CTranslate2) model directory."
+                )
+            self._log(f"Using the custom Whisper model folder {target} instead of {self.params.model}")
+            self.model_path = target
+            return target
         target = model_dir(self.params.model, self.models_dir)
         if not is_model_ready(self.params.model, self.models_dir):
             target = download_model(

@@ -394,8 +394,17 @@ def test_all_shipped_universal_presets_have_the_versioned_settings_contract():
         "chat_enable_thinking",
         "context_tokens",
     }
-    # Only Thinking presets spell out the caption-side reasoning switch.
-    optional_keys = {"enable_thinking"}
+    # Only Thinking presets spell out the caption-side reasoning switch. Every
+    # shipped preset also stores the v1.9 txt-only switch and the four custom
+    # model override paths at their neutral defaults.
+    optional_keys = {
+        "enable_thinking",
+        "caption_txt_only",
+        "override_video_model_path",
+        "override_video_mmproj_path",
+        "override_audio_model_path",
+        "override_audio_mmproj_path",
+    }
     preset_files = sorted((Path(__file__).parents[1] / "presets_default").glob("*.json"))
     assert len(preset_files) == 19
 

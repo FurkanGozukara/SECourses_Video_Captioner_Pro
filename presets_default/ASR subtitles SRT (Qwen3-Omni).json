@@ -40,6 +40,7 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
+    "caption_txt_only": false,
     "output_formats": [
       "txt",
       "json",
@@ -58,6 +59,10 @@
     "chat_top_p": 0.95,
     "chat_top_k": 20,
     "chat_max_new_tokens": 1024,
-    "chat_enable_thinking": false
+    "chat_enable_thinking": false,
+    "override_video_model_path": "",
+    "override_video_mmproj_path": "",
+    "override_audio_model_path": "",
+    "override_audio_mmproj_path": ""
   }
 }

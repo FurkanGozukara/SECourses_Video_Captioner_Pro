@@ -835,23 +835,39 @@ class LlamaCppCaptioner(BaseCaptioner):
         vram_total_gb: float | None = None,
         vram_reserve_gb: float = 2.0,
         runtime: Any | None = None,
+        variant: VariantSpec | None = None,
+        model_path: str | os.PathLike[str] | None = None,
+        mmproj_path: str | os.PathLike[str] | None = None,
     ) -> None:
         super().__init__(family, loaded)
         if not family.startswith("qwen3_omni_"):
             raise ValueError(f"llama.cpp backend only supports Qwen3-Omni, not {family}")
-        if variant_key is None:
-            variant_key = next(
-                variant.key for variant in self.spec.variants if variant.backend == "llamacpp"
-            )
-        variant = get_variant(variant_key)
+        if variant is None:
+            if variant_key is None:
+                variant_key = next(
+                    candidate.key for candidate in self.spec.variants if candidate.backend == "llamacpp"
+                )
+            variant = get_variant(variant_key)
         if variant.backend != "llamacpp" or variant_to_family(variant.key) != family:
-            raise ValueError(f"{variant_key} is not a llama.cpp variant for {family}")
+            raise ValueError(f"{variant.key} is not a llama.cpp variant for {family}")
         self.variant: VariantSpec = variant
+        # Explicit checkpoint files (custom model override). When set, the registry
+        # file names and readiness checks are bypassed for this server.
+        self.model_path = (
+            Path(model_path).expanduser().resolve(strict=False) if model_path is not None else None
+        )
+        self.mmproj_path = (
+            Path(mmproj_path).expanduser().resolve(strict=False) if mmproj_path is not None else None
+        )
+        if self.model_path is not None and model_dir is None:
+            model_dir = self.model_path.parent
         self.model_dir = (
             Path(model_dir).expanduser().resolve(strict=False)
             if model_dir is not None
             else resolve_model_dir(variant.key)
         )
+        # Modalities reported by the running server (``GET /props``); None until known.
+        self.server_modalities: dict[str, bool] | None = None
         self.server_path = (
             Path(server_path).expanduser().resolve(strict=False)
             if server_path is not None
@@ -990,11 +1006,35 @@ class LlamaCppCaptioner(BaseCaptioner):
         with self._fit_lock:
             return json.loads(json.dumps(self.fit_report))
 
-    def _server_command(self, server: Path, port: int) -> list[str]:
+    def checkpoint_files(self) -> tuple[Path, Path | None]:
+        """Return the model GGUF and its projector (None for a text-only override)."""
+
+        if self.model_path is not None:
+            return self.model_path, self.mmproj_path
         if not self.variant.gguf_files or len(self.variant.gguf_files) < 2:
             raise RuntimeError(f"{self.variant.key} does not define a model and mmproj")
-        model = self.model_dir / self.variant.gguf_files[0]
-        mmproj = self.model_dir / self.variant.gguf_files[1]
+        return self.model_dir / self.variant.gguf_files[0], self.model_dir / self.variant.gguf_files[1]
+
+    @property
+    def supports_audio(self) -> bool:
+        """Whether the running server accepts ``input_audio`` parts (unknown counts as yes)."""
+
+        if self.mmproj_path is None and self.model_path is not None:
+            return False
+        modalities = self.server_modalities
+        return True if modalities is None else bool(modalities.get("audio", True))
+
+    @property
+    def supports_vision(self) -> bool:
+        """Whether the running server accepts image parts (unknown counts as yes)."""
+
+        if self.mmproj_path is None and self.model_path is not None:
+            return False
+        modalities = self.server_modalities
+        return True if modalities is None else bool(modalities.get("vision", True))
+
+    def _server_command(self, server: Path, port: int) -> list[str]:
+        model, mmproj = self.checkpoint_files()
         plan = _server_plan_from_env(self.server_plan)
         self._active_server_plan = plan
         self.context_size = plan.context_size
@@ -1004,8 +1044,10 @@ class LlamaCppCaptioner(BaseCaptioner):
             str(server),
             "--model",
             str(model),
-            "--mmproj",
-            str(mmproj),
+        ]
+        if mmproj is not None:
+            command.extend(["--mmproj", str(mmproj)])
+        command += [
             "-c",
             str(plan.context_size),
             "--jinja",
@@ -1079,9 +1121,26 @@ class LlamaCppCaptioner(BaseCaptioner):
         with self._lifecycle_lock:
             if self.is_running:
                 return self
-            ready, detail = variant_is_ready(self.variant.key)
-            if not ready:
-                raise FileNotFoundError(f"{self.variant.key} is not ready: {detail}")
+            if self.model_path is not None:
+                missing = [
+                    str(path)
+                    for path in (self.model_path, self.mmproj_path)
+                    if path is not None and not path.is_file()
+                ]
+                if missing:
+                    raise FileNotFoundError(
+                        "Custom GGUF override file(s) are missing: " + ", ".join(missing)
+                    )
+                _emit(
+                    progress_cb,
+                    f"Custom GGUF override: {self.model_path.name}"
+                    + (f" + {self.mmproj_path.name}" if self.mmproj_path is not None else " (no mmproj: text only)"),
+                )
+            else:
+                ready, detail = variant_is_ready(self.variant.key)
+                if not ready:
+                    raise FileNotFoundError(f"{self.variant.key} is not ready: {detail}")
+            self.server_modalities = None
             server = self.server_path or ensure_llamacpp(progress_cb, cancel)
             self.server_path = server
             port = find_free_port()
@@ -1173,6 +1232,15 @@ class LlamaCppCaptioner(BaseCaptioner):
                             self.load_seconds = time.perf_counter() - started
                             self.load_peak_vram_gb = peak
                             self._update_fit_report_from_log_tail()
+                            self.server_modalities = self._fetch_server_modalities()
+                            if self.server_modalities is not None:
+                                supported = [
+                                    name for name in ("vision", "audio") if self.server_modalities.get(name)
+                                ] or ["text only"]
+                                _emit(
+                                    progress_cb,
+                                    f"llama-server modalities: {', '.join(supported)}",
+                                )
                             _emit(
                                 progress_cb,
                                 f"llama-server ready in {self.load_seconds:.1f}s; "
@@ -1203,6 +1271,26 @@ class LlamaCppCaptioner(BaseCaptioner):
                 raise
             finally:
                 self._startup_progress = None
+
+    def _fetch_server_modalities(self) -> dict[str, bool] | None:
+        """Read the multimodal capabilities the server advertises on ``GET /props``."""
+
+        if not self._base_url:
+            return None
+        try:
+            response = self._session.get(f"{self._base_url}/props", timeout=5)
+            try:
+                if response.status_code != 200:
+                    return None
+                payload = response.json()
+            finally:
+                response.close()
+        except (requests.RequestException, ValueError):
+            return None
+        modalities = payload.get("modalities") if isinstance(payload, dict) else None
+        if not isinstance(modalities, dict):
+            return None
+        return {str(name): bool(value) for name, value in modalities.items()}
 
     def stop(self) -> None:
         """Terminate the server process tree and release the local endpoint."""
@@ -1268,7 +1356,17 @@ class LlamaCppCaptioner(BaseCaptioner):
                     float((end if end is not None else info.duration) or 0.0)
                     - float(start or 0.0),
                 )
+                if not self.supports_vision:
+                    raise ValueError(
+                        f"The loaded model has no vision projector, so it cannot caption video {path.name}. "
+                        "Set the mmproj path for the custom model."
+                    )
                 include_audio = bool(pre.use_audio_in_video and info.has_audio)
+                if include_audio and not self.supports_audio:
+                    include_audio = False
+                    warnings.append(
+                        "The loaded model has no audio encoder; the video's audio track was not sent."
+                    )
                 use_native = self.video_mode == "native" and start is None and end is None
                 if use_native:
                     content.append(_native_video_part(path))
@@ -1339,6 +1437,11 @@ class LlamaCppCaptioner(BaseCaptioner):
             elif part.type == "audio":
                 if part.path is None:
                     raise ValueError("Audio parts require a path")
+                if not self.supports_audio:
+                    raise ValueError(
+                        "The loaded model has no audio encoder, so it cannot caption audio input. "
+                        "Use a model whose mmproj includes an audio encoder (for example Qwen3-Omni)."
+                    )
                 path = Path(part.path).expanduser().resolve(strict=True)
                 info = probe_media(path)
                 duration = max(0.0, float((end if end is not None else info.duration) or 0.0) - float(start or 0.0))
@@ -1351,6 +1454,11 @@ class LlamaCppCaptioner(BaseCaptioner):
             elif part.type == "image":
                 if part.path is None:
                     raise ValueError("Image parts require a path")
+                if not self.supports_vision:
+                    raise ValueError(
+                        "The loaded model has no vision projector, so it cannot caption images. "
+                        "Set the mmproj path for the custom model."
+                    )
                 with Image.open(part.path) as image:
                     converted = ImageOps.exif_transpose(image).convert("RGB")
                     content.append(
@@ -1918,7 +2026,28 @@ class LlamaCppCaptioner(BaseCaptioner):
                 )
                 for warning in prepared.warnings:
                     _emit(callbacks.progress, warning)
-                stream = self._stream_request(self._payload(prepared.messages, generation), callbacks)
+                extra_warnings: list[str] = []
+                try:
+                    stream = self._stream_request(self._payload(prepared.messages, generation), callbacks)
+                except RuntimeError as exc:
+                    # A custom model whose projector has no audio encoder (for
+                    # example Qwen2.5-VL) rejects input_audio with an HTTP 400.
+                    # Retry once without the audio parts so the video is still
+                    # captioned from its frames, and remember the limitation.
+                    stripped, removed = _strip_audio_parts(prepared.messages)
+                    if removed == 0 or not _looks_like_audio_rejection(exc):
+                        raise
+                    note = (
+                        "The loaded model rejected the audio input; retrying with visual/text input only. "
+                        f"Server error: {_short_error_text(exc)}"
+                    )
+                    get_log().warn(note, scope="llama.cpp")
+                    _emit(callbacks.progress, note)
+                    extra_warnings.append(note)
+                    modalities = dict(self.server_modalities or {"vision": True})
+                    modalities["audio"] = False
+                    self.server_modalities = modalities
+                    stream = self._stream_request(self._payload(stripped, generation), callbacks)
         except CancelledError:
             self.stop()
             raise
@@ -1966,8 +2095,34 @@ class LlamaCppCaptioner(BaseCaptioner):
             ),
             peak_vram_gb=stream.peak_vram_gb,
             cancelled=stream.cancelled,
-            warnings=tuple(prepared.warnings),
+            warnings=tuple(prepared.warnings) + tuple(extra_warnings),
         )
+
+
+def _strip_audio_parts(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Return a copy of ``messages`` without ``input_audio`` parts and the removed count."""
+
+    removed = 0
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            stripped.append(message)
+            continue
+        kept = [part for part in content if not (isinstance(part, dict) and part.get("type") == "input_audio")]
+        removed += len(content) - len(kept)
+        stripped.append({**message, "content": kept})
+    return stripped, removed
+
+
+def _looks_like_audio_rejection(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return "audio" in text and ("not supported" in text or "unsupported" in text or "input_audio" in text)
+
+
+def _short_error_text(error: BaseException, limit: int = 300) -> str:
+    text = " ".join(str(error).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 __all__ = [

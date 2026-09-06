@@ -688,6 +688,9 @@ class MediaInputHandles:
     scan_fn: Callable[..., tuple[Any, ...]] | None = None
     scan_inputs: list[Any] | None = None
     scan_outputs: list[Any] | None = None
+    # Unregistered convenience copy of the "Save only .txt captions" switch shown
+    # in the folder panel; the caption tab keeps it in sync with the real control.
+    txt_only_mirror: Any = None
 
 
 def _paths(value: Any) -> list[str]:
@@ -1044,6 +1047,8 @@ def media_input_block(
     save_next_to_source_info: str = (
         "Write each transcript beside its source instead of mirroring it below the batch output folder."
     ),
+    txt_only_mirror_label: str | None = None,
+    txt_only_mirror_info: str = "",
     include_caption_coverage: bool = False,
     default_existing_extension: str = ".txt",
     existing_item_noun: str = "captioned",
@@ -1281,6 +1286,14 @@ def media_input_block(
                         section=section,
                         description=save_next_to_source_info,
                         kind="bool",
+                    )
+                txt_only_mirror: Any = None
+                if txt_only_mirror_label:
+                    txt_only_mirror = gr.Checkbox(
+                        value=False,
+                        label=txt_only_mirror_label,
+                        info=txt_only_mirror_info,
+                        elem_id=f"{input_tabs_elem_id}-txt-only",
                     )
                 scan_summary = gr.Markdown(
                     "<span class='vc-help'>Choose a folder for a light extension scan.</span>",
@@ -1684,6 +1697,7 @@ def media_input_block(
         scan_folder,
         folder_inputs,
         folder_outputs,
+        txt_only_mirror,
     )
 
 

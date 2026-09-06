@@ -68,6 +68,21 @@ clip_clips/
 
 Temporary multi-segment runs use `<stem>_segments/` instead. The item-level timestamped combined caption receives the same three-file layout.
 
+## Plain .txt-only layout
+
+**Save only .txt captions** (Processing Pipeline > 6. Post-processing, mirrored in the Caption tab's Folder batch panel) reduces every caption unit to the single merged file:
+
+```text
+dataset/session_a/
+  clip.mp4
+  clip.txt                       # merged video + audio caption
+outputs/batch_0001_<model>/
+  metadata.json
+  run_log.txt
+```
+
+`video_caption/` and `audio_caption/` parts are composed in memory only, JSON and subtitle outputs, transcript sidecars, reasoning files, and the long-video summary are skipped, and **Write merged caption beside each clip** is treated as on. Batch skip rules look for the single `<stem>.txt`. Existing-caption mode is the one exception: it still keeps its clean copy in `video_caption/` so repeated overwrite runs stay idempotent (the merged file would otherwise be re-read as the clean caption). The Caption Editor shows the merged text; `metadata.json` records the composed audio caption for each unit.
+
 ## Sources and ordering
 
 `whisper` uses the stage 7 Whisper settings. It runs even when the stage 7 checkbox is off, because the audio-caption setting requires its in-memory result. Segment units receive only their overlapping transcript with timestamps shifted to start at zero. Prompt injection remains an independent setting.

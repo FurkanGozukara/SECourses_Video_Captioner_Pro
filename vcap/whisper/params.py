@@ -306,10 +306,13 @@ class WhisperParams:
     language_detection_segments: int = 1
     use_batched_inference: bool = False
     batch_size: int = 1
+    # Optional local CTranslate2 folder that replaces the catalogue model ``model``.
+    model_path: str = ""
     vad: WhisperVadParams = field(default_factory=WhisperVadParams)
 
     def __post_init__(self) -> None:
         self.model = _text(self.model, "large-v1").strip() or "large-v1"
+        self.model_path = _text(self.model_path).strip()
         original_language = _text(self.language)
         code = language_to_code(original_language)
         self.language = code_to_language(code) if code else LANGUAGE_AUTO
@@ -429,6 +432,20 @@ class WhisperParams:
             registry_key = f"{prefix}{registry_suffix}"
             if registry_key in source:
                 values[field_name] = source[registry_key]
+        explicit_path = str(source.get(f"{prefix}model_path") or "").strip()
+        if explicit_path:
+            values["model_path"] = explicit_path
+        else:
+            # The Caption tab's audio override replaces Whisper whenever it points
+            # at a faster-whisper (CTranslate2) folder; other override kinds
+            # target the Qwen3-Omni Captioner and are ignored here.
+            override_raw = source.get("override_audio_model_path")
+            if str(override_raw or "").strip():
+                from vcap.models.overrides import whisper_override_folder
+
+                folder = whisper_override_folder(override_raw)
+                if folder is not None:
+                    values["model_path"] = str(folder)
 
         vad_map = {
             "vad_filter": "enabled",

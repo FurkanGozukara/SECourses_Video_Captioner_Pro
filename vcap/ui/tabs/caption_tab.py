@@ -57,6 +57,11 @@ from vcap.models.offload import (
     migrate_legacy_gpu_layers,
     plan_model_folder,
 )
+from vcap.models.overrides import (
+    describe_override,
+    override_settings_problems,
+    whisper_override_folder,
+)
 from vcap.models.registry import (
     MODEL_SPECS,
     all_variant_choices,
@@ -1245,6 +1250,85 @@ def _quant_line(variant_key: str) -> str:
         return f"<span class='vc-err'>{html.escape(str(exc))}</span>"
 
 
+_OVERRIDE_STATE_STYLE = {
+    "ok": ("vc-ok", "✓"),
+    "warn": ("vc-warn", "⚠"),
+    "error": ("vc-err", "✗"),
+}
+
+
+def override_status_html(
+    video_path: Any,
+    video_mmproj: Any,
+    audio_path: Any,
+    audio_mmproj: Any,
+    model_key: Any,
+    audio_source: Any,
+) -> str:
+    """Describe both override fields: what was detected, or why a path is unusable."""
+
+    variant_key = str(model_key or _INITIAL_VARIANT)
+    lines: list[str] = []
+    for role, raw, mmproj, title in (
+        ("main", video_path, video_mmproj, "Video / main model"),
+        ("audio", audio_path, audio_mmproj, "Audio caption model"),
+    ):
+        info = describe_override(role, raw, mmproj, variant_key, audio_source=str(audio_source or "none"))
+        if info["state"] == "off":
+            continue
+        css, icon = _OVERRIDE_STATE_STYLE.get(str(info["state"]), ("vc-err", "✗"))
+        line = f"<span class='{css}'>{icon} {title}: {html.escape(str(info['text']))}</span>"
+        notes = [html.escape(str(note)) for note in info.get("notes", []) if str(note).strip()]
+        if notes:
+            line += "<br><span class='vc-help'>" + " ".join(notes) + "</span>"
+        lines.append(line)
+    if not lines:
+        return "<span class='vc-help'>No override set; the registered files of the selected variant are used.</span>"
+    return "<br>".join(lines)
+
+
+def txt_only_hint_html(enabled: Any) -> str:
+    """Explain what the 'Save only .txt captions' switch changes for the next run."""
+
+    if bool(enabled):
+        return (
+            "<span class='vc-ok'>✓ Each item or clip writes exactly one &lt;name&gt;.txt caption.</span> "
+            "<span class='vc-help'>Output formats (JSON, SRT, WebVTT, JSONL), transcript sidecars, reasoning, the "
+            "long-video summary, and the video_caption/ and audio_caption/ part folders are skipped while this is on. "
+            "Merged video + audio captions are still composed in that one file; metadata.json and run_log.txt stay "
+            "in the numbered run directory.</span>"
+        )
+    return (
+        "<span class='vc-help'>Off: the Output formats below, transcript sidecars, and the dataset part folders are "
+        "written as configured.</span>"
+    )
+
+
+def whisper_override_note_html(raw: Any) -> Any:
+    """Transcribe-tab note for a Whisper folder set through the Caption tab override."""
+
+    text = str(raw or "").strip()
+    if not text:
+        return gr.update(value="", visible=False)
+    folder = whisper_override_folder(text)
+    if folder is None:
+        return gr.update(
+            value=(
+                "<span class='vc-help'>The audio caption model override in Caption → Model → Override model loading "
+                f"({html.escape(text)}) is not a faster-whisper folder, so the Whisper model above is used.</span>"
+            ),
+            visible=True,
+        )
+    return gr.update(
+        value=(
+            f"<span class='vc-warn'>⚠ Custom Whisper model folder in use: {html.escape(str(folder))}</span><br>"
+            "<span class='vc-help'>Set in Caption → Model → Override model loading (audio caption model). "
+            "The Whisper model dropdown above is ignored until that field is cleared.</span>"
+        ),
+        visible=True,
+    )
+
+
 _GIB = float(2**30)
 # A fresh worker's CUDA context is not visible to NVML until the worker exists; the
 # loader measures free VRAM after creating it, so the preview budgets for it.
@@ -1619,6 +1703,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "and saved clips are written beside each source. Metadata, run_log.txt, and .work "
                         "remain in the numbered batch run directory."
                     ),
+                    txt_only_mirror_label="Save only the .txt caption (skip JSON and other sidecar files)",
+                    txt_only_mirror_info=(
+                        "Write exactly one <name>.txt per item or clip and nothing else: no JSON, SRT/VTT, JSONL, "
+                        "transcript sidecars, reasoning, summary, or video_caption/ and audio_caption/ part folders. "
+                        "Same switch as in Processing Pipeline → 6. Post-processing; applies to single runs too."
+                    ),
                     include_caption_coverage=True,
                     preview_height=320,
                 )
@@ -1908,6 +1998,93 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 description="Show model variants that exceed the active VRAM tier.", kind="bool",
                             )
                             quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
+                            with gr.Accordion(
+                                "Override model loading (experimental)",
+                                open=False,
+                                elem_id="vc_model_override",
+                            ):
+                                gr.Markdown(
+                                    "Load custom checkpoints instead of the registered files of the selected variant. "
+                                    "Leave a field empty to use the regular model. The selected Model variant still "
+                                    "provides the prompts, media limits, and generation controls; the backend follows "
+                                    "the file you point at: a .gguf file or a folder with one runs through llama.cpp "
+                                    "(any llama.cpp multimodal GGUF, for example a Q2/Q3 or abliterated Qwen3-Omni "
+                                    "conversion, or Qwen2.5-VL, with a Qwen3-Omni variant selected as the base), and a "
+                                    "Transformers folder (config.json + safetensors) must belong to the same family as "
+                                    "the selected variant. Nothing is downloaded for an override.",
+                                    elem_classes=["vc-help"],
+                                )
+                                override_video_model_path = gr.Textbox(
+                                    value="",
+                                    label="Video / main caption model override",
+                                    placeholder=r"Empty = regular model. Example: D:\models\Qwen3-Omni-30B-A3B-Instruct-Q3_K_M.gguf",
+                                    info=(
+                                        "Path to a .gguf file, a folder containing it, or a Transformers checkpoint folder. "
+                                        "Used whenever the selected caption model would be loaded (Caption, Processing "
+                                        "Pipeline, Chat, and Caption Editor regeneration)."
+                                    ),
+                                    elem_id="vc_override_video_model_path",
+                                )
+                                controls["override_video_model_path"] = ctx.reg(
+                                    "override_video_model_path", override_video_model_path, "", section="model",
+                                    description=(
+                                        "Custom checkpoint (GGUF file/folder or Transformers folder) that replaces the "
+                                        "selected variant's files; empty uses the registered model."
+                                    ),
+                                    kind="str",
+                                )
+                                override_video_mmproj_path = gr.Textbox(
+                                    value="",
+                                    label="mmproj file for the video / main override (optional)",
+                                    placeholder=r"Empty = auto-detect an mmproj*.gguf beside the model",
+                                    info=(
+                                        "Multimodal projector for a GGUF override. Empty picks the mmproj file stored "
+                                        "next to the model; set it when the projector lives elsewhere or several exist."
+                                    ),
+                                    elem_id="vc_override_video_mmproj_path",
+                                )
+                                controls["override_video_mmproj_path"] = ctx.reg(
+                                    "override_video_mmproj_path", override_video_mmproj_path, "", section="model",
+                                    description="Optional mmproj .gguf for the main GGUF override; empty auto-detects one beside the model.",
+                                    kind="str",
+                                )
+                                override_audio_model_path = gr.Textbox(
+                                    value="",
+                                    label="Audio caption model override",
+                                    placeholder=r"Empty = regular audio model. Example: D:\models\my-whisper-ct2  or  D:\models\Captioner-Q3_K_M.gguf",
+                                    info=(
+                                        "Replaces the model that produces audio captions (Processing Pipeline → 8): a "
+                                        "faster-whisper (CTranslate2) folder with model.bin replaces the Whisper speech "
+                                        "model; a Qwen3-Omni Captioner .gguf or Transformers folder replaces the "
+                                        "sound-caption model."
+                                    ),
+                                    elem_id="vc_override_audio_model_path",
+                                )
+                                controls["override_audio_model_path"] = ctx.reg(
+                                    "override_audio_model_path", override_audio_model_path, "", section="model",
+                                    description=(
+                                        "Custom audio caption model: a faster-whisper CTranslate2 folder (replaces Whisper) "
+                                        "or a Qwen3-Omni Captioner GGUF/Transformers checkpoint; empty uses the regular model."
+                                    ),
+                                    kind="str",
+                                )
+                                override_audio_mmproj_path = gr.Textbox(
+                                    value="",
+                                    label="mmproj file for the audio override (optional)",
+                                    placeholder=r"Empty = auto-detect an mmproj*.gguf beside the model",
+                                    info="Multimodal projector for a Captioner GGUF override; empty auto-detects one beside the model.",
+                                    elem_id="vc_override_audio_mmproj_path",
+                                )
+                                controls["override_audio_mmproj_path"] = ctx.reg(
+                                    "override_audio_mmproj_path", override_audio_mmproj_path, "", section="model",
+                                    description="Optional mmproj .gguf for the audio GGUF override; empty auto-detects one beside the model.",
+                                    kind="str",
+                                )
+                                override_status = gr.Markdown(
+                                    override_status_html("", "", "", "", _INITIAL_VARIANT, "none"),
+                                    elem_classes=["vc-status"],
+                                    elem_id="vc_override_status",
+                                )
                             with gr.Row():
                                 vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
                                 vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
@@ -3432,6 +3609,30 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         ),
                         kind="int", minimum=0, maximum=100000,
                     )
+                    caption_txt_only = gr.Checkbox(
+                        value=False,
+                        label="Save only .txt captions (skip JSON and every other sidecar file)",
+                        info=(
+                            "Write exactly one <name>.txt per item or clip. JSON, SRT/VTT, JSONL, transcript sidecars, "
+                            "reasoning, the long-video summary, and the video_caption/ and audio_caption/ part folders "
+                            "are skipped; merged video + audio captions still land in that single file. Also available "
+                            "in the Caption tab's Folder batch panel."
+                        ),
+                        elem_id="vc_caption_txt_only",
+                    )
+                    controls["caption_txt_only"] = ctx.reg(
+                        "caption_txt_only", caption_txt_only, False, section="output",
+                        description=(
+                            "Write exactly one <name>.txt caption per item or clip and skip JSON, subtitle, JSONL, "
+                            "transcript, reasoning, summary, and dataset part files."
+                        ),
+                        kind="bool",
+                    )
+                    txt_only_hint = gr.Markdown(
+                        txt_only_hint_html(False),
+                        elem_classes=["vc-status"],
+                        elem_id="vc_caption_txt_only_hint",
+                    )
                     formats = gr.CheckboxGroup(
                         choices=[("Plain text", "txt"), ("JSON", "json"), ("SRT", "srt"), ("WebVTT", "vtt"), ("Dataset JSONL", "jsonl")],
                         value=["txt", "json"],
@@ -3879,6 +4080,55 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         job_done_hook=job_done_hook,
     )
     ctx.caption_handles = handles
+
+    # "Save only .txt captions" lives in Post-processing; the folder panel shows a
+    # convenience copy. The copy pushes user clicks into the real control through
+    # ``input`` (user-initiated only) and the real control mirrors every change,
+    # including preset loads, back through ``change``: no feedback loop.
+    txt_only_mirror = media.txt_only_mirror
+    if txt_only_mirror is not None:
+        txt_only_mirror.input(
+            lambda value: bool(value),
+            inputs=txt_only_mirror,
+            outputs=caption_txt_only,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+        caption_txt_only.change(
+            lambda value: bool(value),
+            inputs=caption_txt_only,
+            outputs=txt_only_mirror,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    caption_txt_only.change(
+        txt_only_hint_html,
+        inputs=caption_txt_only,
+        outputs=txt_only_hint,
+        queue=False,
+        show_progress="hidden",
+        api_visibility="private",
+    )
+    override_status_inputs = [
+        override_video_model_path,
+        override_video_mmproj_path,
+        override_audio_model_path,
+        override_audio_mmproj_path,
+        model_key,
+        audio_caption_source,
+    ]
+    for trigger in override_status_inputs:
+        trigger.change(
+            override_status_html,
+            inputs=override_status_inputs,
+            outputs=override_status,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
+    ctx.states["override_status_component"] = override_status
 
     # Lightweight local interactions can be wired immediately.
     last_outputs_state.change(
@@ -5912,6 +6162,19 @@ def wire(ctx: "UiContext") -> None:
         raise RuntimeError("caption_tab.build() must run before wire()")
     registry = ctx.settings_registry
     registry_components = registry.components()
+    whisper_override_note = ctx.states.get("whisper_override_note")
+    audio_override_control = handles.controls.get("override_audio_model_path")
+    if whisper_override_note is not None and audio_override_control is not None:
+        # The Transcribe tab shares the Whisper override; tell it which folder
+        # replaces its dropdown model whenever the Caption-tab field changes.
+        audio_override_control.change(
+            whisper_override_note_html,
+            inputs=audio_override_control,
+            outputs=whisper_override_note,
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
     output_components = [
         handles.progress.bars,
         handles.progress.status,
@@ -5972,6 +6235,29 @@ def wire(ctx: "UiContext") -> None:
                     settings["user_prompt"] = user_update
             except KeyError:
                 pass  # The compatible-preset resolution below handles unknown IDs.
+        override_problems = override_settings_problems(settings)
+        if override_problems:
+            # A missing or incompatible custom checkpoint is reported before any
+            # input resolution, worker start, or model download can happen.
+            message = " ".join(override_problems)
+            yield (
+                render_progress_html(0, "Model override", message),
+                f"<span class='vc-err'>{html.escape(message)}</span>",
+                "**ETA:** —",
+                "**Speed:** — · **Context:** —",
+                [],
+                *[gr.skip() for _ in range(8)],
+                "",
+                gr.update(value="⏹ Cancel", interactive=False),
+                gr.update(visible=False),
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(value=None, visible=False),
+            )
+            return
         if retry_state is None:
             resolved = resolve_caption_inputs_at_start(
                 settings,

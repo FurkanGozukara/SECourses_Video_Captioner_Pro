@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.9.0",
+        "2026-09-06",
+        """
+### Plain .txt-only captions and custom model overrides
+
+- **Save only .txt captions** (Processing Pipeline → 6. Post-processing, with a linked copy in the Caption tab's Folder batch panel next to **Save outputs next to the source files**): every item or clip writes exactly one `<name>.txt` and nothing else. JSON, SRT/WebVTT, JSONL, transcript sidecars, Thinking reasoning files, the long-video summary, and the `video_caption/` and `audio_caption/` part folders are skipped; a merged video + audio caption still lands in that single file, and `metadata.json` plus `run_log.txt` stay in the numbered run directory. Batch skip rules, the run history, the Caption Editor, presets, and Recover Settings understand the new layout.
+- **Override model loading (experimental)** in Caption → Model: point the **video / main caption model** at a local checkpoint instead of the registered files, and nothing is downloaded. A `.gguf` file or a folder containing one runs through llama.cpp with the selected Qwen3-Omni variant as its base, so Q2/Q3 or abliterated Qwen3-Omni conversions and other llama.cpp multimodal models such as Qwen2.5-VL load directly; a Transformers folder must belong to the selected family. The optional **mmproj** field replaces the projector that is otherwise auto-detected beside the model. The **audio caption model** override does the same for the sound-caption Captioner (GGUF or Transformers) or, when it names a faster-whisper CTranslate2 folder, replaces the Whisper speech model for caption jobs and the Transcribe tab (which shows a note while the override is active).
+- Override paths are validated before Start and described by a live status line under the fields (detected format, size, projector, and family compatibility). They travel with universal presets and run metadata (`model_info.override` / `audio_override`), apply to Chat and Caption Editor regeneration, and switch the resident model automatically when they change. llama-server's `/props` modalities are honoured: a custom model without an audio encoder is captioned from its frames with a logged warning, and an audio rejection is retried once without audio.
+""".strip(),
+    ),
+    (
         "v1.8.1",
         "2026-09-06",
         """

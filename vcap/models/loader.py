@@ -98,6 +98,8 @@ class LoadedModel:
     offload: OffloadPlan = field(default_factory=OffloadPlan)
     model_dir: Path | None = None
     gpu_index: int = 0
+    # JSON-safe description of a custom checkpoint override, when one was loaded.
+    override: dict[str, Any] | None = None
 
 
 def _emit(callback: ProgressCallback | None, message: str, fraction: float | None = None) -> None:
@@ -372,6 +374,7 @@ def _load_llamacpp_model(
     model_dir: str | os.PathLike[str] | None,
     context_size: int | None = None,
     runtime: Any | None = None,
+    override: Any | None = None,
 ) -> LoadedModel:
     """Start a local llama-server and wrap it in the common load contract."""
 
@@ -382,13 +385,41 @@ def _load_llamacpp_model(
     family = variant_to_family(variant_key)
     spec = MODEL_SPECS[family]
     variant = get_variant(variant_key)
-    folder = Path(model_dir).expanduser().resolve(strict=False) if model_dir else resolve_model_dir(variant.key)
-    if model_dir is None:
-        ready, detail = variant_is_ready(variant.key)
-        if not ready:
-            raise FileNotFoundError(f"{variant.key} is not ready: {detail}")
-    elif not folder.is_dir() or any(not (folder / name).is_file() for name in (variant.gguf_files or ())):
-        raise FileNotFoundError(f"GGUF model files are incomplete in {folder}")
+    checkpoint_bytes: int | None = None
+    override_kwargs: dict[str, Any] = {}
+    if override is not None:
+        from .overrides import override_variant
+
+        if getattr(override, "kind", "") != "gguf":
+            raise ValueError(f"{getattr(override, 'path', override)} is not a GGUF override")
+        if not override.path.is_file():
+            raise FileNotFoundError(f"Custom GGUF model file does not exist: {override.path}")
+        if override.mmproj is not None and not override.mmproj.is_file():
+            raise FileNotFoundError(f"Custom mmproj file does not exist: {override.mmproj}")
+        variant = override_variant(variant, override)
+        folder = override.path.parent
+        checkpoint_bytes = int(override.path.stat().st_size) + (
+            int(override.mmproj.stat().st_size) if override.mmproj is not None else 0
+        )
+        override_kwargs = {
+            "variant": variant,
+            "model_path": override.path,
+            "mmproj_path": override.mmproj,
+        }
+        _emit(
+            progress_cb,
+            f"Custom model override for {spec.label}: {override.label}",
+        )
+        for note in getattr(override, "notes", ()) or ():
+            get_log().warn(str(note), scope="models")
+    else:
+        folder = Path(model_dir).expanduser().resolve(strict=False) if model_dir else resolve_model_dir(variant.key)
+        if model_dir is None:
+            ready, detail = variant_is_ready(variant.key)
+            if not ready:
+                raise FileNotFoundError(f"{variant.key} is not ready: {detail}")
+        elif not folder.is_dir() or any(not (folder / name).is_file() for name in (variant.gguf_files or ())):
+            raise FileNotFoundError(f"GGUF model files are incomplete in {folder}")
     _emit(progress_cb, f"Loading {spec.label} / {variant.label} with llama.cpp", 0.0)
     server = ensure_llamacpp(progress_cb)
     plan = offload or OffloadPlan()
@@ -397,6 +428,7 @@ def _load_llamacpp_model(
         variant_key=variant.key,
         server_path=server,
         model_dir=folder,
+        **override_kwargs,
         device_index=device_index,
         gpu_index=gpu_index,
         vram_total_gb=float(
@@ -413,7 +445,9 @@ def _load_llamacpp_model(
     report = LoadReport(
         seconds=time.perf_counter() - started,
         peak_vram_gb=float(backend.load_peak_vram_gb),
-        checkpoint_bytes=_gguf_checkpoint_bytes(folder, variant),
+        checkpoint_bytes=(
+            checkpoint_bytes if checkpoint_bytes is not None else _gguf_checkpoint_bytes(folder, variant)
+        ),
         attention="llamacpp",
         device_map={"": str(device)},
         compile_mode="llama.cpp",
@@ -431,6 +465,7 @@ def _load_llamacpp_model(
         plan,
         folder,
         gpu_index,
+        override=override.to_dict() if override is not None else None,
     )
     backend.loaded = loaded
     _SWITCH_REGISTRY.add(loaded)
@@ -712,15 +747,28 @@ def load_model(
     budget_hint: BudgetHint | None = None,
     last_token_logits: bool = True,
     runtime: Any | None = None,
+    override: Any | None = None,
 ) -> LoadedModel:
-    """Load one local thinker checkpoint through its registered backend."""
+    """Load one local thinker checkpoint through its registered backend.
+
+    ``override`` (a :class:`vcap.models.overrides.ModelOverride`) replaces the
+    variant's files: a GGUF override always runs through llama.cpp and a
+    Transformers folder through the Transformers path, whatever the base
+    variant's own backend is. The base variant keeps supplying the family
+    behaviour and its key stays the cache/unload identity.
+    """
 
     device, device_index, physical_gpu_index = _resolve_gpu_selection(device, gpu_index)
     _enforce_dev_gpu_guard(physical_gpu_index)
     family = variant_to_family(variant_key)
     spec = MODEL_SPECS[family]
     variant = get_variant(variant_key)
-    if variant.scheme == "gguf":
+    override_kind = str(getattr(override, "kind", "") or "") if override is not None else ""
+    if override_kind == "ctranslate2":
+        raise ValueError(
+            f"{override.path} is a Whisper (CTranslate2) model folder and cannot replace the {spec.label} caption model."
+        )
+    if override_kind == "gguf" or (override is None and variant.scheme == "gguf"):
         return _load_llamacpp_model(
             variant.key,
             device=device,
@@ -731,10 +779,23 @@ def load_model(
             model_dir=hf_dir,
             context_size=int(getattr(budget_hint, "context_tokens", 0) or 0) or None,
             runtime=runtime,
+            override=override,
         )
     import torch
 
     started = time.perf_counter()
+    if override_kind == "transformers":
+        from .overrides import override_variant
+
+        if not override.path.is_dir():
+            raise FileNotFoundError(f"Custom checkpoint folder does not exist: {override.path}")
+        hf_dir = override.path
+        variant = override_variant(variant, override)
+        _emit(progress_cb, f"Custom model override for {spec.label}: {override.label}")
+        for note in getattr(override, "notes", ()) or ():
+            get_log().warn(str(note), scope="models")
+    elif override is not None:
+        raise ValueError(f"Unsupported model override kind: {override_kind or type(override).__name__}")
     folder = Path(hf_dir).expanduser().resolve(strict=False) if hf_dir else resolve_model_dir(variant_key)
     if hf_dir is None:
         ready, detail = variant_is_ready(variant_key)
@@ -1048,6 +1109,7 @@ def load_model(
         plan,
         folder,
         physical_gpu_index,
+        override=override.to_dict() if override is not None else None,
     )
     _SWITCH_REGISTRY.add(loaded)
     _emit(
@@ -1362,12 +1424,14 @@ class ModelCache:
         """Reuse an identical model or unload before switching variants/options."""
 
         offload = kwargs.get("offload") or OffloadPlan()
+        override = kwargs.get("override")
+        override_kind = str(getattr(override, "kind", "") or "") if override is not None else ""
         # A llama-server is started with a fixed context, so a different requested
         # window needs a restart; Transformers apply the window per call instead.
         context_key = 0
         runtime_key: Any = ()
         try:
-            if get_variant(variant_key).scheme == "gguf":
+            if override_kind == "gguf" or (override is None and get_variant(variant_key).scheme == "gguf"):
                 context_key = int(getattr(kwargs.get("budget_hint"), "context_tokens", 0) or 0)
                 from .llamacpp_backend import LlamaCppRuntimeOptions
 
@@ -1380,6 +1444,8 @@ class ModelCache:
         )
         key = (
             ("variant", variant_key),
+            ("override", str(getattr(override, "path", "")) if override is not None else ""),
+            ("override_mmproj", str(getattr(override, "mmproj", "") or "") if override is not None else ""),
             ("device", str(kwargs.get("device", "cuda:0"))),
             ("gpu_index", kwargs.get("gpu_index")),
             ("attention", str(kwargs.get("attention", "auto"))),

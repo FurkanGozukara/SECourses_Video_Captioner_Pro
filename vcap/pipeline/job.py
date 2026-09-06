@@ -305,14 +305,53 @@ class OffloadSpec:
         )
 
 
+def _override_path(value: Any) -> str:
+    """Normalize a custom checkpoint path field; empty means no override."""
+
+    text = "" if value is None else str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 @dataclass(frozen=True)
 class ModelChoice:
-    """Selected checkpoint and model-loading policy."""
+    """Selected checkpoint and model-loading policy.
+
+    ``override_model_path`` replaces the files of ``variant_key`` (a GGUF file
+    or folder, or a Transformers checkpoint folder) while the variant keeps
+    supplying the family behaviour. ``override_audio_model_path`` does the same
+    for the audio caption model: a Captioner GGUF/Transformers checkpoint, or a
+    faster-whisper CTranslate2 folder that replaces the Whisper speech model.
+    The mmproj fields are optional multimodal projectors for GGUF overrides;
+    empty auto-detects an ``mmproj`` file beside the model.
+    """
 
     variant_key: str = "qwen3_omni_instruct_int4"
     attention: str = "auto"
     vram_preset: str = "auto"
     offload: OffloadSpec = field(default_factory=OffloadSpec)
+    override_model_path: str = ""
+    override_mmproj_path: str = ""
+    override_audio_model_path: str = ""
+    override_audio_mmproj_path: str = ""
+
+    def __post_init__(self) -> None:
+        for name in (
+            "override_model_path",
+            "override_mmproj_path",
+            "override_audio_model_path",
+            "override_audio_mmproj_path",
+        ):
+            object.__setattr__(self, name, _override_path(getattr(self, name)))
+
+    @property
+    def has_override(self) -> bool:
+        return bool(self.override_model_path)
+
+    @property
+    def has_audio_override(self) -> bool:
+        return bool(self.override_audio_model_path)
 
 
 @dataclass(frozen=True)
@@ -464,8 +503,15 @@ class PostSpec:
     subtitle_min_cue_s: float = 0.5
     subtitle_max_line_chars: int = 0
     join_separator: str = " "
+    # Write exactly one ``<name>.txt`` per item or clip: no JSON/SRT/VTT/JSONL,
+    # transcript sidecars, reasoning, summary, or video_caption/audio_caption parts.
+    txt_only: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "txt_only", _bool(self.txt_only, False))
+        if self.txt_only:
+            object.__setattr__(self, "formats", ("txt",))
+            object.__setattr__(self, "save_reasoning", False)
         object.__setattr__(self, "formats", _formats(self.formats))
         object.__setattr__(self, "replace_pairs", _replace_pairs(self.replace_pairs))
         object.__setattr__(
@@ -872,6 +918,18 @@ class JobSpec:
             variant_key=variant_key,
             attention=str(_setting(source, "attention", "attention_backend", default="auto")),
             vram_preset=str(_setting(source, "vram_preset", default="auto")),
+            override_model_path=_override_path(
+                _setting(source, "override_video_model_path", "override_model_path", default="")
+            ),
+            override_mmproj_path=_override_path(
+                _setting(source, "override_video_mmproj_path", "override_mmproj_path", default="")
+            ),
+            override_audio_model_path=_override_path(
+                _setting(source, "override_audio_model_path", default="")
+            ),
+            override_audio_mmproj_path=_override_path(
+                _setting(source, "override_audio_mmproj_path", default="")
+            ),
             offload=OffloadSpec(
                 gpu_layers=gpu_layers,
                 offload_experts=_bool(
@@ -1164,6 +1222,7 @@ class JobSpec:
             collapse_whitespace=_bool(_setting(source, "collapse_whitespace", default=False)),
             formats=_formats(_setting(source, "output_formats", "formats", default=("txt",))),
             save_reasoning=_bool(_setting(source, "save_reasoning", default=True), True),
+            txt_only=_bool(_setting(source, "caption_txt_only", "txt_only", default=False), False),
             max_caption_chars=max(
                 0,
                 min(

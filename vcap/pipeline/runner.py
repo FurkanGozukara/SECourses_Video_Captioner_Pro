@@ -53,6 +53,12 @@ from vcap.core.preprocess import (
 from vcap.core.progress import ProgressEvent, ProgressSink, ProgressTracker, UiThrottle
 from vcap.core.scene_split import SceneDetectParams, SceneRange, plan_segments, split_video
 from vcap.core.subprocess_runner import CancelToken, CancelledError
+from vcap.models.overrides import (
+    ModelOverride,
+    override_identity,
+    resolve_audio_override,
+    resolve_main_override,
+)
 from vcap.models.registry import MODEL_SPECS, ModelSpec, variant_to_family
 from vcap.prompts.presets import get_preset
 
@@ -63,6 +69,7 @@ _TOTAL_STEPS = 8
 _FAKE_LOCK = threading.RLock()
 _FAKE_CAPTIONER: "_FakeCaptioner | None" = None
 _FAKE_VARIANT: str | None = None
+_FAKE_OVERRIDE: tuple[str, str] = ("", "")
 
 
 def _split_layout(spec: JobSpec) -> bool:
@@ -92,6 +99,95 @@ def _sound_captioner_variant(spec: JobSpec) -> str:
         spec.model.variant_key,
         vram_tier=_captioner_vram_tier(spec),
     )
+
+
+def _main_override(model: ModelChoice, *, role: str = "main") -> ModelOverride | None:
+    """Resolve the custom checkpoint that replaces ``model.variant_key``'s files."""
+
+    if not model.override_model_path:
+        return None
+    return resolve_main_override(
+        model.variant_key,
+        model.override_model_path,
+        model.override_mmproj_path,
+        role=role,
+    )
+
+
+def _sound_caption_model_choice(spec: JobSpec, captioner_variant: str) -> ModelChoice:
+    """Return the model choice for the sound-caption phase, applying the audio override.
+
+    The audio override replaces the Captioner files when it is a GGUF or
+    Transformers checkpoint; a Whisper (CTranslate2) folder targets the speech
+    model instead and leaves the Captioner untouched.
+    """
+
+    override = resolve_audio_override(
+        captioner_variant,
+        spec.model.override_audio_model_path,
+        spec.model.override_audio_mmproj_path,
+    )
+    return replace(
+        spec.model,
+        variant_key=captioner_variant,
+        override_model_path=str(override.path) if override is not None else "",
+        override_mmproj_path=(
+            str(override.mmproj) if override is not None and override.mmproj is not None else ""
+        ),
+        override_audio_model_path="",
+        override_audio_mmproj_path="",
+    )
+
+
+def _same_model_choice(left: ModelChoice, right: ModelChoice) -> bool:
+    return left.variant_key == right.variant_key and override_identity(
+        left.override_model_path, left.override_mmproj_path
+    ) == override_identity(right.override_model_path, right.override_mmproj_path)
+
+
+def _validate_job_overrides(spec: JobSpec, *, loads_main_model: bool) -> list[str]:
+    """Resolve both override fields up front so a bad path fails before any work.
+
+    Returns human-readable notes about which override applies; raises
+    ``ValueError`` for an invalid path or an incompatible checkpoint.
+    """
+
+    notes: list[str] = []
+    if spec.model.override_model_path and loads_main_model:
+        override = _main_override(spec.model)
+        if override is not None:
+            notes.append(f"Main caption model override: {override.label}")
+            notes.extend(override.notes)
+    if spec.model.override_audio_model_path:
+        from vcap.models.overrides import classify_model_path
+
+        classified = classify_model_path(
+            spec.model.override_audio_model_path,
+            spec.model.override_audio_mmproj_path,
+        )
+        if classified is not None and classified.kind == "ctranslate2":
+            if _needs_whisper(spec):
+                notes.append(f"Whisper speech model override: {classified.label}")
+            else:
+                notes.append(
+                    f"Audio override {classified.name} is a Whisper model but this job does not run Whisper; it is unused."
+                )
+        elif classified is not None:
+            if spec.audio_caption.needs_captioner:
+                override = resolve_audio_override(
+                    _sound_captioner_variant(spec),
+                    spec.model.override_audio_model_path,
+                    spec.model.override_audio_mmproj_path,
+                )
+                if override is not None:
+                    notes.append(f"Sound-caption (Captioner) model override: {override.label}")
+                    notes.extend(override.notes)
+            else:
+                notes.append(
+                    f"Audio override {classified.name} replaces the Qwen3-Omni Captioner, but the audio caption "
+                    "source does not use the Captioner; it is unused."
+                )
+    return notes
 
 
 class _NullSink:
@@ -466,12 +562,21 @@ def _status_counts(
     for item in item_list:
         result["total"] += 1
         result[item.status] = result.get(item.status, 0) + 1
+        item_paths: set[str] = set()
         if item.audio_caption_path:
-            audio_paths.add(str(item.audio_caption_path))
+            item_paths.add(str(item.audio_caption_path))
+        text_units = 0
         for segment in item.segments:
             outputs = segment.get("outputs") if isinstance(segment, Mapping) else None
             if isinstance(outputs, Mapping) and outputs.get("audio_caption"):
-                audio_paths.add(str(outputs["audio_caption"]))
+                item_paths.add(str(outputs["audio_caption"]))
+            elif isinstance(segment, Mapping) and str(segment.get("audio_caption") or "").strip():
+                text_units += 1
+        if item_paths:
+            audio_paths.update(item_paths)
+        else:
+            # txt-only runs merge the audio caption without writing a part file.
+            audio_paths.update(f"{item.index}:{unit}" for unit in range(text_units))
     if include_audio:
         result["audio_captions"] = len(audio_paths)
         result["no_speech"] = sum(
@@ -740,7 +845,8 @@ def _apply_batch_skip(spec: JobSpec, resolved: list[_ResolvedInput]) -> None:
             continue
         paths = caption_unit_paths(entry.out_dir, entry.stem)
         targets: list[Path]
-        if not _split_layout(spec):
+        if not _split_layout(spec) or spec.post.txt_only:
+            # txt-only runs write exactly one file per unit: the merged caption.
             targets = [paths.merged]
         elif spec.audio_caption.video_source == "existing":
             targets = [paths.audio]
@@ -786,6 +892,31 @@ def _allocate_job_dir(spec: JobSpec) -> Path:
         model_short_name(spec.model.variant_key),
         spec.output.kind,
     )
+
+
+def _metadata_override_info(spec: JobSpec, load_report: Any | None = None) -> dict[str, Any]:
+    """Describe the custom checkpoints a run used so metadata stays reproducible."""
+
+    del load_report
+    info: dict[str, Any] = {}
+    if spec.model.override_model_path:
+        try:
+            override = _main_override(spec.model)
+            info["override"] = override.to_dict() if override is not None else None
+        except (ValueError, KeyError) as exc:
+            info["override"] = {"path": spec.model.override_model_path, "error": str(exc)}
+    if spec.model.override_audio_model_path:
+        from vcap.models.overrides import classify_model_path
+
+        try:
+            classified = classify_model_path(
+                spec.model.override_audio_model_path,
+                spec.model.override_audio_mmproj_path,
+            )
+            info["audio_override"] = classified.to_dict() if classified is not None else None
+        except ValueError as exc:
+            info["audio_override"] = {"path": spec.model.override_audio_model_path, "error": str(exc)}
+    return info
 
 
 def _metadata_settings(spec: JobSpec) -> dict[str, Any]:
@@ -1016,6 +1147,7 @@ def _write_metadata(
         }
     except KeyError:
         model_info = {"variant_key": spec.model.variant_key}
+    model_info.update(_metadata_override_info(spec, load_report))
     gpu_info = gpu.resource_snapshot(spec.runtime.gpu_index)
     gpu_info["peak_vram_gb"] = float(peak_vram_gb)
     block_swap = getattr(load_report, "block_swap", None)
@@ -1237,24 +1369,44 @@ class _ModelSession:
         for warning in plan.warnings:
             self.emitter.log(warning, level="warning", scope="compile")
 
+    @property
+    def override(self) -> ModelOverride | None:
+        """The custom checkpoint replacing this session's variant files, if any."""
+
+        if not self.spec.model.override_model_path:
+            return None
+        return _main_override(self.spec.model)
+
+    def _model_label(self, override: ModelOverride | None) -> str:
+        if override is None:
+            return self.spec.model.variant_key
+        return f"{self.spec.model.variant_key} (override: {override.name})"
+
     def ensure(self) -> Any:
-        global _FAKE_CAPTIONER, _FAKE_VARIANT
+        global _FAKE_CAPTIONER, _FAKE_VARIANT, _FAKE_OVERRIDE
         if self.captioner is not None:
             return self.captioner
         _check_cancel(self.cancel)
         self._prepare_compile()
+        override = self.override
+        override_key = override_identity(
+            self.spec.model.override_model_path,
+            self.spec.model.override_mmproj_path,
+        )
         if os.environ.get("VCAP_FAKE_CAPTIONER", "").strip().casefold() in {"1", "true", "yes", "on"}:
             with _FAKE_LOCK:
                 reused = (
                     _FAKE_CAPTIONER is not None
                     and _FAKE_VARIANT == self.spec.model.variant_key
+                    and _FAKE_OVERRIDE == override_key
                 )
                 if not reused:
                     _FAKE_CAPTIONER = _FakeCaptioner(self.spec.model.variant_key)
                     _FAKE_VARIANT = self.spec.model.variant_key
+                    _FAKE_OVERRIDE = override_key
                 self.captioner = _FAKE_CAPTIONER
             self.emitter.log(
-                f"{'Reusing resident' if reused else 'Loading'} {self.spec.model.variant_key}",
+                f"{'Reusing resident' if reused else 'Loading'} {self._model_label(override)}",
                 scope="models",
             )
             return self.captioner
@@ -1278,7 +1430,16 @@ class _ModelSession:
         def download_progress(message: Any, payload: Any = None) -> None:
             _emit_model_download_progress(self.emitter, message, payload)
 
-        if (
+        if override is not None:
+            # A custom checkpoint replaces the registry files, so the registered
+            # variant is never downloaded or verified for this session.
+            self.emitter.log(
+                f"Using the custom model override for {self.spec.model.variant_key}: {override.label}",
+                scope="models",
+            )
+            for note in override.notes:
+                self.emitter.log(str(note), "warning", "models")
+        elif (
             not loader_is_patched
             and resident_variant != self.spec.model.variant_key
             and os.environ.get("VCAP_SKIP_MODEL_ENSURE", "") != "1"
@@ -1365,6 +1526,20 @@ class _ModelSession:
             accepts_budget_hint = False
         if accepts_budget_hint:
             load_kwargs["budget_hint"] = budget_hint
+        if override is not None:
+            try:
+                parameters = inspect.signature(loader.load_model).parameters
+                accepts_override = "override" in parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_override = False
+            if not accepts_override:
+                raise RuntimeError(
+                    "The active model loader does not support custom model overrides; "
+                    "clear the override path to use the registered model."
+                )
+            load_kwargs["override"] = override
         try:
             accepts_runtime = "runtime" in inspect.signature(loader.load_model).parameters
         except (TypeError, ValueError):
@@ -1374,7 +1549,7 @@ class _ModelSession:
         cached_before = loader.MODEL_CACHE.loaded if not loader_is_patched else None
         if cached_before is None:
             self.emitter.log(
-                f"Loading {self.spec.model.variant_key}",
+                f"Loading {self._model_label(override)}",
                 scope="models",
             )
         self.loaded = (
@@ -1384,12 +1559,12 @@ class _ModelSession:
         )
         if cached_before is not None and self.loaded is cached_before:
             self.emitter.log(
-                f"Reusing resident {self.spec.model.variant_key}",
+                f"Reusing resident {self._model_label(override)}",
                 scope="models",
             )
         elif cached_before is not None:
             self.emitter.log(
-                f"Loading {self.spec.model.variant_key}",
+                f"Loading {self._model_label(override)}",
                 scope="models",
             )
         report = getattr(self.loaded, "load_report", None)
@@ -1440,12 +1615,13 @@ class _ModelSession:
             )
 
     def unload(self) -> None:
-        global _FAKE_CAPTIONER, _FAKE_VARIANT
+        global _FAKE_CAPTIONER, _FAKE_VARIANT, _FAKE_OVERRIDE
         if os.environ.get("VCAP_FAKE_CAPTIONER", "").strip().casefold() in {"1", "true", "yes", "on"}:
             if not self.spec.runtime.keep_model_loaded:
                 with _FAKE_LOCK:
                     _FAKE_CAPTIONER = None
                     _FAKE_VARIANT = None
+                    _FAKE_OVERRIDE = ("", "")
             return
         if self.loaded is None:
             return
@@ -1498,7 +1674,7 @@ def unload_cached_model(
 ) -> dict[str, Any] | None:
     """Release a resident model unless it is the selected variant."""
 
-    global _FAKE_CAPTIONER, _FAKE_VARIANT
+    global _FAKE_CAPTIONER, _FAKE_VARIANT, _FAKE_OVERRIDE
     with _FAKE_LOCK:
         if _FAKE_VARIANT is not None:
             if _FAKE_VARIANT == unless_variant:
@@ -1506,6 +1682,7 @@ def unload_cached_model(
             released = _FAKE_VARIANT
             _FAKE_CAPTIONER = None
             _FAKE_VARIANT = None
+            _FAKE_OVERRIDE = ("", "")
             return {"variant_key": released, "released": True, "fake": True}
     try:
         from vcap.models.loader import MODEL_CACHE
@@ -2032,7 +2209,9 @@ def _run_item_transcript(
 
     params = WhisperParams.from_dict(spec.transcript.whisper)
     output = TranscriptOutputOptions(
-        formats=tuple(spec.transcript.formats),
+        # txt-only runs keep the transcript in memory (prompt injection and
+        # audio captions still use it) and write no sidecar files.
+        formats=() if spec.post.txt_only else tuple(spec.transcript.formats),
         file_suffix=spec.transcript.file_suffix,
     )
     request = build_request(
@@ -3027,8 +3206,17 @@ def _process_item(
         summary_usage: dict[str, Any] = {}
         summary_timing: dict[str, Any] = {}
         summary_path: Path | None = None
+        if spec.summarize_segments and spec.post.txt_only and len(done_records) > 1:
+            emitter.log(
+                "Long video summary skipped: 'Save only .txt captions' writes exactly one caption file per item.",
+                "warning",
+                "summary",
+            )
         try:
-            summary, summary_usage, summary_timing, summary_path = _summarize_item(
+            summary, summary_usage, summary_timing, summary_path = (
+                ("", {}, {}, None)
+                if spec.post.txt_only
+                else _summarize_item(
                 spec,
                 entry,
                 model,
@@ -3036,6 +3224,7 @@ def _process_item(
                 done_records,
                 emitter,
                 cancel,
+            )
             )
         except CancelledError:
             raise
@@ -3472,11 +3661,20 @@ def _render_and_write_unit(
     *,
     allow_merged: bool = True,
 ) -> tuple[str, str, bool]:
-    """Render and atomically write one split-layout caption unit."""
+    """Render and atomically write one split-layout caption unit.
 
+    With ``spec.post.txt_only`` the video and audio parts are composed in
+    memory only and the single ``<stem>.txt`` merged caption is the one file
+    written; the JSON companion is skipped as well.
+    """
+
+    txt_only = bool(spec.post.txt_only)
+    write_merged = bool(spec.audio_caption.write_merged or txt_only)
     paths = caption_unit_paths(out_dir, stem)
-    if video_caption or allow_merged:
+    if (video_caption or allow_merged) and not txt_only:
         outputs["video_caption"] = str(_write_text_caption(paths.video, video_caption))
+    elif txt_only:
+        outputs.pop("video_caption", None)
     has_audio = bool(transcript_text.strip() or sound_caption.strip())
     audio_caption = ""
     no_speech = not has_audio
@@ -3491,21 +3689,22 @@ def _render_and_write_unit(
         )
     elif spec.audio_caption.empty_policy == "placeholder":
         audio_caption = spec.audio_caption.empty_text.strip()
-    if audio_caption:
+    if audio_caption and not txt_only:
         outputs["audio_caption"] = str(_write_text_caption(paths.audio, audio_caption))
     else:
         outputs.pop("audio_caption", None)
-        if spec.output.overwrite:
+        if spec.output.overwrite and not txt_only:
             try:
                 paths.audio.unlink(missing_ok=True)
             except OSError as exc:
                 emitter.log(f"Could not remove stale audio caption {paths.audio}: {exc}", "warning", "dataset_captions")
+    if not audio_caption:
         emitter.log(
             (
                 f"No speech detected in {filename}; "
                 + (
                     "merged caption is the video caption only"
-                    if spec.audio_caption.write_merged and allow_merged
+                    if write_merged and allow_merged
                     else "audio caption skipped"
                 )
                 if no_speech
@@ -3525,13 +3724,13 @@ def _render_and_write_unit(
     )
     if not audio_caption:
         merged_caption = video_caption
-    if spec.audio_caption.write_merged and allow_merged:
+    if write_merged and allow_merged:
         outputs["merged_caption"] = str(_write_text_caption(paths.merged, merged_caption))
         outputs["txt"] = outputs["merged_caption"]
     else:
         outputs.pop("merged_caption", None)
         outputs.pop("txt", None)
-    if "json" in spec.post.formats:
+    if "json" in spec.post.formats and not txt_only:
         json_path = out_dir / f"{sanitize_filename(str(stem) or 'caption')}.json"
         value = _caption_parts_structured(
             structured,
@@ -3566,13 +3765,23 @@ def _run_sound_caption_phase(
             "warning",
             "sound_captions",
         )
+    sound_model = _sound_caption_model_choice(spec, variant)
     sound_spec = replace(
         spec,
-        model=replace(spec.model, variant_key=variant),
+        model=sound_model,
         generation=replace(spec.generation, max_new_tokens=sound_tokens),
         preprocess=replace(spec.preprocess, max_frames=0, use_audio_in_video=False),
     )
-    sound_session = main_session if variant == spec.model.variant_key else _ModelSession(sound_spec, emitter, cancel)
+    sound_session = (
+        main_session
+        if _same_model_choice(sound_model, spec.model)
+        else _ModelSession(sound_spec, emitter, cancel)
+    )
+    if sound_model.override_model_path:
+        emitter.log(
+            f"Sound captions use the custom audio model override: {sound_model.override_model_path}",
+            scope="sound_captions",
+        )
     units: list[tuple[_ResolvedInput, ItemResult, dict[str, Any]]] = []
     entries = {entry.result_index: entry for entry in resolved}
     for result in sorted(results.values(), key=lambda item: item.index):
@@ -3788,6 +3997,11 @@ def _run_merge_phase(
             if no_speech:
                 for record in records:
                     record.setdefault("no_speech", True)
+            # A single-unit item never enters the per-record loop above; record
+            # its rendered audio text so txt-only runs (no audio part file) still
+            # count and display the audio caption they merged.
+            for record in records:
+                record.setdefault("audio_caption", audio_text)
             del paths, merged_text
         except CancelledError:
             cancelled = True
@@ -3828,7 +4042,7 @@ def _populate_split_result_paths(
         if paths.audio.is_file():
             result.audio_caption_path = str(paths.audio)
             result.outputs.setdefault("audio_caption", str(paths.audio))
-        if spec.audio_caption.write_merged and paths.merged.is_file():
+        if (spec.audio_caption.write_merged or spec.post.txt_only) and paths.merged.is_file():
             result.merged_caption_path = str(paths.merged)
             result.outputs.setdefault("merged_caption", str(paths.merged))
             result.outputs.setdefault("txt", str(paths.merged))
@@ -3864,6 +4078,20 @@ def _run_job_local(spec: JobSpec, sinks: ProgressSink | None, cancel: CancelToke
             f"Starting {spec.output.kind} job with {len(resolved)} resolved input(s) using "
             f"{spec.model.variant_key}."
         )
+        try:
+            existing_only_mode = bool(
+                spec.audio_caption.enabled and spec.audio_caption.video_source == "existing"
+            )
+            for note in _validate_job_overrides(spec, loads_main_model=not existing_only_mode):
+                emitter.log(note, scope="models")
+        except (ValueError, KeyError) as exc:
+            emitter.log(f"Model override: {exc}", "error", "models")
+        if spec.post.txt_only:
+            emitter.log(
+                "Save only .txt captions: each item or clip writes one <name>.txt; JSON, subtitle, JSONL, "
+                "transcript, reasoning, summary, and video_caption/audio_caption part files are skipped.",
+                scope="outputs",
+            )
         for message in filter_messages:
             emitter.log(message, scope="inputs")
         if _split_layout(spec):
@@ -4469,6 +4697,10 @@ def run_job(
     if not isinstance(spec, JobSpec):
         spec = JobSpec.from_dict(spec)  # type: ignore[arg-type]
     token = cancel or CancelToken()
+    # Fail fast on a missing or incompatible custom checkpoint before any run
+    # directory, worker, or model load exists.
+    existing_only = bool(spec.audio_caption.enabled and spec.audio_caption.video_source == "existing")
+    _validate_job_overrides(spec, loads_main_model=not existing_only)
     multi_gpu = (
         spec.output.kind == "batch"
         and len(spec.runtime.gpu_indices) > 1

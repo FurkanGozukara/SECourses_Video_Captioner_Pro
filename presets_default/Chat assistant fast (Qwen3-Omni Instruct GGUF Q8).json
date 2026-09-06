@@ -40,7 +40,11 @@
     "caption_suffix": "",
     "trigger_mode": "none",
     "replace_words": "",
-    "output_formats": ["txt", "json"],
+    "caption_txt_only": false,
+    "output_formats": [
+      "txt",
+      "json"
+    ],
     "save_clips": false,
     "save_reasoning": true,
     "overwrite_existing": false,
@@ -54,6 +58,10 @@
     "chat_top_p": 0.8,
     "chat_top_k": 20,
     "chat_max_new_tokens": 2048,
-    "chat_enable_thinking": false
+    "chat_enable_thinking": false,
+    "override_video_model_path": "",
+    "override_video_mmproj_path": "",
+    "override_audio_model_path": "",
+    "override_audio_mmproj_path": ""
   }
 }

@@ -21,6 +21,10 @@
     "trim_end_s": null,
     "model_key": "qwen3_omni_instruct_int4",
     "show_all_variants": false,
+    "override_video_model_path": "",
+    "override_video_mmproj_path": "",
+    "override_audio_model_path": "",
+    "override_audio_mmproj_path": "",
     "vram_preset": "auto",
     "attention_backend": "auto",
     "subprocess_mode": true,
@@ -135,6 +139,7 @@
     "dedupe_repeated_sentences": true,
     "caption_join_separator": " ",
     "max_caption_chars": 0,
+    "caption_txt_only": false,
     "output_formats": [
       "txt",
       "json"
