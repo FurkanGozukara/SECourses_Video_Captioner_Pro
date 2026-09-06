@@ -122,7 +122,7 @@ token transfer time = total swapped layer bytes / effective PCIe bandwidth
 ```
 
 Measure the effective bandwidth on the target system rather than using the link's advertised
-maximum. On the development machine (RTX 5090, Windows 11, WDDM driver 610.88) host-to-device
+maximum. On the test system (RTX 5090, Windows 11, WDDM driver 610.88) host-to-device
 copies reached about **13.4 GiB/s** for registered, pinned, and pageable buffers alike, far below
 the nominal PCIe 5.0 figure. At that rate one decoder layer costs roughly:
 
@@ -298,6 +298,6 @@ layer per token) and bring swapped INT8 close to resident speed.
 - Right after a 63 GB load the worker briefly holds ~20 GB of mapped checkpoint pages on top
   of the pinned packs. The loader trims its working set after installing the swap, and
   ffprobe/ffmpeg child processes retry with backoff, because two runs with 37-38 GiB pinned
-  saw the first child process fail to start on this 93 GB machine.
+  saw the first child process fail to start on a system with 93 GB of RAM.
 - Repeated load/unload cycles plateau (about 10 GB of process-level caches remain after the
   first unload on this system); the pinned packs themselves are released with the model.

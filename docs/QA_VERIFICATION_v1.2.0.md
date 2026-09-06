@@ -1,6 +1,6 @@
 # QA verification log - v1.2.0 (2026-09-01)
 
-This release was verified through the real SECourses Video Captioner Pro interface in Google Chrome on Windows, using physical GPU 0 (NVIDIA GeForce RTX 5090). The pass covered fresh-install downloads, every model family and quantization path, mixed-media batches, output generation, recovery, editing, and system controls. The final automated regression suite completed with `180 passed`.
+This release was verified through the real SECourses Video Captioner Pro interface in Google Chrome on Windows, on an NVIDIA GeForce RTX 5090. The pass covered fresh-install downloads, every model family and quantization path, mixed-media batches, output generation, recovery, editing, and system controls. The final automated regression suite completed with `180 passed`.
 
 ## Fresh-install download verification
 

@@ -4,8 +4,8 @@ Updated: 2026-09-01
 
 ## Test system and method
 
-- GPU: NVIDIA GeForce RTX 5090, physical GPU 0, 31.84 GiB dedicated VRAM, driver 610.88.
-- Isolation: every GPU command used `CUDA_VISIBLE_DEVICES=0`; GPU 1 was not used.
+- GPU: NVIDIA GeForce RTX 5090, 31.84 GiB dedicated VRAM, driver 610.88.
+- Isolation: every GPU command used `CUDA_VISIBLE_DEVICES=0` (single GPU).
 - Transformers stack: Python 3.12.10, PyTorch 2.13.0+cu130, Transformers 5.16.1, BF16 activations, and Triton Windows 3.7.1.
 - Checkpoint sizes are decimal GB. Transformers peak values are PyTorch allocator high-water marks in GiB. GGUF peaks are process-external GPU samples and include the private `llama-server` process.
 - A row marked **fresh C6 3-run EOS mean** used `tools/bench/benchmark.py` through the application's real loader and caption wrapper. Load time is the one load before three generations, peak VRAM is the maximum, and rates/tokens/wall time are arithmetic means. Seeds were 1234, 1235, and 1236.
@@ -83,7 +83,7 @@ These are the automatic production choices encoded in `vcap/models/vram_presets.
 
 ## v1.2.0 live matrix (2026-09-01)
 
-These end-to-end application runs used physical GPU 0, an NVIDIA GeForce RTX 5090, and were driven through Google Chrome. Times include model loading unless the result states otherwise. Generation stopped at EOS except where noted. This newer availability matrix supersedes the earlier "not downloaded" annotations above.
+These end-to-end application runs used an NVIDIA GeForce RTX 5090 and were driven through Google Chrome. Times include model loading unless the result states otherwise. Generation stopped at EOS except where noted. This newer availability matrix supersedes the earlier "not downloaded" annotations above.
 
 | Variant | Input | Result |
 |---|---|---|

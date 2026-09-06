@@ -1,6 +1,6 @@
 # QA verification log — v1.1.0 (2026-08-31)
 
-Hands-on verification of every feature area of SECourses Video Captioner Pro against `task.txt`, performed on the release machine (Windows 11, RTX 5090 = GPU 0, Python 3.12, torch 2.13+cu130, transformers 5.16, gradio 6.26). The app was launched through `Windows_Run_Video_Captioner_Pro.bat` and driven in Google Chrome like a user; CPU-only checks ran through pytest (`161 passed`).
+Hands-on verification of every feature area of SECourses Video Captioner Pro, performed on Windows 11 (RTX 5090, Python 3.12, torch 2.13+cu130, transformers 5.16, gradio 6.26). The app was launched through `Windows_Run_Video_Captioner_Pro.bat` and driven in Google Chrome like a user; CPU-only checks ran through pytest (`161 passed`).
 
 ## Defects found by testing and fixed in v1.1.0
 
@@ -21,7 +21,7 @@ Hands-on verification of every feature area of SECourses Video Captioner Pro aga
 | Downloader | status protocol mismatch (no progress fraction in UI), GGUF absent from the menu, stale sizes | JSON `VCAP_STATUS`, six GGUF menu entries, human-readable status |
 | Misc | multi-GPU not exposed, sampling strategy dead, chat mode missing, global settings not persisted, Recover reset theme/paths, hotkeys unscoped | all implemented (see changelog v1.1.0) |
 
-## Browser runs performed after the fixes (GPU 0)
+## Browser runs performed after the fixes
 
 | Test | Result |
 |---|---|

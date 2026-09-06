@@ -1,9 +1,8 @@
 # QA verification log - v1.7.0 (2026-09-05)
 
-Every tab of the v1.6.0 build was exercised as a real user in Google Chrome on Windows 11 (RTX 5090, GPU 0
-only), started from `Windows_Run_Video_Captioner_Pro.bat --no-browser --server-port 7860`. Defects and
-improvements found in that pass were implemented directly (no delegated tasks) and re-verified on the v1.7.0
-build in the same browser session.
+Every tab of the v1.6.0 build was exercised as a real user in Google Chrome on Windows 11 (RTX 5090), started
+from `Windows_Run_Video_Captioner_Pro.bat --no-browser --server-port 7860`. Defects and improvements found in
+that pass were fixed and re-verified on the v1.7.0 build in the same browser session.
 
 ## Environment
 

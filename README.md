@@ -250,7 +250,7 @@ Qwen3 BF16 checkpoints are 63.4 GB and do not fit wholly in 32 GB VRAM. They loa
 
 ## Benchmarks
 
-Fresh measurements below are three-generation means on physical GPU 0, an RTX 5090. Checkpoint size is decimal GB; peak memory is GiB. Qwen3 Instruct uses the production 32 GB profile (Flash Attention 2 and a 256-token frame budget). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full comparison, quality deltas, GGUF measurements, methodology, and VRAM recommendations.
+Fresh measurements below are three-generation means on an RTX 5090. Checkpoint size is decimal GB; peak memory is GiB. Qwen3 Instruct uses the production 32 GB profile (Flash Attention 2 and a 256-token frame budget). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full comparison, quality deltas, GGUF measurements, methodology, and VRAM recommendations.
 
 | Variant | Checkpoint GB | Load s | Peak GiB | Prefill tok/s | Decode tok/s |
 |---|---:|---:|---:|---:|---:|

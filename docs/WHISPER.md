@@ -132,7 +132,7 @@ GPU index based through `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
 
 ## Verified Smoke Runs
 
-On physical GPU 0, `large-v1` produced:
+On an RTX 5090, `large-v1` produced:
 
 - JFK WAV: 11.000 s media, 8.464 s transcription, 11.508 s wall time. Transcript:
   `And so my fellow Americans, ask not what your country can do for you. Ask what YOU CAN DO FOR YOUR COUNTRY!`

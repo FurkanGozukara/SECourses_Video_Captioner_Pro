@@ -203,13 +203,13 @@ SHA-256 verified against the repositories' LFS metadata.
 ```powershell
 venv\Scripts\python.exe tools\smoke\caption_gguf.py `
   --variant qwen3_omni_instruct_gguf_q4 `
-  --input F:\SECourses_Video_Captioner_Pro_TEMP\test_media\lightning_storm_20s.mp4
+  --input path\to\lightning_storm_20s.mp4
 ```
 
 ## Verified measurements
 
-Measurements below are real runs on physical GPU 0, an NVIDIA GeForce RTX 5090
-with 31.84 GiB VRAM and driver 610.88. Peak VRAM is sampled through
+Measurements below are real runs on an NVIDIA GeForce RTX 5090 with 31.84 GiB
+VRAM and driver 610.88. Peak VRAM is sampled through
 `vcap.core.gpu.resource_snapshot`, so it is process-external GPU usage rather
 than a Torch allocator number. Times include server startup but exclude the
 already-completed model download.

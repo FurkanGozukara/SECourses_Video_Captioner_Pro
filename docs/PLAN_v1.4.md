@@ -5,7 +5,7 @@ Date: 2026-09-02. Work was split into tasks A, P, U, I running in parallel with 
 ## 1. Where v1.3.2 stands (verified 2026-09-02)
 
 - Full automated suite: 284 passed, 5 skipped (real-GPU tests) in 94 s.
-- task.txt compliance audit (code-verified, not README-based): every requirement area is implemented. Remaining partials: Captioner has one prompt preset by design (prompt-free model); TimeChat has 3 presets (single-task specialist); GGUF benchmark matrix incomplete; editor regenerate preset list not filtered by model; chat tab has no preset picker; no hierarchical "chapters + summary" stage; editor has a table but no thumbnail gallery.
+- Requirements compliance audit (code-verified, not README-based): every requirement area is implemented. Remaining partials: Captioner has one prompt preset by design (prompt-free model); TimeChat has 3 presets (single-task specialist); GGUF benchmark matrix incomplete; editor regenerate preset list not filtered by model; chat tab has no preset picker; no hierarchical "chapters + summary" stage; editor has a table but no thumbnail gallery.
 - Parameter plumbing audit: no dead control, but several controls are only partially honored (GGUF ignores attention/block-swap/compile/use_cache and collapses the frame budget to 8–16 stills; sampling knobs are dropped unless `do_sample and temperature > 0`; `audio_sample_rate` never reaches the model path; `max_frames = 0` becomes the family maximum instead of "audio only"; the family clamp on `max_frames` is silent). Hard-coded backend values that users reasonably want: seed, context carry-over word count, re-encode codec/CRF/preset/audio bitrate, total pixel budget, GGUF frames/JPEG quality/threads/batch sizes/flash-attn/cache-reuse/context-tier clamp, OOM retry count, fade threshold, quality-analysis frame count, pinned RAM budget, max caption characters, logs directory.
 - Decode-speed audit: TimeChat/AVoCaDO decode at the same ~34 tok/s for BF16, INT8 and INT4, which proves a fixed host-side cost per token dominates. The per-token `StoppingCriteria` flushes the console and dispatches two unthrottled UI events every token; GGUF streams the SSE response one byte at a time (`iter_lines(chunk_size=1)`) and emits per-chunk UI events; `--no-webui`/`-np 1` are not passed; dense gate/up projections are not fused for ConvRot; the Hadamard lookup takes a lock on every linear call. StaticCache + CUDA graphs would raise VRAM and is excluded.
 - Robustness: worker isolation uses `CUDA_VISIBLE_DEVICES=<index>` but never sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so on mixed multi-GPU machines the CUDA index can differ from the NVML/nvidia-smi index shown in the picker.
@@ -14,11 +14,11 @@ Date: 2026-09-02. Work was split into tasks A, P, U, I running in parallel with 
 ## 2. Goals for v1.4.0
 
 1. **Every user-configurable value is a Gradio control, and every control is honored by every backend.** Expose the hard-coded values above, make the GGUF path honor the frame budget, make GGUF-irrelevant controls visibly disabled, warn on every silent clamp, and harmonize spec defaults with UI defaults.
-2. **Faster decoding with bit-identical output and no extra VRAM** on all backends: throttle per-token host work (Transformers), fix SSE reading and flags (GGUF), fuse gate/up and hoist the Hadamard lookup (ConvRot INT8/INT4). Measure before/after on GPU 0 for every family and publish the table.
+2. **Faster decoding with bit-identical output and no extra VRAM** on all backends: throttle per-token host work (Transformers), fix SSE reading and flags (GGUF), fuse gate/up and hoist the Hadamard lookup (ConvRot INT8/INT4). Measure before/after on the test GPU for every family and publish the table.
 3. **Cancel asks for confirmation** with explicit Confirm / Keep running buttons (mouse and `Esc`), and it demonstrably stops the worker.
 4. **Features a regular user expects next:** Unload model button; Open in Caption Editor after a run; batch file-kind and name filters; seed; max caption length; long-video chapters + summary stage; TimeChat flatten variants (motion+camera, audiovisual, speech-only SRT, chapters); editor thumbnail gallery, dataset statistics, trainer token-limit warning, regenerate-all-filtered, ZIP export; chat prompt-preset picker; sampled-frame preview; presets/logs folder buttons.
 5. **Cloud installers fixed** to the Upscaler v8 flow (fresh install only), plus an automatic Linux llama.cpp CUDA build so GGUF works on Massed Compute/RunPod.
-6. **Verified like a user in Chrome**: every tab, every model family and quant path, single + batch + Unicode paths, presets, cancel, recover, editor, dataset, settings, health; then GPU 0 released.
+6. **Verified like a user in Chrome**: every tab, every model family and quant path, single + batch + Unicode paths, presets, cancel, recover, editor, dataset, settings, health; then the GPU released.
 
 ## 3. Work breakdown
 
@@ -30,7 +30,7 @@ Date: 2026-09-02. Work was split into tasks A, P, U, I running in parallel with 
 | I — installers | `Massed_Compute_Install.sh`, `RunPod_Install_*.sh`, instruction txts, `Windows_Run_*.bat`, `vcap/models/llamacpp_install.py`, README install sections | Upscaler-v8 flow; Linux llama.cpp build; docs |
 | Final integration | version, changelog, README, BENCHMARKS, PLAN, QA doc | Integration, full pytest, Chrome QA of everything, GPU release |
 
-## 4. Verification plan (Chrome, GPU 0 only)
+## 4. Verification plan (Chrome)
 
 1. Restart via `Windows_Run_Video_Captioner_Pro.bat`; confirm no console errors; dark and light theme.
 2. Single file: upload, file path, Unicode path, trim, scene split, all output formats, prefix/suffix/replace/trigger, max caption chars, seed reproducibility (sampled run twice), summary stage, open output / last caption / reveal clip / open in editor.
@@ -42,7 +42,7 @@ Date: 2026-09-02. Work was split into tasks A, P, U, I running in parallel with 
 8. Dataset: fitness analysis, plan JSON, TOML, sub-split tool.
 9. Settings: dirs incl. logs dir, notifications, theme persistence; Recover: load + apply; Health: env report, llama.cpp status, unload.
 10. Presets: save (Unicode name) / load / delete / reset / last-used autoload; shipped presets protected.
-11. Speed table before/after; final `pytest tests -q`; GPU 0 emptied.
+11. Speed table before/after; final `pytest tests -q`; GPU emptied.
 
 ## 5. Status (2026-09-02, integration)
 

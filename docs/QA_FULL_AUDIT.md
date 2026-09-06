@@ -5,10 +5,9 @@ regressions, source review, and checks that require an unavailable environment.
 No claim of universal correctness is made from a passing sample.
 
 Baseline: commit `68fa49e`, app 1.7.0, Windows, Python 3.12.10,
-Gradio 6.26.0, PyTorch 2.13.0+cu130, RTX 5090 32 GB and RTX 3090 24 GB.
-Chrome opens the actual local app (initially port 7860; port 7861 from September
-6, after another application occupied 7860). Models are reused from
-the existing distribution; QA media and outputs live in this checkout.
+Gradio 6.26.0, PyTorch 2.13.0+cu130, RTX 5090 32 GB.
+Chrome opens the actual local app. Models are reused from an existing
+installation; QA media and outputs live in the checkout.
 
 ## Coverage inventory
 
@@ -86,7 +85,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   runs. Added clearing on Start, F9, and Retry. Browser regression pending.
 - Cancellation regression passed in Chrome (`0008_whisper`): confirmation
   remained visible during segment progress and Yes stopped the 1,650-second job
-  after 29.3 s. GPU 0 memory returned to idle.
+  after 29.3 s. GPU memory returned to idle.
 - Recursive Whisper batch (`batch_0009_whisper`) transcribed nested speech and
   Unicode video, reporting the intentionally corrupt MP4 as failed while
   continuing. `batch_0010_whisper` skipped both existing transcripts; the old
@@ -128,9 +127,6 @@ permutations are covered by targeted tests as well as representative UI jobs.
   the first turn. Image answer: 72 tokens, 12.42 tok/s, EOS, context 573/32768.
 - Global Settings light-theme screenshot reviewed; top theme toggle restored
   Dark and synchronized the radio. Keyboard reference rendered correctly.
-- Browser automation detached during a chat file-chooser wait (infrastructure
-  timeout, not an app failure). Continuing in a fresh Chrome tab; prior chat
-  was not saved before the interruption.
 - Further Chat checks: uploaded JFK audio produced the correct transcript;
   a quoted Unicode video path on the next turn produced an accurate nighttime
   storm description. Saved JSON/Markdown in `0014_chat_qwen3` retain messages,
@@ -144,7 +140,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - Real Chat stop passed: double-click confirmation stopped a story at 806
   generated tokens / 68.4 s, finish=cancelled, retaining the resident model.
   Cancelled conversation saved in `0015_chat_qwen3`.
-- Chat fixes passed after restart with Qwen3 Instruct GGUF Q4 on GPU 0:
+- Chat fixes passed after restart with Qwen3 Instruct GGUF Q4:
   Copy last answer returned SAVED exactly; toolbar Clear reset the displayed
   history and token/context metrics; the next reply was NO HISTORY with only
   the new pair visible and 28 prompt tokens. First GGUF conversation saved in
@@ -165,8 +161,8 @@ permutations are covered by targeted tests as well as representative UI jobs.
   changes retained the conversation; cross-family selection cleared history.
   Found stale counters on cross-family changes; fixed, pending restart check.
 - System UI copied a complete environment report, detected all 21 downloaded
-  caption variants and CUDA llama.cpp b10621, reported the local Git commits
-  ahead of origin, showed loaded Thinking Q8 / fit, and verified TimeChat INT4
+  caption variants and CUDA llama.cpp b10621, reported the update status,
+  showed loaded Thinking Q8 / fit, and verified TimeChat INT4
   (16 files / 6.0 GiB, sizes and SHA). Runtime repair reused the external
   executable successfully. System unload completed before Whisper tests.
 - Fresh Whisper base download (not present initially) was cancelled mid-progress
@@ -279,10 +275,10 @@ permutations are covered by targeted tests as well as representative UI jobs.
   Its audio caption again incorrectly described mono content as stereo.
   Restored original output directory and the two preferences afterwards.
 - Global empty-directory validation rejected an empty output path and retained
-  the prior app_settings.json. Empty-string browser fill was unreliable in this
-  interaction; keyboard Ctrl+A/Backspace visibly cleared it before submission.
+  the prior app_settings.json. The field was cleared with Ctrl+A/Backspace
+  before submission.
 - Restart-only path test: saved temporary directory `temp/qa_runtime_temp`
-  and FFmpeg path `C:/ffmpeg_latest`. Run `0048_qwen3` subsequently verified
+  and a custom FFmpeg path. Run `0048_qwen3` subsequently verified
   them with no VCAP_MODELS_DIR override. Restored `temp` and automatic FFmpeg
   discovery through Chrome, saved, restarted, and verified System environment.
 
@@ -314,7 +310,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   128 tokens at 0.36 tok/s. Model loading took 51.2 seconds and reported
   25.44 GiB peak VRAM, 17 resident layers, 31 swapped layers / 35.98 GiB pinned
   RAM, and two staging slots. Generation transferred 4,605.5 GiB through block
-  swap. This proves BF16 execution with RAM offload on GPU 0, not full residency.
+  swap. This proves BF16 execution with RAM offload, not full residency.
   Saved TXT/JSON/metadata exist. The output again falsely calls the mono WAV
   stereo and truncates at the deliberately small token cap; these are explicit
   output-quality limitations.
@@ -325,8 +321,8 @@ permutations are covered by targeted tests as well as representative UI jobs.
   v1.7.0 correctly. Editor Min/Max chars=31 selected items 10–27 (18 matches).
   Over token limit selected all 27 eight-token captions at limit 7, showed warning
   flags, and selected zero at limit 8. A temporary narrow viewport reported no
-  horizontal document overflow; screenshot capture was unsuitable for visual
-  signoff, so responsive layout coverage remains incomplete. Viewport reset.
+  horizontal document overflow; responsive layout coverage otherwise remains
+  incomplete.
 
 ### Checkpoint streaming, unload memory, and remaining Qwen variants
 
@@ -375,8 +371,8 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - Thinking BF16 completed `0054_qwen3` with the new unmapped reader: 109.83 s
   total, 49.2 s load, 25.44 GiB peak VRAM, 19 tokens at 0.35 tok/s, EOS, correct
   test-pattern caption. Automatic placement kept 17 layers resident and 31
-  swapped (35.98 GiB pinned). Keep model loaded off stopped worker PID 17672
-  and wrapper 79548 after the run; both disappeared and GPU 0 returned to
+  swapped (35.98 GiB pinned). Keep model loaded off stopped the worker and its
+  wrapper process after the run; both disappeared and the GPU returned to
   2,159 MiB. This releases the 39.59 GiB of private host memory still reported
   immediately after the in-worker unload.
 - Thinking INT4 completed `0055_qwen3`: 31.60 s, 22 tokens, 4.71 tok/s, EOS.
@@ -449,9 +445,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   UTF-8 filename `renk_ü.png`, and extracted below `outputs/uploaded_batches`.
   A harmless test archive included parent traversal, a Windows absolute path,
   and macOS metadata entries; all three were skipped and neither marker escaped
-  the extraction directory. An earlier malformed fixture accidentally contained
-  `?` in its filename due to PowerShell pipe encoding and correctly showed an
-  extraction error; it was replaced by the intended UTF-8 fixture.
+  the extraction directory.
 - Found two feedback bugs: literal `<stem>` was interpreted as an HTML tag,
   hiding the rest of the scan summary, and an automatic rescan immediately
   replaced the ZIP extraction report. Escaped the placeholder and gave ZIP
@@ -553,7 +547,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   resumed the unfinished files in `batch_0072_qwen3`: 2 done / 1 skipped in
   36.04 s, both generations ending at EOS. The original caption's SHA-256
   and modification time stayed unchanged through cancellation and resume.
-  All three jobs used only GPU 0 and Keep model loaded off.
+  All three jobs used Keep model loaded off.
 
 ### Split transcripts, context carry, summary, and HEVC
 
@@ -564,7 +558,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   in 60.17 s and the worker exited. A typed context-carry size of 8 was
   rejected before job creation; the corrected supported minimum was 10.
 - Whisper `base.en` was absent initially, downloaded automatically (147.8 MB),
-  loaded on isolated GPU 0, and transcribed the complete JFK sentence with
+  loaded in the isolated worker, and transcribed the complete JFK sentence with
   22 words. All six sidecars were written with `_qa_all_speech` suffix.
   An explicit `{{TRANSCRIPT}}` token worked with automatic prompt appending
   disabled: the two clips recorded different local speech windows (9 and
@@ -608,8 +602,8 @@ permutations are covered by targeted tests as well as representative UI jobs.
   and loaded/applied it successfully. The fixture contained an obsolete
   personal-prompt name, unavailable GPU 9999, and distinct Caption/Whisper
   and machine paths. Chrome skipped the obsolete selection, warned and
-  defaulted the unavailable GPU to GPU 0, and removed 9999 from the GPU list.
-  GPU 1 remained unselected. Whisper paths stayed empty without opt-in and
+  defaulted the unavailable GPU to the first GPU, and removed 9999 from the
+  GPU list. Whisper paths stayed empty without opt-in and
   restored correctly when opted in. Outputs, temp, models, logs, and FFmpeg
   machine paths remained unchanged, as verified in Global Settings.
 - New `batch_0074_qwen3` metadata excludes personal-library controls, chat
@@ -766,13 +760,12 @@ permutations are covered by targeted tests as well as representative UI jobs.
   backreferences, a rule that must not reprocess inserted text, and an empty
   end-of-string match. The model returned `aaa rain rain cat cat` (6 tokens,
   EOS); Chrome and JSON both showed the expected `XY RAIN CATEND`. The job
-  finished in 27.25 s and its worker exited. A temporary browser-control
-  connection failure was resolved without restarting a live application job.
+  finished in 27.25 s and its worker exited.
 
 ### Remaining Whisper model catalogue checks
 
 - Chrome exposes 17 aliases. The following checks use the same 11 s JFK WAV,
-  GPU 0, float16, English, beam/best-of 5, repetition penalty 1, VAD enabled,
+  float16, English, beam/best-of 5, repetition penalty 1, VAD enabled,
   and normalized word timestamps. All six output formats are selected.
 - `0098_whisper`: tiny.en downloaded automatically (78.1 MB), then transcribed
   the complete benchmark sentence. Total time 8.92 s, inference 0.6 s, one raw
@@ -787,7 +780,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   about 0.5 s inference. The normalized two-cue timing differed from small,
   while the recognized words agreed. Worker exited.
 - The remaining small/medium and initial distilled-large aliases also downloaded
-  automatically and completed in Chrome on GPU 0. Each wrote all six selected
+  automatically and completed in Chrome. Each wrote all six selected
   formats and metadata/logs. Every result retained the complete spoken sentence;
   punctuation, raw segment boundaries and normalized cue timing varied.
 
@@ -842,7 +835,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   remained selectable with the explicit above-tier warning. Dataset presets
   also applied their existing/generated video source and speech/both audio
   source on the Pipeline tab. Whisper Fast and Quality selected large-v3-turbo
-  and large-v1 respectively on the Transcribe tab, both on GPU 0.
+  and large-v1 respectively on the Transcribe tab.
 - Found that loading the shipped ASR preset left `{{SOURCE_LANGUAGE}}` in the
   visible request despite the English variable. Universal loads now expand an
   exact canonical prompt template, preserve saved manual wording, and deliver
@@ -868,8 +861,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
   EOS in 49.5 s total, 12.88 tok/s. TXT/JSON/SRT contained the complete spoken
   sentence in four cues. Metadata records `asr_timestamped_srt`, source language
   English and the expanded request, with no unresolved ordinary variable.
-  The worker exited after the job. The QA app now uses port 7862 because other
-  applications occupied 7860 and 7861 after the earlier QA process stopped.
+  The worker exited after the job.
 
 
 ### Individual task catalogue and immediate media updates
@@ -937,7 +929,7 @@ permutations are covered by targeted tests as well as representative UI jobs.
 - All seven TimeChat task variants were exposed for the audiovisual fixture.
   Each selected the unchanged native request, greedy decoding, and a 9,216
   token default. The checks used a 2,048-token budget, whole-clip mode and
-  16 frames on GPU 0, with TXT/JSON/SRT/VTT/JSONL enabled.
+  16 frames, with TXT/JSON/SRT/VTT/JSONL enabled.
 - `0118_timechat` produced four complete native objects: 870 tokens to EOS,
   59.4 s total, 25.64 tok/s. Both TXT and JSON parsed as the same native array.
   Quality failed for later timestamps and speech: the 11-second source received

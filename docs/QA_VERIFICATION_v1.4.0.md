@@ -1,7 +1,7 @@
 # QA verification log - v1.4.0 (2026-09-02)
 
 This release was verified through the real SECourses Video Captioner Pro interface in Google Chrome on Windows 11,
-started with `Windows_Run_Video_Captioner_Pro.bat`, using physical GPU 0 only (NVIDIA GeForce RTX 5090, 32 GB).
+started with `Windows_Run_Video_Captioner_Pro.bat`, on an NVIDIA GeForce RTX 5090 (32 GB).
 The pass covers the v1.4.0 backend/UI/performance/installer work and the second feature round. Automated results
 are listed at the end.
 
@@ -13,13 +13,13 @@ are listed at the end.
 | Python / torch / transformers / gradio | 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
 | GPU used | RTX 5090, driver 610.88 |
 | llama.cpp | b10621 Windows CUDA build (`llamacpp/b10621`) |
-| Test media | `F:\SECourses_Video_Captioner_Pro_TEMP\test_media` (20 s storm video, 78 s Unicode-named launch video, 18 s MP3, WAV, PNG, Unicode batch folders) |
+| Test media | 20 s storm video, 78 s Unicode-named launch video, 18 s MP3, WAV, PNG, Unicode batch folders |
 
 ## UI-only pass (before model runs)
 
 | Area | Verified result |
 |---|---|
-| Startup | Launcher printed the banner with both GPUs and served `http://127.0.0.1:7860`; no browser console errors on load. |
+| Startup | Launcher printed the banner with the detected GPUs and served `http://127.0.0.1:7860`; no browser console errors on load. |
 | File path input | A quoted, mixed-separator, non-ASCII path (`"F:/…\test_media/vöyager ünicode 日本語 テスト.mp4"`) was accepted; the probe line showed `video · 01:18.02 · 960 × 720 · 60 fps · aac, 48000 Hz, 2 ch · codec h264` and the player rendered the first frame. (Chrome defers media loading in hidden tabs, so the preview only fills once the tab is visible; not an application issue.) |
 | Trim range | Start/End controls and the player trim editor are present under the preview. |
 | Processing Pipeline | Sections 4-6 render with every control; `Detect scenes now (preview)` found 9 scenes in the Unicode file; `Preview sampled frames` produced `Plan: 128 frames at 576×416 (~14,976 visual tokens) — showing 16` with timestamped thumbnails. |
@@ -35,7 +35,7 @@ are listed at the end.
 | ZIP upload | `qa_v14_upload.zip` was extracted to `outputs/uploaded_batches/<name>_<timestamp>` with Unicode names intact and the folder scan ran (3 files with Scan subfolders). |
 | System & Models | Check for updates reported `Up to date (v1.3.2, b0c3021)`; Delete model files showed `Delete BF16 (16.65 GB) from disk?` and **Keep files** left the model untouched. |
 
-## Model runs (GPU 0, app started from the Windows launcher, v1.4.0)
+## Model runs (app started from the Windows launcher, v1.4.0)
 
 | Run | Input | Verified result |
 |---|---|---|
@@ -50,7 +50,7 @@ are listed at the end.
 | `timechat_int4` | storm video, scene split | 5 timestamped segments at 26.9-27.1 tok/s in 99.8 s; TXT/JSON/JSONL/SRT/VTT plus saved clips; prefix, suffix, and replacements applied. |
 | `avocado_int4` | storm video, scene split | 5 segments at 26.8-27.0 tok/s in 57.5 s; all formats and clips written. |
 | Caption Editor on `0077_avocado` | 6 items | Approve advanced to the next item; Export approved copied `clip_0003.mp4` + `.txt` to `outputs/approved_dataset` and wrote `approved_dataset.zip` (3.7 MiB); **Regenerate selected failed** with `Expected 154 values, got 143` (fix F4.3). |
-| Unload model | System & Models | GPU 0 returned to 0.8 GiB used after the AVoCaDO release; model switches also released the previous model automatically each time (17.06, 7.85, 23.10 GiB freed in the log). |
+| Unload model | System & Models | The GPU returned to 0.8 GiB used after the AVoCaDO release; model switches also released the previous model automatically each time (17.06, 7.85, 23.10 GiB freed in the log). |
 | Global Settings | Save | `app_settings.json` gained `logs_dir` and `ffmpeg_path`; Light theme rendered readable and Dark was restored. |
 
 ## Defects found during the GPU pass (fix rounds F3/F4)
@@ -78,7 +78,7 @@ are listed at the end.
 
 | Stage | Result |
 |---|---|
-| Start of session (v1.3.2 + round 1 uncommitted) | 333 passed, 7 skipped |
+| Start (v1.3.2 + round 1) | 333 passed, 7 skipped |
 | After round 2 (F1 backend, F2 UI) | 375 passed, 7 skipped |
 | After fix rounds F3 + F4 | 385 passed, 7 skipped |
 | Final tree (F5, F6, F7 included) | **393 passed, 7 skipped** in 86 s (`venv\Scripts\python.exe -m pytest tests -q`) |

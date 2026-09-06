@@ -13,7 +13,7 @@ models); every result was then verified in Chrome.
 | OS / Python / torch / transformers / gradio | Windows 11 Pro 10.0.26200 / 3.12.10 / 2.13.0+cu130 / 5.16.1 / 6.26.0 |
 | Whisper runtime | faster-whisper 1.2.1, ctranslate2 4.8.2, onnxruntime 1.29.0 |
 | GPU | RTX 5090 (single GPU) |
-| Test media | `temp/qa_media` (20 s storm video, 18 s MP3, PNG, 11 s JFK WAV), `temp/qa_batch_ünicode` (Unicode names, nested folders, a corrupt MP4, silent videos), `temp/qa_dataset_clips` (four pre-cut 8 s clips with narration cut from the Voyager launch film, one silent clip, one Unicode-named clip in a Unicode subfolder), `F:\…\test_media\vöyager ünicode 日本語 テスト.mp4` (78 s) |
+| Test media | `temp/qa_media` (20 s storm video, 18 s MP3, PNG, 11 s JFK WAV), `temp/qa_batch_ünicode` (Unicode names, nested folders, a corrupt MP4, silent videos), `temp/qa_dataset_clips` (four pre-cut 8 s clips with narration cut from the Voyager launch film, one silent clip, one Unicode-named clip in a Unicode subfolder), and a 78 s Unicode-named launch video (`vöyager ünicode 日本語 テスト.mp4`) |
 | Automated suite | `pytest tests -q`: **561 passed, 8 skipped** (v1.5.0 baseline: 493 passed, 8 skipped) |
 
 ## v1.5.0 baseline pass (defects found → fixed in v1.6.0)
@@ -29,20 +29,20 @@ models); every result was then verified in Chrome.
 | D7 | Editor character/word/token line and queue columns did not refresh after an autosaved edit | Autosave refreshes the stats line and queue cells (`test_d7_autosave_refreshes_stats_and_queue_cells`) |
 | D8 | Task / prompt preset silently replaced by `wan22_t2v_dense` when switching to Folder batch (metadata proved the batch ran with the Wan prompt) | Live: Upload → Folder batch → Upload keeps `Model-native · Qwen3-Omni — dense audiovisual video`; `test_d8_prompt_preset_survives_upload_folder_upload` |
 | D9 | Editor regeneration status showed raw worker log lines (`INFO:root:Successfully loaded: 'mslk.dll'`) | Regeneration status filters raw worker lines (`test_d9_editor_regeneration_filters_raw_worker_status`) |
-| D10 | Editor **Regenerate selected** on a scene segment captioned the whole 78 s source (clip window dropped for batch-kind jobs) | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)0 |
-| D11 | Editor regeneration reloaded the resident model in a fresh worker (26 s) | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)1 |
-| D12 | Folder light scan showed the raw ffprobe error for a corrupt file | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)2 |
-| D13 | Idle unload stopped the worker silently | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)3 |
-| D14 | `logs/` stayed empty; Open logs folder opened an empty directory | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)4 |
-| D15 | Three shipped Whisper presets contained the developer's absolute paths and every non-preset key | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)5 |
-| D16 | Selecting the Upload files input tab did not refresh the preview/probe/modality (stale folder/path media shown) | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)6 |
-| D17 | Raw llama-server stderr shown in the Status line while the GGUF server started | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)7 |
-| D18 | Precision/Backend/Checkpoint line lagged the model dropdown by seconds | Cancelled run ends with `Status: Cancelled: 1 cancelled, 0 done, 0 skipped, 0 failed in 14.1s` (cancel note lives in its own element)8 |
-| D20 | Foreign-family preset label (`Qwen3-Omni — describe image`) left in the Task preset box after a family change with stale modality; run used a silent fallback | Run history uses fixed column widths and a 90-character preview; no wrapped `Ite ms` header0 |
-| D22 | Whisper folder batch failed silent videos with `tuple index out of range` and showed `[Errno …]` for a corrupt file | Run history uses fixed column widths and a 90-character preview; no wrapped `Ite ms` header2 |
-| D23 | Chat status/Tokens lines lagged behind the finished answer after a model load | Run history uses fixed column widths and a 90-character preview; no wrapped `Ite ms` header3 |
-| D25 | Resident model released after a job because a stale pre-preset model selection was reported (`… changed to timechat_int4`); next chat reloaded it | Run history uses fixed column widths and a 90-character preview; no wrapped `Ite ms` header5 |
-| D29 | Chat UI stream lagged minutes behind the worker (per-token full re-render); Stop/Send during the lag acted on a finished job | Run history uses fixed column widths and a 90-character preview; no wrapped `Ite ms` header9 |
+| D10 | Editor **Regenerate selected** on a scene segment captioned the whole 78 s source (clip window dropped for batch-kind jobs) | Regeneration processes only that scene's recorded time window |
+| D11 | Editor regeneration reloaded the resident model in a fresh worker (26 s) | Editor regeneration reuses the shared resident model instead of starting a duplicate worker |
+| D12 | Folder light scan showed the raw ffprobe error for a corrupt file | Unreadable folder items show a concise skipped-file message while the ffprobe diagnostics stay in the logs |
+| D13 | Idle unload stopped the worker silently | Idle model release and worker shutdown are reported in the console and live log |
+| D14 | `logs/` stayed empty; Open logs folder opened an empty directory | Application logs persist daily for 14 days, with a separate diagnostic file for crashed workers |
+| D15 | Three shipped Whisper presets contained absolute local paths and every non-preset key | Shipped Whisper and dataset presets contain only portable preset settings |
+| D16 | Selecting the Upload files input tab did not refresh the preview/probe/modality (stale folder/path media shown) | Returning to Upload files refreshes its preview and ignores late folder-scan results |
+| D17 | Raw llama-server stderr shown in the Status line while the GGUF server started | GGUF startup shows a timed friendly status while raw llama-server output stays in the live log |
+| D18 | Precision/Backend/Checkpoint line lagged the model dropdown by seconds | Model precision, backend, and checkpoint details update in the dropdown's first event chain |
+| D20 | Foreign-family preset label (`Qwen3-Omni — describe image`) left in the Task preset box after a family change with stale modality; run used a silent fallback | Changing model families can no longer leave a foreign-family task label in the dropdown |
+| D22 | Whisper folder batch failed silent videos with `tuple index out of range` and showed `[Errno …]` for a corrupt file | Silent videos are skipped cleanly by Whisper and corrupt media reports a concise ffmpeg error |
+| D23 | Chat status/Tokens lines lagged behind the finished answer after a model load | Chat discards superseded load progress so final token statistics arrive with the answer |
+| D25 | Resident model released after a job because a stale pre-preset model selection was reported (`… changed to timechat_int4`); next chat reloaded it | A preset-applied model remains resident after its run unless another variant is selected while it is busy |
+| D29 | Chat UI stream lagged minutes behind the worker (per-token full re-render); Stop/Send during the lag acted on a finished job | Chat streaming keeps pace with the worker (updates are coalesced instead of re-rendering the conversation for every token), so Stop takes effect within a second and the final token line arrives with the answer |
 
 
 ## Dataset clip captions (new in v1.6.0)

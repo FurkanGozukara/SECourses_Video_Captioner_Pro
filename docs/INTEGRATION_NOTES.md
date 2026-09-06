@@ -29,7 +29,7 @@ proc(text=..., videos=[frames8], fps=2.0, use_audio_in_video=False, ...)        
 proc(text=..., audio=[a4s], ...)                                                       # audio-only OK -> 70 (≈13 tok/s * 4 s + text)
 proc(text=..., images=[img1080p], size={"shortest_edge":4*32*32,"longest_edge":1280*32*32}, ...)  # OK -> 1238 (cap applied per call)
 ```
-- No system prompt auto-injected (template renders straight to user turn) — matches report 12.
+- No system prompt auto-injected (template renders straight to user turn) — matches the Qwen3-Omni reference.
 - `fps` must be a SCALAR and match the actual sampling fps (else silent A/V misalignment).
 
 ## Other environment facts
@@ -37,4 +37,3 @@ proc(text=..., images=[img1080p], size={"shortest_edge":4*32*32,"longest_edge":1
 - `qwen-omni-utils` 0.0.9's video readers are unusable here, but its `smart_resize` math and constants remain the reference.
 - venv has: transformers 5.16.1, accelerate 1.14, safetensors 0.8, av 18.1, librosa 1.0, soundfile 0.14, audioread, psutil 7.2.2, nvidia-ml-py, gguf 0.19, einops, opencv-python 5.0, scenedetect 0.7.1, tomli-w, imageio(-ffmpeg), sentencepiece, tiktoken, protobuf. Do NOT add torchcodec/decord.
 - Probes ran on a single RTX 5090 32 GB (sm120) with ffmpeg n8.1 on PATH.
-- The GitHub remote `origin` (SECourses_Video_Captioner_Pro) is reachable; repo currently has no commits.

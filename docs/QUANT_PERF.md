@@ -176,8 +176,8 @@ completed a real clip 2.63x faster. Raw per-run results are in
 
 ## v1.4.0 host-overhead removal (2026-09-02)
 
-Goal: remove fixed per-token host work from every backend without changing outputs or VRAM. Measured on physical
-GPU 0 (RTX 5090, `CUDA_VISIBLE_DEVICES=0`), greedy decoding, `max_new_tokens=256`, the 20 s
+Goal: remove fixed per-token host work from every backend without changing outputs or VRAM. Measured on an
+RTX 5090 (`CUDA_VISIBLE_DEVICES=0`), greedy decoding, `max_new_tokens=256`, the 20 s
 `lightning_storm_20s.mp4` (video families) and the 18 s `demon_singer_audio_18_sec.mp3` (Captioner), through
 `tools/bench/benchmark.py` with the production 32 GB profile. Raw results: `tools/bench/results/v14_{baseline,after,control}_<variant>.json`.
 
