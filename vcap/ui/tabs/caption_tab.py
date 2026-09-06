@@ -836,20 +836,20 @@ def resolve_caption_inputs_at_start(
     input_mode: str,
     cached: Sequence[str] | None,
 ) -> list[str]:
-    """Resolve the selected tab's raw value, using its preview cache only when blank."""
+    """Resolve the active source, including a clear; use cache only for legacy callers."""
 
     mode = str(input_mode or "upload").casefold()
     if mode == "upload":
         raw = settings.get("input_files")
-        if raw:
+        if "input_files" in settings:
             return _paths(raw)
     elif mode == "path":
         raw = str(settings.get("input_path") or "").strip()
-        if raw:
+        if "input_path" in settings:
             return _paths(raw)
     elif mode == "folder":
         raw = str(settings.get("batch_input_folder") or "").strip()
-        if raw:
+        if "batch_input_folder" in settings:
             selected, _summary = _folder_scan(
                 raw,
                 bool(settings.get("batch_recursive", False)),
@@ -1608,8 +1608,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
         )
         ctx.states["caption_prompt_auto"] = prompt_auto_state
 
-        with gr.Row(equal_height=False):
-            with gr.Column(scale=5, min_width=500):
+        with gr.Row(equal_height=False, elem_id="vc_caption_workspace"):
+            with gr.Column(scale=1, min_width=360, elem_id="vc_caption_media"):
                 media = media_input_block(
                     ctx,
                     save_next_to_source_key="batch_save_next_to_source",
@@ -1620,6 +1620,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "remain in the numbered batch run directory."
                     ),
                     include_caption_coverage=True,
+                    preview_height=320,
                 )
 
                 with gr.Accordion("Trim range", open=False):
@@ -1630,7 +1631,7 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             step=0.1,
                             precision=3,
                             label="Start (seconds)",
-                            info="Applied after any trim made in the media player.",
+                            info="Start captioning at this time in the selected video or audio file.",
                         )
                         controls["trim_start_s"] = ctx.reg(
                             "trim_start_s", trim_start, 0.0, section="preprocessing",
@@ -1649,21 +1650,40 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             description="Optional numeric trim end in seconds.", kind="float", minimum=0.0,
                         )
                     gr.Markdown(
-                        "Use the player's built-in trim editor for visual trimming; its edited file becomes the first input automatically.",
+                        "Preview the selected file above, then set the start and end times to caption only that range.",
                         elem_classes=["vc-help"],
                     )
 
+            with gr.Column(scale=1, min_width=360, elem_id="vc_caption_results"):
                 with gr.Column():
                     gr.Markdown("### Result")
                     caption = gr.Textbox(
                         label="Caption",
-                        lines=14,
-                        max_lines=14,
+                        lines=10,
+                        max_lines=10,
                         buttons=["copy"],
                         show_label=True,
                         interactive=False,
                         autoscroll=True,
                     )
+                with gr.Row():
+                    start = action_button("▶ Start Captioning", "emerald", variant="primary", scale=3, elem_id="vc_caption_start")
+                    cancel = action_button(
+                        "⏹ Cancel",
+                        "red",
+                        variant="stop",
+                        scale=2,
+                        elem_id="vc_caption_cancel",
+                        interactive=False,
+                    )
+                    copy_caption = action_button(
+                        "⧉ Copy caption",
+                        "blue",
+                        scale=2,
+                        elem_id="vc_copy_caption",
+                        interactive=False,
+                    )
+                with gr.Accordion("Additional results", open=False):
                     with gr.Tabs():
                         with gr.Tab("JSON"):
                             structured = gr.JSON(label="Structured result", buttons=["copy"], max_height=410)
@@ -1710,55 +1730,39 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                                 visible=False,
                             )
 
-                with gr.Row():
-                    start = action_button("▶ Start Captioning", "emerald", variant="primary", scale=3)
-                    cancel = action_button(
-                        "⏹ Cancel",
-                        "red",
-                        variant="stop",
-                        scale=2,
-                        elem_id="vc_caption_cancel",
-                        interactive=False,
-                    )
-                    open_output = action_button("📂 Open Output", "teal", scale=2)
-                    open_caption = action_button("📝 Open Caption", "violet", scale=2)
-                    reveal_clip = action_button("🎬 Reveal Clip", "amber", scale=2)
-                    open_editor = action_button(
-                        "✏️ Open in Caption Editor",
-                        "cobalt",
-                        scale=2,
-                        elem_id="vc_open_caption_editor",
-                        interactive=False,
-                    )
-                with gr.Row():
-                    copy_caption = action_button(
-                        "⧉ Copy caption",
-                        "blue",
-                        scale=2,
-                        elem_id="vc_copy_caption",
-                        interactive=False,
-                    )
-                    retry_failed = action_button(
-                        "🔁 Retry failed",
-                        "yellow",
-                        scale=2,
-                        elem_id="vc_retry_failed",
-                        interactive=False,
-                    )
-                    results_zip = action_button(
-                        "⬇ Results ZIP",
-                        "fuchsia",
-                        scale=2,
-                        elem_id="vc_results_zip",
-                        interactive=False,
-                    )
-                with gr.Row():
-                    results_zip_file = gr.File(
-                        label="Results ZIP download",
-                        interactive=False,
-                        visible=False,
-                        elem_id="vc_results_zip_download",
-                    )
+                    with gr.Row():
+                        open_output = action_button("📂 Open Output", "teal", scale=2)
+                        open_caption = action_button("📝 Open Caption", "violet", scale=2)
+                        reveal_clip = action_button("🎬 Reveal Clip", "amber", scale=2)
+                        open_editor = action_button(
+                            "✏️ Open in Caption Editor",
+                            "cobalt",
+                            scale=2,
+                            elem_id="vc_open_caption_editor",
+                            interactive=False,
+                        )
+                    with gr.Row():
+                        retry_failed = action_button(
+                            "🔁 Retry failed",
+                            "yellow",
+                            scale=2,
+                            elem_id="vc_retry_failed",
+                            interactive=False,
+                        )
+                        results_zip = action_button(
+                            "⬇ Results ZIP",
+                            "fuchsia",
+                            scale=2,
+                            elem_id="vc_results_zip",
+                            interactive=False,
+                        )
+                    with gr.Row():
+                        results_zip_file = gr.File(
+                            label="Results ZIP download",
+                            interactive=False,
+                            visible=False,
+                            elem_id="vc_results_zip_download",
+                        )
                 with gr.Row(
                     visible=False,
                     elem_id="vc_caption_cancel_confirmation",
@@ -1785,75 +1789,11 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                 hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
                 cancel_timer = gr.Timer(1.0)
 
-                with gr.Accordion(
-                    "📜 Run history",
-                    open=False,
-                    elem_id="vc_run_history",
-                ):
-                    run_history_records_state = gr.State([])
-                    run_history_selected_state = gr.State({})
-                    run_history = gr.Dataframe(
-                        value=[],
-                        headers=["Run", "Kind", "Model", "Items", "Done/Failed", "When", "Preview"],
-                        datatype=["str", "str", "str", "number", "str", "str", "str"],
-                        type="array",
-                        interactive=False,
-                        wrap=True,
-                        column_widths=[160, 80, 220, 65, 100, 145, 360],
-                        max_height=330,
-                        buttons=["copy", "fullscreen"],
-                        label="Recent runs",
-                        elem_id="vc_run_history_table",
-                    )
-                    gr.Markdown(
-                        "Newest caption, batch, and chat runs discovered below the Outputs directory.",
-                        elem_classes=["vc-help"],
-                    )
-                    with gr.Row():
-                        run_history_refresh = action_button(
-                            "🔄 Refresh",
-                            "pink",
-                            elem_id="vc_run_history_refresh",
-                        )
-                        run_history_open = action_button(
-                            "📂 Open folder",
-                            "bronze",
-                            elem_id="vc_run_history_open_folder",
-                            interactive=False,
-                        )
-                        run_history_editor = action_button(
-                            "✏️ Open in editor",
-                            "mint",
-                            elem_id="vc_run_history_open_editor",
-                            interactive=False,
-                        )
-                        run_history_recover = action_button(
-                            "🔁 Recover settings",
-                            "coral",
-                            elem_id="vc_run_history_recover",
-                            interactive=False,
-                        )
-                    run_history_status = gr.Markdown(
-                        "<span class='vc-help'>Refresh to discover recent runs.</span>",
-                        elem_classes=["vc-status"],
-                    )
-
                 progress = progress_panel(ctx)
-                item_table = gr.Dataframe(
-                    headers=["#", "Input", "Status", "Message", "Elapsed", "Tokens"],
-                    value=[],
-                    type="array",
-                    datatype=["number", "str", "str", "str", "str", "number"],
-                    interactive=False,
-                    wrap=True,
-                    max_height=260,
-                    buttons=["copy", "fullscreen"],
-                    label="Items",
-                )
-                logs = log_panel(ctx)
 
-            with gr.Column(scale=4, min_width=430):
-                with gr.Accordion("1. Model", open=True):
+        with gr.Row(equal_height=False, elem_id="vc_caption_settings"):
+            with gr.Column(scale=1, min_width=360):
+                with gr.Accordion("1. Model", open=False):
                     model_key = gr.Dropdown(
                         choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
                         value=_INITIAL_VARIANT,
@@ -2450,7 +2390,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         )
                     ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
 
-                with gr.Accordion("2. Task & Prompt", open=True):
+            with gr.Column(scale=1, min_width=360):
+                with gr.Accordion("2. Task & Prompt", open=False):
                     prompt_preset = gr.Dropdown(
                         choices=_prompt_choices(initial_family, _INITIAL_MODALITY),
                         value=initial_prompt.id,
@@ -2612,7 +2553,8 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     reset_prompts = action_button("↺ Reset prompts to preset", "purple")
 
                 schema = {item.name: item for item in initial_spec.param_schema}
-                with gr.Accordion("3. Generation", open=True):
+            with gr.Column(scale=1, min_width=360):
+                with gr.Accordion("3. Generation", open=False):
                     temperature = gr.Slider(
                         0.0, 2.0, value=float(schema["temperature"].default), step=0.01,
                         label="Temperature", info=schema["temperature"].description, buttons=["reset"],
@@ -2743,6 +2685,72 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     sample_note = gr.Markdown(
                         "<span class='vc-help'>Sampling is controlled explicitly and may also be overridden by a task preset.</span>"
                     )
+
+        with gr.Accordion(
+            "📜 Run history",
+            open=False,
+            elem_id="vc_run_history",
+        ):
+            run_history_records_state = gr.State([])
+            run_history_selected_state = gr.State({})
+            run_history = gr.Dataframe(
+                value=[],
+                headers=["Run", "Kind", "Model", "Items", "Done/Failed", "When", "Preview"],
+                datatype=["str", "str", "str", "number", "str", "str", "str"],
+                type="array",
+                interactive=False,
+                wrap=True,
+                column_widths=[160, 80, 220, 65, 100, 145, 360],
+                max_height=330,
+                buttons=["copy", "fullscreen"],
+                label="Recent runs",
+                elem_id="vc_run_history_table",
+            )
+            gr.Markdown(
+                "Newest caption, batch, and chat runs discovered below the Outputs directory.",
+                elem_classes=["vc-help"],
+            )
+            with gr.Row():
+                run_history_refresh = action_button(
+                    "🔄 Refresh",
+                    "pink",
+                    elem_id="vc_run_history_refresh",
+                )
+                run_history_open = action_button(
+                    "📂 Open folder",
+                    "bronze",
+                    elem_id="vc_run_history_open_folder",
+                    interactive=False,
+                )
+                run_history_editor = action_button(
+                    "✏️ Open in editor",
+                    "mint",
+                    elem_id="vc_run_history_open_editor",
+                    interactive=False,
+                )
+                run_history_recover = action_button(
+                    "🔁 Recover settings",
+                    "coral",
+                    elem_id="vc_run_history_recover",
+                    interactive=False,
+                )
+            run_history_status = gr.Markdown(
+                "<span class='vc-help'>Refresh to discover recent runs.</span>",
+                elem_classes=["vc-status"],
+            )
+
+        item_table = gr.Dataframe(
+            headers=["#", "Input", "Status", "Message", "Elapsed", "Tokens"],
+            value=[],
+            type="array",
+            datatype=["number", "str", "str", "str", "str", "number"],
+            interactive=False,
+            wrap=True,
+            max_height=260,
+            buttons=["copy", "fullscreen"],
+            label="Items",
+        )
+        logs = log_panel(ctx)
 
         last_outputs_state = gr.State({})
         job_done_hook = gr.HTML("", visible=False, elem_id="vcap-job-done-hook")

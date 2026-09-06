@@ -119,26 +119,28 @@ def resolve_transcribe_inputs_at_start(
     """Resolve the active input mode, restricting standalone transcription to AV media."""
 
     mode = str(input_mode or "upload").casefold()
-    if mode == "upload" and settings.get("whisper_input_files"):
+    if mode == "upload" and "whisper_input_files" in settings:
         return _path_values(settings.get("whisper_input_files"))
-    if mode == "path" and str(settings.get("whisper_input_path") or "").strip():
+    if mode == "path" and "whisper_input_path" in settings:
         return _path_values(settings.get("whisper_input_path"))
-    if mode == "folder":
+    if mode == "folder" and "whisper_batch_input_folder" in settings:
         raw = str(settings.get("whisper_batch_input_folder") or "").strip()
-        if raw:
-            try:
-                root = normalize_path(raw, must_exist=True)
-                if root.is_dir():
-                    return [
-                        str(path)
-                        for path in list_media_files(
-                            root,
-                            recursive=bool(settings.get("whisper_batch_recursive", False)),
-                            kinds=("video", "audio"),
-                        )
-                    ]
-            except (OSError, ValueError):
-                return []
+        if not raw:
+            return []
+        try:
+            root = normalize_path(raw, must_exist=True)
+            if root.is_dir():
+                return [
+                    str(path)
+                    for path in list_media_files(
+                        root,
+                        recursive=bool(settings.get("whisper_batch_recursive", False)),
+                        kinds=("video", "audio"),
+                    )
+                ]
+        except (OSError, ValueError):
+            return []
+        return []
     return _path_values(list(cached or []))
 
 

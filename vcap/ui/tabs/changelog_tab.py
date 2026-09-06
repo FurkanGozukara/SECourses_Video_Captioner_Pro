@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.8.0",
+        "2026-09-06",
+        """
+### One media selection and a side-by-side caption workspace
+
+- Image, video, and audio previews are read-only. Load or replace content through **Upload files**, **File path**, or **Folder batch**; preview upload, recording, editing, and clear controls can no longer display a different file from the one being captioned. Playback, image fullscreen, and downloads remain available. Use **Trim range** for video/audio start and end times. The shared Transcribe input previews follow the same rule.
+- Clearing an upload, path, or folder and immediately starting cannot resurrect an older selection while the preview is still updating. The selected source takes precedence over cached preview state in Caption and Transcribe.
+- The Caption tab puts the loaded media on the left and the caption, **Start Captioning**, **Cancel**, and **Copy caption** on the right. Extra result formats and file/export tools are under **Additional results**. Model, task/prompt, and generation settings sit below the workspace in collapsed sections; narrow screens stack the workspace vertically.
+""".strip(),
+    ),
+    (
         "v1.7.0",
         "2026-09-05",
         """

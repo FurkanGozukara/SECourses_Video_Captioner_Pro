@@ -223,6 +223,7 @@ def test_transcribe_handler_with_fake_stream_writes_metadata_and_results(
         whisper_compute_type="int8",
         whisper_formats=["srt", "txt", "json"],
     )
+    settings["whisper_input_files"] = [str(source)]
     values = app.settings_registry.dict_to_values(settings)
     handler = ctx.states["transcribe_run_handler"]
 
@@ -349,6 +350,7 @@ def test_long_transcribe_stream_is_throttled_and_final_views_are_bounded(
         whisper_compute_type="int8",
         whisper_formats=["srt", "txt"],
     )
+    settings["whisper_input_files"] = [str(source)]
     values = app.settings_registry.dict_to_values(settings)
 
     started = time.monotonic()
@@ -411,6 +413,7 @@ def test_terminal_status_is_yielded_before_result_views_are_built(
     monkeypatch.setattr(transcribe_tab, "_result_views", tracked_views)
     settings = app.settings_registry.defaults()
     settings.update(whisper_device="cpu", whisper_compute_type="int8", whisper_formats=["txt"])
+    settings["whisper_input_files"] = [str(source)]
     values = app.settings_registry.dict_to_values(settings)
     run = app.vcap_context.states["transcribe_run_handler"](*values, [str(source)], "upload")
 
@@ -457,6 +460,7 @@ def test_cancel_timer_skips_unchanged_state_and_cancelled_run_can_restart(
     monkeypatch.setattr(transcribe_tab, "_run_transcription_client", fake_client)
     settings = app.settings_registry.defaults()
     settings.update(whisper_device="cpu", whisper_compute_type="int8", whisper_formats=["txt"])
+    settings["whisper_input_files"] = [str(source)]
     values = app.settings_registry.dict_to_values(settings)
     ctx = app.vcap_context
     handlers = ctx.states["transcribe_cancel_handlers"]

@@ -1021,40 +1021,6 @@ def extracted_batch_folder(
     return selected, not top_level and bool(recursive)
 
 
-def _resolved_after_preview_edit(
-    value: str | None,
-    current: list[str] | None,
-    input_mode: str,
-) -> list[str]:
-    """Keep folder scans authoritative while accepting single-file edits."""
-
-    selected = list(current or [])
-    if str(input_mode).casefold() == "folder" or not value:
-        return selected
-    resolved = str(normalize_path(value))
-    if selected:
-        try:
-            cached_path = normalize_path(resolved)
-            cached_path.relative_to(normalize_path(TEMP_DIR / "preview_posters"))
-            return selected
-        except (OSError, TypeError, ValueError):
-            pass
-        cache_root = os.environ.get("GRADIO_TEMP_DIR")
-        if cache_root:
-            try:
-                current_path = normalize_path(selected[0])
-                cached_path = normalize_path(resolved)
-                root = normalize_path(cache_root)
-                cached_path.relative_to(root)
-                try:
-                    current_path.relative_to(root)
-                except ValueError:
-                    return selected
-            except (OSError, TypeError, ValueError):
-                pass
-    return [resolved, *selected[1:]] if selected else [resolved]
-
-
 def media_input_block(
     ctx: "UiContext",
     *,
@@ -1083,6 +1049,7 @@ def media_input_block(
     existing_item_noun: str = "captioned",
     existing_files_label: str = "captions",
     input_tabs_elem_id: str = "vc-input-tabs",
+    preview_height: int = 390,
 ) -> MediaInputHandles:
     """Build the shared upload/path/folder surface with optional namespacing.
 
@@ -1321,29 +1288,32 @@ def media_input_block(
                 )
 
         with gr.Group():
+            # Only the source tabs may change the selection. Interactive media
+            # components also expose upload/clear controls and cached copies,
+            # which can diverge from the authoritative Files or File path value.
             video = gr.Video(
-                label="Video preview and trim",
+                label="Video preview",
                 format=None,
-                interactive=True,
+                interactive=False,
                 visible=False,
-                height=390,
+                height=preview_height,
                 buttons=["download"],
             )
             audio = gr.Audio(
-                label="Audio preview and trim",
+                label="Audio preview",
                 type="filepath",
                 format=None,
-                interactive=True,
-                editable=True,
+                interactive=False,
+                editable=False,
                 visible=False,
                 buttons=["download"],
             )
             image = gr.Image(
                 label="Image preview",
                 type="filepath",
-                interactive=True,
+                interactive=False,
                 visible=False,
-                height=390,
+                height=preview_height,
                 buttons=["download", "fullscreen"],
             )
         info = gr.Markdown(
@@ -1684,40 +1654,8 @@ def media_input_block(
         "select": select_input_mode,
     }
 
-    def accept_editor_value(
-        value: str | None,
-        current: list[str] | None,
-        input_mode: str,
-    ) -> tuple[Any, ...]:
-        selected = _resolved_after_preview_edit(value, current, input_mode)
-        updates = _preview_updates(selected)
-        return selected, updates[3], updates[4], updates[5], updates[6]
-
-    editor_outputs = [resolved_state, info, gallery, modality_state, duration_state]
-    video.change(
-        accept_editor_value,
-        inputs=[video, resolved_state, mode_state],
-        outputs=editor_outputs,
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
-    )
-    audio.change(
-        accept_editor_value,
-        inputs=[audio, resolved_state, mode_state],
-        outputs=editor_outputs,
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
-    )
-    image.change(
-        accept_editor_value,
-        inputs=[image, resolved_state, mode_state],
-        outputs=editor_outputs,
-        queue=False,
-        show_progress="hidden",
-        api_visibility="private",
-    )
+    # Previews are outputs only. Their cached media copies must never become
+    # inputs or replace the files selected through the upload/path/folder tabs.
 
     return MediaInputHandles(
         files,

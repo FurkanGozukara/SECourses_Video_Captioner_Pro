@@ -229,9 +229,6 @@ def test_non_playable_video_uses_a_poster_without_assigning_gradio_video(
     assert "Trim range still works." in detail
     assert source.name in gallery
     assert modality == "video_audio" and duration == 1680.0
-    assert components._resolved_after_preview_edit(image["value"], [str(source)], "upload") == [
-        str(source)
-    ]
 
 
 def test_poster_failure_keeps_probe_and_state_updates(

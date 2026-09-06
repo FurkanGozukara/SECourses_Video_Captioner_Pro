@@ -21,7 +21,7 @@ from vcap.pipeline.runner import (
 )
 from vcap.prompts.presets import TEMPLATE_VARIABLES, render_prompt
 from vcap.ui.app import UiContext
-from vcap.ui.components import _folder_scan, _resolved_after_preview_edit
+from vcap.ui.components import _folder_scan
 from vcap.ui.tabs import caption_tab
 
 
@@ -58,26 +58,6 @@ def test_folder_scan_counts_mirrored_output_sidecars(tmp_path: Path) -> None:
         str(source), True, str(output), False, 2, ["video"]
     )
     assert "limiting to first 2" in limited_summary
-
-
-def test_folder_preview_edit_never_replaces_scanned_source_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "source" / "nested" / "clip.mp4"
-    cached = tmp_path / "gradio" / "hash" / "clip.mp4"
-    uploaded = tmp_path / "gradio" / "original" / "clip.mp4"
-    source.parent.mkdir(parents=True)
-    cached.parent.mkdir(parents=True)
-    uploaded.parent.mkdir(parents=True)
-    source.write_bytes(b"")
-    cached.write_bytes(b"")
-    uploaded.write_bytes(b"")
-    monkeypatch.setenv("GRADIO_TEMP_DIR", str(tmp_path / "gradio"))
-
-    assert _resolved_after_preview_edit(str(cached), [str(source)], "folder") == [str(source)]
-    assert _resolved_after_preview_edit(str(cached), [str(source)], "upload") == [str(source)]
-    assert _resolved_after_preview_edit(str(cached), [str(uploaded)], "upload") == [str(cached)]
 
 
 def test_nested_unicode_batch_output_is_mirrored_from_source_root(tmp_path: Path) -> None:

@@ -185,7 +185,9 @@ Dark is the default. The **🌗 Light / dark theme** button at the top right of 
 
 **Open / Close All** in the preset bar expands or collapses every section of the tab you are looking at, including sections nested inside others; it runs entirely in the browser and never touches the server. **⟲ Load Last Values**, immediately to its left, applies the preset this machine used last.
 
-The top-level order is Caption, Processing Pipeline, Transcribe, Chat, Caption Editor, Dataset & Export, Global Settings, Recover Settings, System & Models, and Changelog. Transcribe mirrors Caption's two-column workflow: inputs, streamed result, actions, progress, item tracker, live log, and resource meter stay on the left; model, language, decoding, timestamp/output, and VAD settings stay in numbered accordions on the right.
+The top-level order is Caption, Processing Pipeline, Transcribe, Chat, Caption Editor, Dataset & Export, Global Settings, Recover Settings, System & Models, and Changelog. Caption keeps the loaded media on the left and the caption, Start, Cancel, and Copy controls on the right. Model, task/prompt, and generation settings sit below that workspace in collapsed sections; narrow screens stack the two columns. Additional results contains the JSON, subtitles, reasoning, files, clips, and export tools.
+
+Load and replace media through Upload files, File path, or Folder batch. Image, video, and audio previews are read-only so they always represent the selected source; use Trim range to select video/audio start and end times. Transcribe uses the same source-selection rules, with inputs, streamed result, actions, progress, item tracker, live log, and resource meter on the left, and model, language, decoding, timestamp/output, and VAD settings on the right.
 
 ## Keyboard Shortcuts
 
@@ -259,6 +261,7 @@ Fresh measurements below are three-generation means on physical GPU 0, an RTX 50
 - [Quantization quality report](docs/QUANT_REPORT.md)
 - [Consolidated benchmarks](docs/BENCHMARKS.md)
 - [Whisper speech transcription backend](docs/WHISPER.md)
+- [QA verification log v1.8.0](docs/QA_VERIFICATION_v1.8.0.md)
 - [QA verification log v1.7.0](docs/QA_VERIFICATION_v1.7.0.md)
 - [QA verification log v1.6.0](docs/QA_VERIFICATION_v1.6.0.md)
 - [QA verification log v1.5.0](docs/QA_VERIFICATION_v1.5.0.md)
