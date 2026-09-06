@@ -61,16 +61,18 @@ def test_replaced_source_wins_over_pending_preview(tmp_path, mode, key, transcri
     assert resolver({key: value}, mode, [str(previous)]) == [str(selected.resolve())]
 
 
-def test_caption_results_and_actions_share_column_beside_media(app):
+def test_caption_actions_output_and_options_share_column_beside_media(app):
     config = app.get_config_file()
     ids = {
         item["props"].get("elem_id"): item["id"]
         for item in config["components"]
     }
     parents = {}
+    order = []
 
     def visit(node, ancestry=()):
         parents[node["id"]] = ancestry
+        order.append(node["id"])
         for child in node.get("children", []):
             visit(child, (*ancestry, node["id"]))
 
@@ -84,7 +86,18 @@ def test_caption_results_and_actions_share_column_beside_media(app):
     assert media in parents[handles.media.image._id]
     assert results in parents[handles.caption._id]
     assert results in parents[handles.start._id]
-    assert workspace not in parents[ids["vc_caption_settings"]]
+    options = ids["vc_caption_options"]
+    assert results in parents[options]
+    for button in ("vc_caption_start", "vc_caption_cancel", "vc_copy_caption"):
+        assert ids["vc_caption_actions"] in parents[ids[button]]
+        assert order.index(ids[button]) < order.index(handles.caption._id)
+    assert order.index(handles.caption._id) < order.index(options)
+    assert options in parents[ids["vc_caption_settings"]]
     entries = {entry.key: entry.component._id for entry in app.vcap_context.registry.entries()}
-    for key in ("model_key", "user_prompt", "max_new_tokens"):
+    for key in ("model_key", "user_prompt", "system_prompt", "max_new_tokens"):
         assert ids["vc_caption_settings"] in parents[entries[key]]
+    assert order.index(entries["user_prompt"]) < order.index(entries["system_prompt"])
+    # Both prompts are immediately available when Caption options is open.
+    accordions = {item["id"] for item in config["components"] if item["type"] == "accordion"}
+    for key in ("user_prompt", "system_prompt"):
+        assert accordions.intersection(parents[entries[key]]) == {options}

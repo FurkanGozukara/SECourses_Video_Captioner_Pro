@@ -1655,24 +1655,21 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                     )
 
             with gr.Column(scale=1, min_width=360, elem_id="vc_caption_results"):
-                with gr.Column():
-                    gr.Markdown("### Result")
-                    caption = gr.Textbox(
-                        label="Caption",
-                        lines=10,
-                        max_lines=10,
-                        buttons=["copy"],
-                        show_label=True,
-                        interactive=False,
-                        autoscroll=True,
+                with gr.Row(elem_id="vc_caption_actions"):
+                    start = action_button(
+                        "▶ Start Captioning",
+                        "emerald",
+                        variant="primary",
+                        scale=3,
+                        min_width=0,
+                        elem_id="vc_caption_start",
                     )
-                with gr.Row():
-                    start = action_button("▶ Start Captioning", "emerald", variant="primary", scale=3, elem_id="vc_caption_start")
                     cancel = action_button(
                         "⏹ Cancel",
                         "red",
                         variant="stop",
                         scale=2,
+                        min_width=0,
                         elem_id="vc_caption_cancel",
                         interactive=False,
                     )
@@ -1680,9 +1677,939 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                         "⧉ Copy caption",
                         "blue",
                         scale=2,
+                        min_width=0,
                         elem_id="vc_copy_caption",
                         interactive=False,
                     )
+                with gr.Row(
+                    visible=False,
+                    elem_id="vc_caption_cancel_confirmation",
+                    elem_classes=["vc-confirm-bar"],
+                ) as cancel_confirmation:
+                    gr.Markdown("⚠ Cancel the running job?")
+                    cancel_yes = action_button(
+                        "✔ Yes, cancel",
+                        "maroon",
+                        variant="stop",
+                        scale=0,
+                        min_width=132,
+                        elem_id="vc_caption_cancel_yes",
+                    )
+                    cancel_keep = action_button(
+                        "✖ Keep running",
+                        "steel",
+                        scale=0,
+                        min_width=148,
+                        elem_id="vc_caption_cancel_keep",
+                    )
+                caption = gr.Textbox(
+                    label="Output caption",
+                    placeholder="Your caption will appear here as it is generated.",
+                    lines=7,
+                    max_lines=7,
+                    buttons=["copy"],
+                    show_label=True,
+                    interactive=False,
+                    autoscroll=True,
+                    elem_id="vc_caption_output",
+                )
+                with gr.Accordion("Caption options", open=True, elem_id="vc_caption_options"):
+                    with gr.Column(min_width=0, elem_id="vc_caption_settings"):
+                        # Separate groups keep Gradio from combining the two
+                        # full-width prompts into a horizontally scrolling form.
+                        with gr.Group():
+                            user_prompt = gr.Textbox(
+                                value=initial_user,
+                                label="User prompt",
+                                info="The complete model request after template variables are rendered.",
+                                lines=3,
+                                max_lines=6,
+                                elem_classes=["vc-mono"],
+                            )
+                        controls["user_prompt"] = ctx.reg(
+                            "user_prompt", user_prompt, initial_user, section="prompt",
+                            description="Rendered or custom user instruction.", kind="str",
+                        )
+                        with gr.Group():
+                            system_prompt = gr.Textbox(
+                                value=initial_system or "",
+                                label="System prompt",
+                                info="Optional system instruction sent before the user request.",
+                                lines=2,
+                                max_lines=4,
+                                elem_classes=["vc-mono"],
+                            )
+                        controls["system_prompt"] = ctx.reg(
+                            "system_prompt", system_prompt, "", section="prompt",
+                            description="Rendered or custom system instruction.", kind="str",
+                        )
+                        with gr.Accordion("Task & prompt presets", open=False):
+                            prompt_preset = gr.Dropdown(
+                                choices=_prompt_choices(initial_family, _INITIAL_MODALITY),
+                                value=initial_prompt.id,
+                                allow_custom_value=True,
+                                label="Task / prompt preset",
+                                info="Filtered to the selected model family and first input modality.",
+                            )
+                            controls["prompt_preset_id"] = ctx.reg(
+                                "prompt_preset_id", prompt_preset, initial_prompt.id, section="prompt",
+                                description="Built-in task and prompt preset identifier.", kind="str",
+                            )
+                            valid_prompt_preset_state = gr.State(initial_prompt.id)
+                            picked_prompt = pick_marker(prompt_preset, "prompt_preset")
+                            prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
+                            with gr.Row():
+                                my_prompts = gr.Dropdown(
+                                    choices=initial_prompt_names,
+                                    value=None,
+                                    label="My prompts",
+                                    info="Saved system and user prompt pairs from the personal prompt library.",
+                                    scale=3,
+                                    elem_id="vc_my_prompts",
+                                )
+                                controls["prompt_library_selection"] = ctx.reg(
+                                    "prompt_library_selection",
+                                    my_prompts,
+                                    "",
+                                    section="prompt_library",
+                                    description="Currently selected personal prompt-library entry.",
+                                    kind="str",
+                                    in_preset=False,
+                                    in_metadata=False,
+                                )
+                                prompt_name = gr.Textbox(
+                                    value="",
+                                    label="Prompt name",
+                                    info="Name used when saving a personal prompt; Unicode names are supported.",
+                                    scale=3,
+                                    elem_id="vc_prompt_name",
+                                )
+                                controls["prompt_library_name"] = ctx.reg(
+                                    "prompt_library_name",
+                                    prompt_name,
+                                    "",
+                                    section="prompt_library",
+                                    description="Name used to save or identify a personal prompt entry.",
+                                    kind="str",
+                                    in_preset=False,
+                                    in_metadata=False,
+                                )
+                            with gr.Row():
+                                save_prompt = action_button(
+                                    "💾 Save prompt", "green", elem_id="vc_save_prompt"
+                                )
+                                load_prompt = action_button(
+                                    "📥 Load prompt", "jade", elem_id="vc_load_prompt"
+                                )
+                                delete_prompt = action_button(
+                                    "🗑 Delete prompt", "crimson", elem_id="vc_delete_prompt"
+                                )
+                            prompt_library_status = gr.Markdown(
+                                "<span class='vc-help'>Personal prompt library ready.</span>",
+                                elem_classes=["vc-status"],
+                                elem_id="vc_prompt_library_status",
+                            )
+                            with gr.Accordion("Template variables", open=False):
+                                gr.Markdown(
+                                    "Prompt templates may also use `{{TRANSCRIPT}}`; it is filled with clip-local "
+                                    "Whisper speech after the ordinary variables are rendered.",
+                                    elem_classes=["vc-help"],
+                                )
+                                trigger_word = gr.Textbox(
+                                    value="ohwx",
+                                    label="Trigger word",
+                                    info="Concept token used in prompt templates and optional caption injection.",
+                                )
+                                controls["trigger_word"] = ctx.reg(
+                                    "trigger_word", trigger_word, "ohwx", section="prompt",
+                                    description="Concept trigger token used by templates and post-processing.", kind="str",
+                                )
+                                with gr.Row():
+                                    language = gr.Textbox(value="English", label="Caption language", info="Requested caption language.")
+                                    controls["language"] = ctx.reg(
+                                        "language", language, "English", section="prompt",
+                                        description="Requested caption language.", kind="str",
+                                    )
+                                    source_language = gr.Textbox(value="English", label="Source language", info="Spoken language in the source audio.")
+                                    controls["source_language"] = ctx.reg(
+                                        "source_language", source_language, "English", section="prompt",
+                                        description="Language spoken in source audio.", kind="str",
+                                    )
+                                    target_language = gr.Textbox(value="English", label="Target language", info="Translation target language.")
+                                    controls["target_language"] = ctx.reg(
+                                        "target_language", target_language, "English", section="prompt",
+                                        description="Target language for translation tasks.", kind="str",
+                                    )
+                                with gr.Row():
+                                    caption_length = gr.Dropdown(
+                                        choices=list(_CAPTION_LENGTH_CHOICES),
+                                        value="detailed",
+                                        allow_custom_value=True,
+                                        label="Caption length",
+                                        info="Natural-language detail target inserted into compatible templates.",
+                                    )
+                                    controls["caption_length"] = ctx.reg(
+                                        "caption_length", caption_length, "detailed", section="prompt",
+                                        description="Requested caption length or detail level.", kind="str",
+                                    )
+                                    valid_caption_length_state = gr.State("detailed")
+                                    subject_class = gr.Textbox(value="person", label="Subject class", info="Generic identity class for LoRA captions.")
+                                    controls["subject_class"] = ctx.reg(
+                                        "subject_class", subject_class, "person", section="prompt",
+                                        description="Generic class noun used by character training prompts.", kind="str",
+                                    )
+                                avoid_list = gr.Textbox(
+                                    value="",
+                                    label="Avoid list",
+                                    info="Concepts the generated caption should not mention.",
+                                    lines=2,
+                                )
+                                controls["avoid_list"] = ctx.reg(
+                                    "avoid_list", avoid_list, "", section="prompt",
+                                    description="Comma-separated concepts excluded by compatible prompt templates.", kind="str",
+                                )
+                                extra_instructions = gr.Textbox(
+                                    value="",
+                                    label="Extra instructions",
+                                    info="Optional task-specific directions appended by compatible templates.",
+                                    lines=3,
+                                )
+                                controls["extra_instructions"] = ctx.reg(
+                                    "extra_instructions", extra_instructions, "", section="prompt",
+                                    description="Additional task instructions inserted into prompt templates.", kind="str",
+                                )
+                            reset_prompts = action_button("↺ Reset prompts to preset", "purple")
+
+                        with gr.Accordion("Model", open=False):
+                            model_key = gr.Dropdown(
+                                choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
+                                value=_INITIAL_VARIANT,
+                                label="Model variant",
+                                info="Model family, precision/backend variant, and estimated local checkpoint size.",
+                                # Presets and tier filters can update the value and the
+                                # choices in different events; the validator below rejects
+                                # unknown values, so Gradio must not raise on a transient one.
+                                allow_custom_value=True,
+                            )
+                            valid_model_key_state = gr.State(_INITIAL_VARIANT)
+                            ctx.states["caption_valid_model_key"] = valid_model_key_state
+                            picked_model = pick_marker(model_key, "model_key")
+                            controls["model_key"] = ctx.reg(
+                                "model_key", model_key, _INITIAL_VARIANT, section="model",
+                                description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
+                            )
+                            show_all_variants = gr.Checkbox(
+                                value=False,
+                                label="Show all variants (ignore VRAM tier)",
+                                info="Lists variants above the active VRAM tier; they may require CPU offload or run out of memory.",
+                            )
+                            controls["show_all_variants"] = ctx.reg(
+                                "show_all_variants", show_all_variants, False, section="model",
+                                description="Show model variants that exceed the active VRAM tier.", kind="bool",
+                            )
+                            quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
+                            with gr.Row():
+                                vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
+                                vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
+                                vram_preset = gr.Dropdown(
+                                    choices=vram_choices,
+                                    value="auto",
+                                    label="VRAM preset",
+                                    info="Applies a coordinated precision, frame, pixel, token, attention, and offload plan.",
+                                )
+                                controls["vram_preset"] = ctx.reg(
+                                    "vram_preset", vram_preset, "auto", section="model",
+                                    description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
+                                )
+                                picked_vram = pick_marker(vram_preset, "vram_preset")
+                                attention = gr.Dropdown(
+                                    choices=_attention_choices(),
+                                    value="auto",
+                                    label="Attention backend",
+                                    info=_CONTROL_INFO["attention_backend"],
+                                )
+                                controls["attention_backend"] = ctx.reg(
+                                    "attention_backend", attention, "auto", section="model",
+                                    description="Requested attention implementation with safe runtime fallback.", choices=ATTENTION_CHOICES, kind="str",
+                                )
+                            vram_note = gr.Markdown(
+                                f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
+                            )
+                            with gr.Row():
+                                gpu_picker = gr.Dropdown(
+                                    choices=gpu_choices,
+                                    value=gpu_default,
+                                    label="GPU",
+                                    info="The selected physical GPU is isolated for the caption worker.",
+                                )
+                                controls["gpu_index"] = ctx.reg(
+                                    "gpu_index", gpu_picker, gpu_default, section="runtime",
+                                    description="Physical NVIDIA GPU index used by the pipeline.", kind="int",
+                                    choices=[value for _, value in gpu_choices], in_preset=False,
+                                )
+                                subprocess_mode = gr.Checkbox(
+                                    value=True,
+                                    label="Subprocess mode",
+                                    info="Recommended: isolates CUDA and allows process-tree cancellation.",
+                                )
+                                controls["subprocess_mode"] = ctx.reg(
+                                    "subprocess_mode", subprocess_mode, True, section="runtime",
+                                    description="Run model inference in an isolated worker process.", kind="bool",
+                                )
+                            gpu_indices = gr.CheckboxGroup(
+                                choices=data_parallel_gpu_choices,
+                                value=[],
+                                label="Data-parallel GPUs",
+                                info=(
+                                    "Leave empty to use the single GPU above. Selecting 2 or more GPUs splits folder batches "
+                                    "across workers, with one model copy loaded per GPU."
+                                ),
+                            )
+                            controls["gpu_indices"] = ctx.reg(
+                                "gpu_indices", gpu_indices, [], section="runtime",
+                                description="Physical GPU indices used for data-parallel folder batch workers.",
+                                choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
+                            )
+                            with gr.Row():
+                                keep_loaded = gr.Checkbox(
+                                    value=True,
+                                    label="Keep model loaded",
+                                    info="Reuse the worker and resident model between caption jobs.",
+                                )
+                                controls["keep_model_loaded"] = ctx.reg(
+                                    "keep_model_loaded", keep_loaded, True, section="runtime",
+                                    description="Keep model weights resident between runs.", kind="bool",
+                                )
+                                idle_minutes = gr.Number(
+                                    value=10,
+                                    minimum=0,
+                                    maximum=1440,
+                                    step=1,
+                                    precision=1,
+                                    label="Idle unload (minutes)",
+                                    info="Zero disables automatic idle unload.",
+                                )
+                                controls["idle_unload_minutes"] = ctx.reg(
+                                    "idle_unload_minutes", idle_minutes, 10, section="runtime",
+                                    description="Minutes before an idle persistent model is unloaded.", kind="float", minimum=0, maximum=1440,
+                                )
+                                oom_retries = gr.Number(
+                                    value=2,
+                                    minimum=0,
+                                    maximum=4,
+                                    step=1,
+                                    precision=0,
+                                    label="OOM retries",
+                                    info=(
+                                        "Automatic out-of-memory recoveries per segment; each retry lowers frames and resolution "
+                                        "one notch and logs it. 0 fails the segment immediately."
+                                    ),
+                                    elem_id="vc_oom_retries",
+                                )
+                                controls["oom_retries"] = ctx.reg(
+                                    "oom_retries", oom_retries, 2, section="runtime",
+                                    description=(
+                                        "Automatic out-of-memory recoveries per segment; each retry lowers frames and resolution "
+                                        "one notch and logs it. 0 fails the segment immediately."
+                                    ),
+                                    kind="int", minimum=0, maximum=4,
+                                )
+                            oom_degrade_factor = gr.Slider(
+                                minimum=0.5,
+                                maximum=0.95,
+                                value=0.75,
+                                step=0.05,
+                                label="OOM degrade factor",
+                                info=(
+                                    "Scale applied to the pixel and frame budgets on each automatic out-of-memory retry "
+                                    "(0.75 = reduce by 25%)."
+                                ),
+                                elem_id="vc_oom_degrade_factor",
+                            )
+                            controls["oom_degrade_factor"] = ctx.reg(
+                                "oom_degrade_factor",
+                                oom_degrade_factor,
+                                0.75,
+                                section="runtime",
+                                description=(
+                                    "Scale applied to the pixel and frame budgets on each automatic out-of-memory retry "
+                                    "(0.75 = reduce by 25%)."
+                                ),
+                                kind="float",
+                                minimum=0.5,
+                                maximum=0.95,
+                            )
+                            with gr.Accordion("Block swap & offload plan", open=True):
+                                with gr.Row():
+                                    block_swap_auto = gr.Checkbox(
+                                        value=True,
+                                        label="Automatic block swap",
+                                        info=_CONTROL_INFO["block_swap_auto"],
+                                        scale=2,
+                                    )
+                                    controls["block_swap_auto"] = ctx.reg(
+                                        "block_swap_auto", block_swap_auto, True, section="model",
+                                        description="Let the loader choose how many decoder layers to block-swap.", kind="bool",
+                                    )
+                                    blocks_to_swap = gr.Slider(
+                                        minimum=0,
+                                        maximum=_BLOCK_SWAP_SLIDER_MAX,
+                                        step=1,
+                                        value=0,
+                                        interactive=False,
+                                        label="Decoder layers to block-swap",
+                                        info=_blocks_info(family_layer_count(initial_family)),
+                                        scale=3,
+                                    )
+                                    controls["blocks_to_swap"] = ctx.reg(
+                                        "blocks_to_swap", blocks_to_swap, 0, section="model",
+                                        description="Decoder layers kept in system RAM when automatic block swap is off.",
+                                        kind="int", minimum=0, maximum=_BLOCK_SWAP_SLIDER_MAX,
+                                    )
+                                block_swap_note = gr.Markdown(
+                                    _initial_block_swap_note(ctx, _INITIAL_VARIANT, gpu_default, detected_tier),
+                                    elem_classes=["vc-status"],
+                                )
+                                with gr.Row():
+                                    vram_reserve_gb = gr.Number(
+                                        value=2.0,
+                                        minimum=0,
+                                        maximum=24,
+                                        step=0.5,
+                                        label="VRAM to keep free (GB)",
+                                        info="Dedicated VRAM reserved for activations and runtime peaks.",
+                                    )
+                                    controls["vram_reserve_gb"] = ctx.reg(
+                                        "vram_reserve_gb", vram_reserve_gb, 2.0, section="model",
+                                        description="Dedicated VRAM kept free at the expected generation peak.",
+                                        kind="float", minimum=0, maximum=24,
+                                    )
+                                    swap_slots = gr.Dropdown(
+                                        choices=[1, 2, 3, 4],
+                                        value=2,
+                                        label="Swap slots",
+                                        info=_CONTROL_INFO["swap_slots"],
+                                        elem_id="vc_swap_slots",
+                                    )
+                                    controls["swap_slots"] = ctx.reg(
+                                        "swap_slots", swap_slots, 2, section="model",
+                                        description="GPU staging slots allocated for decoder block swap.",
+                                        choices=[1, 2, 3, 4], kind="int",
+                                    )
+                                    plan_slack_mib = gr.Number(
+                                        value=512,
+                                        minimum=0,
+                                        maximum=8192,
+                                        step=64,
+                                        precision=0,
+                                        label="Plan slack (MiB)",
+                                        info=_CONTROL_INFO["plan_slack_mib"],
+                                        elem_id="vc_plan_slack_mib",
+                                    )
+                                    controls["plan_slack_mib"] = ctx.reg(
+                                        "plan_slack_mib",
+                                        plan_slack_mib,
+                                        512,
+                                        section="model",
+                                        description=(
+                                            "Fixed CUDA-allocator slack (MiB) added to the activation estimate when planning "
+                                            "how many decoder layers stay resident."
+                                        ),
+                                        kind="int",
+                                        minimum=0,
+                                        maximum=8192,
+                                    )
+                                with gr.Row():
+                                    offload_experts = gr.Checkbox(
+                                        value=False,
+                                        label="Offload MoE experts",
+                                        info=_CONTROL_INFO["offload_experts"],
+                                    )
+                                    controls["offload_experts"] = ctx.reg(
+                                        "offload_experts", offload_experts, False, section="model",
+                                        description="Use legacy Accelerate expert offload instead of block swap.", kind="bool",
+                                    )
+                                    pin_cpu = gr.Checkbox(
+                                        value=True,
+                                        label="Pin swapped layers in RAM",
+                                        info=_CONTROL_INFO["pin_cpu"],
+                                    )
+                                    controls["pin_cpu"] = ctx.reg(
+                                        "pin_cpu", pin_cpu, True, section="model",
+                                        description="Pin block-swapped decoder layers in host memory.", kind="bool",
+                                    )
+                                    pinned_ram_budget_gb = gr.Number(
+                                        value=0.0,
+                                        minimum=0,
+                                        maximum=1024,
+                                        step=0.5,
+                                        label="Pinned RAM budget (GB)",
+                                        info=_CONTROL_INFO["pinned_ram_budget_gb"],
+                                        elem_id="vc_pinned_ram_budget_gb",
+                                    )
+                                    controls["pinned_ram_budget_gb"] = ctx.reg(
+                                        "pinned_ram_budget_gb", pinned_ram_budget_gb, 0.0, section="model",
+                                        description=_CONTROL_INFO["pinned_ram_budget_gb"],
+                                        kind="float", minimum=0, maximum=1024,
+                                    )
+                                vram_hard_cap = gr.Checkbox(
+                                    value=True,
+                                    label="Cap the CUDA allocator at the VRAM free at load",
+                                    info=_CONTROL_INFO["vram_hard_cap"],
+                                    elem_id="vc_vram_hard_cap",
+                                )
+                                controls["vram_hard_cap"] = ctx.reg(
+                                    "vram_hard_cap", vram_hard_cap, True, section="model",
+                                    description=_CONTROL_INFO["vram_hard_cap"], kind="bool",
+                                )
+                            with gr.Row():
+                                compile_enabled = gr.Checkbox(
+                                    value=False,
+                                    label="torch.compile",
+                                    info=_CONTROL_INFO["torch_compile"],
+                                )
+                                controls["torch_compile"] = ctx.reg(
+                                    "torch_compile", compile_enabled, False, section="runtime",
+                                    description="Compile the language model forward pass with safe fallbacks.", kind="bool",
+                                )
+                                compile_mode = gr.Dropdown(
+                                    choices=compile_mode_choices(),
+                                    value=DEFAULT_COMPILE_MODE,
+                                    label="Compile mode",
+                                    info=_CONTROL_INFO["torch_compile_mode"],
+                                )
+                                controls["torch_compile_mode"] = ctx.reg(
+                                    "torch_compile_mode", compile_mode, DEFAULT_COMPILE_MODE, section="runtime",
+                                    description="Requested torch.compile tuning mode.",
+                                    choices=list(compile_mode_values()), kind="str",
+                                )
+                            with gr.Accordion(
+                                "llama.cpp (GGUF) options",
+                                open=False,
+                                visible=False,
+                                elem_id="vc_gguf_options",
+                            ) as gguf_options:
+                                with gr.Row():
+                                    gguf_max_frames = gr.Number(
+                                        value=32, minimum=1, maximum=128, step=1, precision=0,
+                                        label="GGUF maximum frames",
+                                        info=(
+                                            "Upper bound on sampled video frames sent to llama-server per clip; each frame is encoded "
+                                            "as an image (about 256 tokens per frame at 262,144 pixels). Frames are chosen from Sampling "
+                                            "FPS, Maximum frames and Sampling strategy, then capped here and by the context window."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_max_frames",
+                                    )
+                                    controls["gguf_max_frames"] = ctx.reg(
+                                        "gguf_max_frames", gguf_max_frames, 32, section="runtime",
+                                        description=(
+                                            "Upper bound on sampled video frames sent to llama-server per clip; each frame is encoded "
+                                            "as an image (about 256 tokens per frame at 262,144 pixels). Frames are chosen from Sampling "
+                                            "FPS, Maximum frames and Sampling strategy, then capped here and by the context window."
+                                        ), kind="int", minimum=1, maximum=128,
+                                    )
+                                    gguf_jpeg_quality = gr.Number(
+                                        value=90, minimum=50, maximum=100, step=1, precision=0,
+                                        label="JPEG quality",
+                                        info="JPEG quality of frames sent to llama-server.",
+                                        interactive=False,
+                                        elem_id="vc_gguf_jpeg_quality",
+                                    )
+                                    controls["gguf_jpeg_quality"] = ctx.reg(
+                                        "gguf_jpeg_quality", gguf_jpeg_quality, 90, section="runtime",
+                                        description="JPEG quality of frames sent to llama-server.",
+                                        kind="int", minimum=50, maximum=100,
+                                    )
+                                with gr.Row():
+                                    gguf_threads = gr.Number(
+                                        value=0, minimum=0, maximum=256, step=1, precision=0,
+                                        label="CPU threads",
+                                        info="CPU threads for llama-server (--threads); 0 = llama.cpp default.",
+                                        interactive=False,
+                                        elem_id="vc_gguf_threads",
+                                    )
+                                    controls["gguf_threads"] = ctx.reg(
+                                        "gguf_threads", gguf_threads, 0, section="runtime",
+                                        description="CPU threads for llama-server (--threads); 0 = llama.cpp default.",
+                                        kind="int", minimum=0, maximum=256,
+                                    )
+                                    gguf_flash_attn = gr.Dropdown(
+                                        choices=[("Automatic", "auto"), ("On", "on"), ("Off", "off")],
+                                        value="auto", label="Flash attention",
+                                        info="llama.cpp flash attention (-fa).",
+                                        interactive=False,
+                                        elem_id="vc_gguf_flash_attn",
+                                    )
+                                    controls["gguf_flash_attn"] = ctx.reg(
+                                        "gguf_flash_attn", gguf_flash_attn, "auto", section="runtime",
+                                        description="llama.cpp flash attention (-fa).",
+                                        kind="str", choices=["auto", "on", "off"],
+                                    )
+                                with gr.Row():
+                                    gguf_batch_size = gr.Number(
+                                        value=2048, minimum=64, maximum=8192, step=64, precision=0,
+                                        label="Logical batch size",
+                                        info="Logical prompt batch size (-b).",
+                                        interactive=False,
+                                        elem_id="vc_gguf_batch_size",
+                                    )
+                                    controls["gguf_batch_size"] = ctx.reg(
+                                        "gguf_batch_size", gguf_batch_size, 2048, section="runtime",
+                                        description="Logical prompt batch size (-b).",
+                                        kind="int", minimum=64, maximum=8192,
+                                    )
+                                    gguf_ubatch_size = gr.Number(
+                                        value=512, minimum=32, maximum=4096, step=32, precision=0,
+                                        label="Physical batch size",
+                                        info="Physical micro-batch size (-ub); lower values reduce VRAM during prefill.",
+                                        interactive=False,
+                                        elem_id="vc_gguf_ubatch_size",
+                                    )
+                                    controls["gguf_ubatch_size"] = ctx.reg(
+                                        "gguf_ubatch_size", gguf_ubatch_size, 512, section="runtime",
+                                        description="Physical micro-batch size (-ub); lower values reduce VRAM during prefill.",
+                                        kind="int", minimum=32, maximum=4096,
+                                    )
+                                with gr.Row():
+                                    gguf_cache_reuse = gr.Number(
+                                        value=0, minimum=0, maximum=4096, step=1, precision=0,
+                                        label="Prompt cache reuse",
+                                        info="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
+                                        interactive=False,
+                                        elem_id="vc_gguf_cache_reuse",
+                                    )
+                                    controls["gguf_cache_reuse"] = ctx.reg(
+                                        "gguf_cache_reuse", gguf_cache_reuse, 0, section="runtime",
+                                        description="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
+                                        kind="int", minimum=0, maximum=4096,
+                                    )
+                                    gguf_ignore_tier_context = gr.Checkbox(
+                                        value=False, label="Ignore tier context cap",
+                                        info=(
+                                            "Request the full Context length instead of the VRAM-tier clamp (8k for 16 GB and below, "
+                                            "16k for 24 GB, 32k otherwise). Larger windows need more VRAM for the KV cache."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_ignore_tier_context",
+                                    )
+                                    controls["gguf_ignore_tier_context"] = ctx.reg(
+                                        "gguf_ignore_tier_context", gguf_ignore_tier_context, False, section="runtime",
+                                        description=(
+                                            "Request the full Context length instead of the VRAM-tier clamp (8k for 16 GB and below, "
+                                            "16k for 24 GB, 32k otherwise). Larger windows need more VRAM for the KV cache."
+                                        ),
+                                        kind="bool",
+                                    )
+                                with gr.Row():
+                                    gguf_min_p = gr.Slider(
+                                        minimum=0.0,
+                                        maximum=1.0,
+                                        value=0.05,
+                                        step=0.01,
+                                        label="Min-p",
+                                        info=(
+                                            "llama.cpp min-p sampling: tokens below this fraction of the top probability are "
+                                            "dropped. 0.05 is the llama.cpp default; only matters when Sample tokens is on."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_min_p",
+                                    )
+                                    controls["gguf_min_p"] = ctx.reg(
+                                        "gguf_min_p", gguf_min_p, 0.05, section="runtime",
+                                        description=(
+                                            "llama.cpp min-p sampling: tokens below this fraction of the top probability are "
+                                            "dropped; only matters when sampling."
+                                        ),
+                                        kind="float", minimum=0.0, maximum=1.0,
+                                    )
+                                    gguf_repeat_last_n = gr.Number(
+                                        value=64,
+                                        minimum=0,
+                                        maximum=4096,
+                                        step=1,
+                                        precision=0,
+                                        label="Repeat last N",
+                                        info=(
+                                            "Number of previous tokens the repetition penalty looks at (llama.cpp default 64; "
+                                            "0 disables the window)."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_repeat_last_n",
+                                    )
+                                    controls["gguf_repeat_last_n"] = ctx.reg(
+                                        "gguf_repeat_last_n", gguf_repeat_last_n, 64, section="runtime",
+                                        description="Number of previous tokens considered by the llama.cpp repetition penalty.",
+                                        kind="int", minimum=0, maximum=4096,
+                                    )
+                                with gr.Row():
+                                    gguf_presence_penalty = gr.Slider(
+                                        minimum=-2.0,
+                                        maximum=2.0,
+                                        value=0.0,
+                                        step=0.05,
+                                        label="Presence penalty",
+                                        info="llama.cpp presence penalty (positive values discourage tokens that already appeared).",
+                                        interactive=False,
+                                        elem_id="vc_gguf_presence_penalty",
+                                    )
+                                    controls["gguf_presence_penalty"] = ctx.reg(
+                                        "gguf_presence_penalty", gguf_presence_penalty, 0.0, section="runtime",
+                                        description="llama.cpp presence penalty; positive values discourage tokens that already appeared.",
+                                        kind="float", minimum=-2.0, maximum=2.0,
+                                    )
+                                    gguf_frequency_penalty = gr.Slider(
+                                        minimum=-2.0,
+                                        maximum=2.0,
+                                        value=0.0,
+                                        step=0.05,
+                                        label="Frequency penalty",
+                                        info="llama.cpp frequency penalty (scales with how often a token appeared).",
+                                        interactive=False,
+                                        elem_id="vc_gguf_frequency_penalty",
+                                    )
+                                    controls["gguf_frequency_penalty"] = ctx.reg(
+                                        "gguf_frequency_penalty", gguf_frequency_penalty, 0.0, section="runtime",
+                                        description="llama.cpp frequency penalty scaled by how often a token appeared.",
+                                        kind="float", minimum=-2.0, maximum=2.0,
+                                    )
+                                with gr.Row():
+                                    gguf_fit_headroom_mib = gr.Number(
+                                        value=1536,
+                                        minimum=0,
+                                        maximum=8192,
+                                        step=64,
+                                        precision=0,
+                                        label="Fit headroom (MiB)",
+                                        info=(
+                                            "Extra MiB kept free on top of VRAM to keep free for the multimodal projector's "
+                                            "encoder buffers when llama.cpp fits the model to the GPU (--fit)."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_fit_headroom_mib",
+                                    )
+                                    controls["gguf_fit_headroom_mib"] = ctx.reg(
+                                        "gguf_fit_headroom_mib", gguf_fit_headroom_mib, 1536, section="runtime",
+                                        description="Extra MiB kept free for multimodal projector buffers during llama.cpp GPU fitting.",
+                                        kind="int", minimum=0, maximum=8192,
+                                    )
+                                    gguf_startup_timeout_s = gr.Number(
+                                        value=900,
+                                        minimum=60,
+                                        maximum=3600,
+                                        step=30,
+                                        precision=0,
+                                        label="Startup timeout (s)",
+                                        info=(
+                                            "Seconds to wait for llama-server to become healthy after starting; large models "
+                                            "on slow disks need longer."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_startup_timeout_s",
+                                    )
+                                    controls["gguf_startup_timeout_s"] = ctx.reg(
+                                        "gguf_startup_timeout_s", gguf_startup_timeout_s, 900, section="runtime",
+                                        description="Seconds to wait for llama-server to become healthy after starting.",
+                                        kind="int", minimum=60, maximum=3600,
+                                    )
+                                    gguf_stream_idle_timeout_s = gr.Number(
+                                        value=120,
+                                        minimum=0,
+                                        maximum=3600,
+                                        step=10,
+                                        precision=0,
+                                        label="Stream idle timeout (s)",
+                                        info=(
+                                            "Abort a GGUF generation when no data arrives from llama-server for this many "
+                                            "seconds (0 = wait forever)."
+                                        ),
+                                        interactive=False,
+                                        elem_id="vc_gguf_stream_idle_timeout_s",
+                                    )
+                                    controls["gguf_stream_idle_timeout_s"] = ctx.reg(
+                                        "gguf_stream_idle_timeout_s", gguf_stream_idle_timeout_s, 120, section="runtime",
+                                        description="Maximum idle seconds while waiting for streamed llama-server generation data.",
+                                        kind="int", minimum=0, maximum=3600,
+                                    )
+                                with gr.Row():
+                                    gguf_gpu_layers = gr.Number(
+                                        value=0, minimum=0, maximum=999, step=1, precision=0,
+                                        label="GPU layers (-ngl, 0 = fit automatically)",
+                                        info=_CONTROL_INFO["gguf_gpu_layers"],
+                                        interactive=False,
+                                        elem_id="vc_gguf_gpu_layers",
+                                    )
+                                    controls["gguf_gpu_layers"] = ctx.reg(
+                                        "gguf_gpu_layers", gguf_gpu_layers, 0, section="runtime",
+                                        description=_CONTROL_INFO["gguf_gpu_layers"], kind="int", minimum=0, maximum=999,
+                                    )
+                                    gguf_n_cpu_moe = gr.Number(
+                                        value=0, minimum=0, maximum=999, step=1, precision=0,
+                                        label="MoE expert layers on CPU (--n-cpu-moe)",
+                                        info=_CONTROL_INFO["gguf_n_cpu_moe"],
+                                        interactive=False,
+                                        elem_id="vc_gguf_n_cpu_moe",
+                                    )
+                                    controls["gguf_n_cpu_moe"] = ctx.reg(
+                                        "gguf_n_cpu_moe", gguf_n_cpu_moe, 0, section="runtime",
+                                        description=_CONTROL_INFO["gguf_n_cpu_moe"], kind="int", minimum=0, maximum=999,
+                                    )
+                                gguf_extra_args = gr.Textbox(
+                                    value="", label="Extra llama-server arguments",
+                                    info="Extra llama-server command-line arguments appended verbatim (advanced; shell-split).",
+                                    lines=2, interactive=False,
+                                    elem_id="vc_gguf_extra_args",
+                                )
+                                controls["gguf_extra_args"] = ctx.reg(
+                                    "gguf_extra_args", gguf_extra_args, "", section="runtime",
+                                    description="Extra llama-server command-line arguments appended verbatim (advanced; shell-split).",
+                                    kind="str",
+                                )
+                            compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
+                            compile_probe_timer = gr.Timer(1.0)
+                            with gr.Row():
+                                download = action_button("📥 Download / Verify model", "sky", scale=3)
+                                refresh_ready = action_button("↻ Refresh", "lime", scale=1)
+                                clear_compile = action_button("⌫ Clear compile caches", "rose", scale=2, min_width=200)
+                                unload_model = action_button(
+                                    "⏏ Unload model", "navy", scale=2,
+                                    elem_id="vc_unload_model",
+                                )
+                            ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
+
+                        schema = {item.name: item for item in initial_spec.param_schema}
+                        with gr.Accordion("Generation", open=False):
+                            temperature = gr.Slider(
+                                0.0, 2.0, value=float(schema["temperature"].default), step=0.01,
+                                label="Temperature", info=schema["temperature"].description, buttons=["reset"],
+                            )
+                            controls["temperature"] = ctx.reg(
+                                "temperature", temperature, float(schema["temperature"].default), section="generation",
+                                description=schema["temperature"].description, kind="float", minimum=0, maximum=2,
+                            )
+                            with gr.Row():
+                                top_p = gr.Slider(0, 1, value=float(schema["top_p"].default), step=0.01, label="Top-p", info=schema["top_p"].description)
+                                controls["top_p"] = ctx.reg(
+                                    "top_p", top_p, float(schema["top_p"].default), section="generation",
+                                    description=schema["top_p"].description, kind="float", minimum=0, maximum=1,
+                                )
+                                top_k = gr.Slider(0, 200, value=int(schema["top_k"].default), step=1, precision=0, label="Top-k", info=schema["top_k"].description)
+                                controls["top_k"] = ctx.reg(
+                                    "top_k", top_k, int(schema["top_k"].default), section="generation",
+                                    description=schema["top_k"].description, kind="int", minimum=0, maximum=200,
+                                )
+                            repetition = gr.Slider(
+                                0.5, 2.0, value=float(schema["repetition_penalty"].default), step=0.01,
+                                label="Repetition penalty", info=schema["repetition_penalty"].description,
+                            )
+                            controls["repetition_penalty"] = ctx.reg(
+                                "repetition_penalty", repetition, float(schema["repetition_penalty"].default), section="generation",
+                                description=schema["repetition_penalty"].description, kind="float", minimum=0.5, maximum=2,
+                            )
+                            no_repeat_ngram_size = gr.Number(
+                                value=0,
+                                minimum=0,
+                                maximum=20,
+                                step=1,
+                                precision=0,
+                                label="No-repeat n-gram size",
+                                info=_CONTROL_INFO["no_repeat_ngram_size"],
+                                elem_id="vc_no_repeat_ngram_size",
+                            )
+                            controls["no_repeat_ngram_size"] = ctx.reg(
+                                "no_repeat_ngram_size",
+                                no_repeat_ngram_size,
+                                0,
+                                section="generation",
+                                description=_CONTROL_INFO["no_repeat_ngram_size"],
+                                kind="int",
+                                minimum=0,
+                                maximum=20,
+                            )
+                            max_new_tokens = gr.Slider(
+                                1,
+                                _GLOBAL_MAX_NEW_TOKENS,
+                                value=int(schema["max_new_tokens"].default),
+                                step=1,
+                                precision=0,
+                                label="Maximum new tokens",
+                                info=schema["max_new_tokens"].description,
+                            )
+                            controls["max_new_tokens"] = ctx.reg(
+                                "max_new_tokens", max_new_tokens, int(schema["max_new_tokens"].default), section="generation",
+                                description=schema["max_new_tokens"].description, kind="int", minimum=1, maximum=32768,
+                            )
+                            context_tokens = gr.Number(
+                                value=int(initial_spec.limits.context_tokens),
+                                minimum=1024,
+                                maximum=_GLOBAL_MAX_CONTEXT,
+                                step=256,
+                                precision=0,
+                                label="Context length (tokens)",
+                                info=_context_info(initial_spec),
+                            )
+                            controls["context_tokens"] = ctx.reg(
+                                "context_tokens", context_tokens, int(initial_spec.limits.context_tokens), section="generation",
+                                description=(
+                                    "Requested context window in tokens; capped by the selected model and, for GGUF, "
+                                    "by the VRAM tier and llama.cpp's memory fitter."
+                                ),
+                                kind="int", minimum=1024, maximum=_GLOBAL_MAX_CONTEXT,
+                            )
+                            with gr.Row():
+                                do_sample = gr.Checkbox(
+                                    value=bool(schema["do_sample"].default),
+                                    label="Sample tokens",
+                                    info="Prompt presets set this automatically; disable for deterministic greedy decoding.",
+                                )
+                                controls["do_sample"] = ctx.reg(
+                                    "do_sample", do_sample, bool(schema["do_sample"].default), section="generation",
+                                    description=schema["do_sample"].description, kind="bool",
+                                )
+                                seed = gr.Number(
+                                    value=-1,
+                                    minimum=-1,
+                                    maximum=2147483647,
+                                    step=1,
+                                    precision=0,
+                                    label="Seed",
+                                    info=(
+                                        "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
+                                        "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
+                                    ),
+                                    elem_id="vc_seed",
+                                )
+                                controls["seed"] = ctx.reg(
+                                    "seed", seed, -1, section="generation",
+                                    description=(
+                                        "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
+                                        "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
+                                    ),
+                                    kind="int", minimum=-1, maximum=2147483647,
+                                )
+                                use_cache = gr.Checkbox(
+                                    value=True,
+                                    label="Use KV cache",
+                                    info=_CONTROL_INFO["use_cache"],
+                                )
+                                controls["use_cache"] = ctx.reg(
+                                    "use_cache", use_cache, True, section="generation",
+                                    description="Use the model key/value cache during generation.", kind="bool",
+                                )
+                                enable_thinking = gr.Checkbox(
+                                    value=False,
+                                    label="Enable thinking",
+                                    info="Available only for the Qwen3-Omni Thinking family.",
+                                    interactive=False,
+                                )
+                                controls["enable_thinking"] = ctx.reg(
+                                    "enable_thinking", enable_thinking, False, section="generation",
+                                    description="Allow the Thinking model to emit a reasoning section.", kind="bool",
+                                )
+                            sample_note = gr.Markdown(
+                                "<span class='vc-help'>Sampling is controlled explicitly and may also be overridden by a task preset.</span>"
+                            )
+
                 with gr.Accordion("Additional results", open=False):
                     with gr.Tabs():
                         with gr.Tab("JSON"):
@@ -1763,928 +2690,12 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             visible=False,
                             elem_id="vc_results_zip_download",
                         )
-                with gr.Row(
-                    visible=False,
-                    elem_id="vc_caption_cancel_confirmation",
-                    elem_classes=["vc-confirm-bar"],
-                ) as cancel_confirmation:
-                    gr.Markdown("⚠ Cancel the running job?")
-                    cancel_yes = action_button(
-                        "✔ Yes, cancel",
-                        "maroon",
-                        variant="stop",
-                        scale=0,
-                        min_width=132,
-                        elem_id="vc_caption_cancel_yes",
-                    )
-                    cancel_keep = action_button(
-                        "✖ Keep running",
-                        "steel",
-                        scale=0,
-                        min_width=148,
-                        elem_id="vc_caption_cancel_keep",
-                    )
-                cancel_note = gr.Markdown("", elem_classes=["vc-status"])
                 hotkey_start = gr.Button("Start caption hotkey", elem_id="hk_caption_start", visible="hidden")
                 hotkey_cancel = gr.Button("Cancel caption hotkey", elem_id="hk_caption_cancel", visible="hidden")
                 cancel_timer = gr.Timer(1.0)
 
-                progress = progress_panel(ctx)
-
-        with gr.Row(equal_height=False, elem_id="vc_caption_settings"):
-            with gr.Column(scale=1, min_width=360):
-                with gr.Accordion("1. Model", open=False):
-                    model_key = gr.Dropdown(
-                        choices=variant_choices_for_tier(_INITIAL_VARIANT, detected_tier),
-                        value=_INITIAL_VARIANT,
-                        label="Model variant",
-                        info="Model family, precision/backend variant, and estimated local checkpoint size.",
-                        # Presets and tier filters can update the value and the
-                        # choices in different events; the validator below rejects
-                        # unknown values, so Gradio must not raise on a transient one.
-                        allow_custom_value=True,
-                    )
-                    valid_model_key_state = gr.State(_INITIAL_VARIANT)
-                    ctx.states["caption_valid_model_key"] = valid_model_key_state
-                    picked_model = pick_marker(model_key, "model_key")
-                    controls["model_key"] = ctx.reg(
-                        "model_key", model_key, _INITIAL_VARIANT, section="model",
-                        description="Selected model family and checkpoint variant.", choices=[key for _, key in _variant_choices()], kind="str",
-                    )
-                    show_all_variants = gr.Checkbox(
-                        value=False,
-                        label="Show all variants (ignore VRAM tier)",
-                        info="Lists variants above the active VRAM tier; they may require CPU offload or run out of memory.",
-                    )
-                    controls["show_all_variants"] = ctx.reg(
-                        "show_all_variants", show_all_variants, False, section="model",
-                        description="Show model variants that exceed the active VRAM tier.", kind="bool",
-                    )
-                    quant_info = gr.Markdown(_quant_line(_INITIAL_VARIANT))
-                    with gr.Row():
-                        vram_choices = [(f"Auto ({gpu_total:.0f} GB detected)" if gpu_total else "Auto", "auto")]
-                        vram_choices.extend((f"{value} GB", str(value)) for value in VRAM_TIERS)
-                        vram_preset = gr.Dropdown(
-                            choices=vram_choices,
-                            value="auto",
-                            label="VRAM preset",
-                            info="Applies a coordinated precision, frame, pixel, token, attention, and offload plan.",
-                        )
-                        controls["vram_preset"] = ctx.reg(
-                            "vram_preset", vram_preset, "auto", section="model",
-                            description="Detected or manually selected VRAM capacity tier.", choices=["auto", *map(str, VRAM_TIERS)], kind="str",
-                        )
-                        picked_vram = pick_marker(vram_preset, "vram_preset")
-                        attention = gr.Dropdown(
-                            choices=_attention_choices(),
-                            value="auto",
-                            label="Attention backend",
-                            info=_CONTROL_INFO["attention_backend"],
-                        )
-                        controls["attention_backend"] = ctx.reg(
-                            "attention_backend", attention, "auto", section="model",
-                            description="Requested attention implementation with safe runtime fallback.", choices=ATTENTION_CHOICES, kind="str",
-                        )
-                    vram_note = gr.Markdown(
-                        f"<span class='vc-help'>Auto tier: {detected_tier} GB. The detected plan is applied at startup and on family changes.</span>"
-                    )
-                    with gr.Row():
-                        gpu_picker = gr.Dropdown(
-                            choices=gpu_choices,
-                            value=gpu_default,
-                            label="GPU",
-                            info="The selected physical GPU is isolated for the caption worker.",
-                        )
-                        controls["gpu_index"] = ctx.reg(
-                            "gpu_index", gpu_picker, gpu_default, section="runtime",
-                            description="Physical NVIDIA GPU index used by the pipeline.", kind="int",
-                            choices=[value for _, value in gpu_choices], in_preset=False,
-                        )
-                        subprocess_mode = gr.Checkbox(
-                            value=True,
-                            label="Subprocess mode",
-                            info="Recommended: isolates CUDA and allows process-tree cancellation.",
-                        )
-                        controls["subprocess_mode"] = ctx.reg(
-                            "subprocess_mode", subprocess_mode, True, section="runtime",
-                            description="Run model inference in an isolated worker process.", kind="bool",
-                        )
-                    gpu_indices = gr.CheckboxGroup(
-                        choices=data_parallel_gpu_choices,
-                        value=[],
-                        label="Data-parallel GPUs",
-                        info=(
-                            "Leave empty to use the single GPU above. Selecting 2 or more GPUs splits folder batches "
-                            "across workers, with one model copy loaded per GPU."
-                        ),
-                    )
-                    controls["gpu_indices"] = ctx.reg(
-                        "gpu_indices", gpu_indices, [], section="runtime",
-                        description="Physical GPU indices used for data-parallel folder batch workers.",
-                        choices=[value for _, value in data_parallel_gpu_choices], kind="list", in_preset=False, in_metadata=True,
-                    )
-                    with gr.Row():
-                        keep_loaded = gr.Checkbox(
-                            value=True,
-                            label="Keep model loaded",
-                            info="Reuse the worker and resident model between caption jobs.",
-                        )
-                        controls["keep_model_loaded"] = ctx.reg(
-                            "keep_model_loaded", keep_loaded, True, section="runtime",
-                            description="Keep model weights resident between runs.", kind="bool",
-                        )
-                        idle_minutes = gr.Number(
-                            value=10,
-                            minimum=0,
-                            maximum=1440,
-                            step=1,
-                            precision=1,
-                            label="Idle unload (minutes)",
-                            info="Zero disables automatic idle unload.",
-                        )
-                        controls["idle_unload_minutes"] = ctx.reg(
-                            "idle_unload_minutes", idle_minutes, 10, section="runtime",
-                            description="Minutes before an idle persistent model is unloaded.", kind="float", minimum=0, maximum=1440,
-                        )
-                        oom_retries = gr.Number(
-                            value=2,
-                            minimum=0,
-                            maximum=4,
-                            step=1,
-                            precision=0,
-                            label="OOM retries",
-                            info=(
-                                "Automatic out-of-memory recoveries per segment; each retry lowers frames and resolution "
-                                "one notch and logs it. 0 fails the segment immediately."
-                            ),
-                            elem_id="vc_oom_retries",
-                        )
-                        controls["oom_retries"] = ctx.reg(
-                            "oom_retries", oom_retries, 2, section="runtime",
-                            description=(
-                                "Automatic out-of-memory recoveries per segment; each retry lowers frames and resolution "
-                                "one notch and logs it. 0 fails the segment immediately."
-                            ),
-                            kind="int", minimum=0, maximum=4,
-                        )
-                    oom_degrade_factor = gr.Slider(
-                        minimum=0.5,
-                        maximum=0.95,
-                        value=0.75,
-                        step=0.05,
-                        label="OOM degrade factor",
-                        info=(
-                            "Scale applied to the pixel and frame budgets on each automatic out-of-memory retry "
-                            "(0.75 = reduce by 25%)."
-                        ),
-                        elem_id="vc_oom_degrade_factor",
-                    )
-                    controls["oom_degrade_factor"] = ctx.reg(
-                        "oom_degrade_factor",
-                        oom_degrade_factor,
-                        0.75,
-                        section="runtime",
-                        description=(
-                            "Scale applied to the pixel and frame budgets on each automatic out-of-memory retry "
-                            "(0.75 = reduce by 25%)."
-                        ),
-                        kind="float",
-                        minimum=0.5,
-                        maximum=0.95,
-                    )
-                    with gr.Accordion("Block swap & offload plan", open=True):
-                        with gr.Row():
-                            block_swap_auto = gr.Checkbox(
-                                value=True,
-                                label="Automatic block swap",
-                                info=_CONTROL_INFO["block_swap_auto"],
-                                scale=2,
-                            )
-                            controls["block_swap_auto"] = ctx.reg(
-                                "block_swap_auto", block_swap_auto, True, section="model",
-                                description="Let the loader choose how many decoder layers to block-swap.", kind="bool",
-                            )
-                            blocks_to_swap = gr.Slider(
-                                minimum=0,
-                                maximum=_BLOCK_SWAP_SLIDER_MAX,
-                                step=1,
-                                value=0,
-                                interactive=False,
-                                label="Decoder layers to block-swap",
-                                info=_blocks_info(family_layer_count(initial_family)),
-                                scale=3,
-                            )
-                            controls["blocks_to_swap"] = ctx.reg(
-                                "blocks_to_swap", blocks_to_swap, 0, section="model",
-                                description="Decoder layers kept in system RAM when automatic block swap is off.",
-                                kind="int", minimum=0, maximum=_BLOCK_SWAP_SLIDER_MAX,
-                            )
-                        block_swap_note = gr.Markdown(
-                            _initial_block_swap_note(ctx, _INITIAL_VARIANT, gpu_default, detected_tier),
-                            elem_classes=["vc-status"],
-                        )
-                        with gr.Row():
-                            vram_reserve_gb = gr.Number(
-                                value=2.0,
-                                minimum=0,
-                                maximum=24,
-                                step=0.5,
-                                label="VRAM to keep free (GB)",
-                                info="Dedicated VRAM reserved for activations and runtime peaks.",
-                            )
-                            controls["vram_reserve_gb"] = ctx.reg(
-                                "vram_reserve_gb", vram_reserve_gb, 2.0, section="model",
-                                description="Dedicated VRAM kept free at the expected generation peak.",
-                                kind="float", minimum=0, maximum=24,
-                            )
-                            swap_slots = gr.Dropdown(
-                                choices=[1, 2, 3, 4],
-                                value=2,
-                                label="Swap slots",
-                                info=_CONTROL_INFO["swap_slots"],
-                                elem_id="vc_swap_slots",
-                            )
-                            controls["swap_slots"] = ctx.reg(
-                                "swap_slots", swap_slots, 2, section="model",
-                                description="GPU staging slots allocated for decoder block swap.",
-                                choices=[1, 2, 3, 4], kind="int",
-                            )
-                            plan_slack_mib = gr.Number(
-                                value=512,
-                                minimum=0,
-                                maximum=8192,
-                                step=64,
-                                precision=0,
-                                label="Plan slack (MiB)",
-                                info=_CONTROL_INFO["plan_slack_mib"],
-                                elem_id="vc_plan_slack_mib",
-                            )
-                            controls["plan_slack_mib"] = ctx.reg(
-                                "plan_slack_mib",
-                                plan_slack_mib,
-                                512,
-                                section="model",
-                                description=(
-                                    "Fixed CUDA-allocator slack (MiB) added to the activation estimate when planning "
-                                    "how many decoder layers stay resident."
-                                ),
-                                kind="int",
-                                minimum=0,
-                                maximum=8192,
-                            )
-                        with gr.Row():
-                            offload_experts = gr.Checkbox(
-                                value=False,
-                                label="Offload MoE experts",
-                                info=_CONTROL_INFO["offload_experts"],
-                            )
-                            controls["offload_experts"] = ctx.reg(
-                                "offload_experts", offload_experts, False, section="model",
-                                description="Use legacy Accelerate expert offload instead of block swap.", kind="bool",
-                            )
-                            pin_cpu = gr.Checkbox(
-                                value=True,
-                                label="Pin swapped layers in RAM",
-                                info=_CONTROL_INFO["pin_cpu"],
-                            )
-                            controls["pin_cpu"] = ctx.reg(
-                                "pin_cpu", pin_cpu, True, section="model",
-                                description="Pin block-swapped decoder layers in host memory.", kind="bool",
-                            )
-                            pinned_ram_budget_gb = gr.Number(
-                                value=0.0,
-                                minimum=0,
-                                maximum=1024,
-                                step=0.5,
-                                label="Pinned RAM budget (GB)",
-                                info=_CONTROL_INFO["pinned_ram_budget_gb"],
-                                elem_id="vc_pinned_ram_budget_gb",
-                            )
-                            controls["pinned_ram_budget_gb"] = ctx.reg(
-                                "pinned_ram_budget_gb", pinned_ram_budget_gb, 0.0, section="model",
-                                description=_CONTROL_INFO["pinned_ram_budget_gb"],
-                                kind="float", minimum=0, maximum=1024,
-                            )
-                        vram_hard_cap = gr.Checkbox(
-                            value=True,
-                            label="Cap the CUDA allocator at the VRAM free at load",
-                            info=_CONTROL_INFO["vram_hard_cap"],
-                            elem_id="vc_vram_hard_cap",
-                        )
-                        controls["vram_hard_cap"] = ctx.reg(
-                            "vram_hard_cap", vram_hard_cap, True, section="model",
-                            description=_CONTROL_INFO["vram_hard_cap"], kind="bool",
-                        )
-                    with gr.Row():
-                        compile_enabled = gr.Checkbox(
-                            value=False,
-                            label="torch.compile",
-                            info=_CONTROL_INFO["torch_compile"],
-                        )
-                        controls["torch_compile"] = ctx.reg(
-                            "torch_compile", compile_enabled, False, section="runtime",
-                            description="Compile the language model forward pass with safe fallbacks.", kind="bool",
-                        )
-                        compile_mode = gr.Dropdown(
-                            choices=compile_mode_choices(),
-                            value=DEFAULT_COMPILE_MODE,
-                            label="Compile mode",
-                            info=_CONTROL_INFO["torch_compile_mode"],
-                        )
-                        controls["torch_compile_mode"] = ctx.reg(
-                            "torch_compile_mode", compile_mode, DEFAULT_COMPILE_MODE, section="runtime",
-                            description="Requested torch.compile tuning mode.",
-                            choices=list(compile_mode_values()), kind="str",
-                        )
-                    with gr.Accordion(
-                        "llama.cpp (GGUF) options",
-                        open=False,
-                        visible=False,
-                        elem_id="vc_gguf_options",
-                    ) as gguf_options:
-                        with gr.Row():
-                            gguf_max_frames = gr.Number(
-                                value=32, minimum=1, maximum=128, step=1, precision=0,
-                                label="GGUF maximum frames",
-                                info=(
-                                    "Upper bound on sampled video frames sent to llama-server per clip; each frame is encoded "
-                                    "as an image (about 256 tokens per frame at 262,144 pixels). Frames are chosen from Sampling "
-                                    "FPS, Maximum frames and Sampling strategy, then capped here and by the context window."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_max_frames",
-                            )
-                            controls["gguf_max_frames"] = ctx.reg(
-                                "gguf_max_frames", gguf_max_frames, 32, section="runtime",
-                                description=(
-                                    "Upper bound on sampled video frames sent to llama-server per clip; each frame is encoded "
-                                    "as an image (about 256 tokens per frame at 262,144 pixels). Frames are chosen from Sampling "
-                                    "FPS, Maximum frames and Sampling strategy, then capped here and by the context window."
-                                ), kind="int", minimum=1, maximum=128,
-                            )
-                            gguf_jpeg_quality = gr.Number(
-                                value=90, minimum=50, maximum=100, step=1, precision=0,
-                                label="JPEG quality",
-                                info="JPEG quality of frames sent to llama-server.",
-                                interactive=False,
-                                elem_id="vc_gguf_jpeg_quality",
-                            )
-                            controls["gguf_jpeg_quality"] = ctx.reg(
-                                "gguf_jpeg_quality", gguf_jpeg_quality, 90, section="runtime",
-                                description="JPEG quality of frames sent to llama-server.",
-                                kind="int", minimum=50, maximum=100,
-                            )
-                        with gr.Row():
-                            gguf_threads = gr.Number(
-                                value=0, minimum=0, maximum=256, step=1, precision=0,
-                                label="CPU threads",
-                                info="CPU threads for llama-server (--threads); 0 = llama.cpp default.",
-                                interactive=False,
-                                elem_id="vc_gguf_threads",
-                            )
-                            controls["gguf_threads"] = ctx.reg(
-                                "gguf_threads", gguf_threads, 0, section="runtime",
-                                description="CPU threads for llama-server (--threads); 0 = llama.cpp default.",
-                                kind="int", minimum=0, maximum=256,
-                            )
-                            gguf_flash_attn = gr.Dropdown(
-                                choices=[("Automatic", "auto"), ("On", "on"), ("Off", "off")],
-                                value="auto", label="Flash attention",
-                                info="llama.cpp flash attention (-fa).",
-                                interactive=False,
-                                elem_id="vc_gguf_flash_attn",
-                            )
-                            controls["gguf_flash_attn"] = ctx.reg(
-                                "gguf_flash_attn", gguf_flash_attn, "auto", section="runtime",
-                                description="llama.cpp flash attention (-fa).",
-                                kind="str", choices=["auto", "on", "off"],
-                            )
-                        with gr.Row():
-                            gguf_batch_size = gr.Number(
-                                value=2048, minimum=64, maximum=8192, step=64, precision=0,
-                                label="Logical batch size",
-                                info="Logical prompt batch size (-b).",
-                                interactive=False,
-                                elem_id="vc_gguf_batch_size",
-                            )
-                            controls["gguf_batch_size"] = ctx.reg(
-                                "gguf_batch_size", gguf_batch_size, 2048, section="runtime",
-                                description="Logical prompt batch size (-b).",
-                                kind="int", minimum=64, maximum=8192,
-                            )
-                            gguf_ubatch_size = gr.Number(
-                                value=512, minimum=32, maximum=4096, step=32, precision=0,
-                                label="Physical batch size",
-                                info="Physical micro-batch size (-ub); lower values reduce VRAM during prefill.",
-                                interactive=False,
-                                elem_id="vc_gguf_ubatch_size",
-                            )
-                            controls["gguf_ubatch_size"] = ctx.reg(
-                                "gguf_ubatch_size", gguf_ubatch_size, 512, section="runtime",
-                                description="Physical micro-batch size (-ub); lower values reduce VRAM during prefill.",
-                                kind="int", minimum=32, maximum=4096,
-                            )
-                        with gr.Row():
-                            gguf_cache_reuse = gr.Number(
-                                value=0, minimum=0, maximum=4096, step=1, precision=0,
-                                label="Prompt cache reuse",
-                                info="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
-                                interactive=False,
-                                elem_id="vc_gguf_cache_reuse",
-                            )
-                            controls["gguf_cache_reuse"] = ctx.reg(
-                                "gguf_cache_reuse", gguf_cache_reuse, 0, section="runtime",
-                                description="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
-                                kind="int", minimum=0, maximum=4096,
-                            )
-                            gguf_ignore_tier_context = gr.Checkbox(
-                                value=False, label="Ignore tier context cap",
-                                info=(
-                                    "Request the full Context length instead of the VRAM-tier clamp (8k for 16 GB and below, "
-                                    "16k for 24 GB, 32k otherwise). Larger windows need more VRAM for the KV cache."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_ignore_tier_context",
-                            )
-                            controls["gguf_ignore_tier_context"] = ctx.reg(
-                                "gguf_ignore_tier_context", gguf_ignore_tier_context, False, section="runtime",
-                                description=(
-                                    "Request the full Context length instead of the VRAM-tier clamp (8k for 16 GB and below, "
-                                    "16k for 24 GB, 32k otherwise). Larger windows need more VRAM for the KV cache."
-                                ),
-                                kind="bool",
-                            )
-                        with gr.Row():
-                            gguf_min_p = gr.Slider(
-                                minimum=0.0,
-                                maximum=1.0,
-                                value=0.05,
-                                step=0.01,
-                                label="Min-p",
-                                info=(
-                                    "llama.cpp min-p sampling: tokens below this fraction of the top probability are "
-                                    "dropped. 0.05 is the llama.cpp default; only matters when Sample tokens is on."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_min_p",
-                            )
-                            controls["gguf_min_p"] = ctx.reg(
-                                "gguf_min_p", gguf_min_p, 0.05, section="runtime",
-                                description=(
-                                    "llama.cpp min-p sampling: tokens below this fraction of the top probability are "
-                                    "dropped; only matters when sampling."
-                                ),
-                                kind="float", minimum=0.0, maximum=1.0,
-                            )
-                            gguf_repeat_last_n = gr.Number(
-                                value=64,
-                                minimum=0,
-                                maximum=4096,
-                                step=1,
-                                precision=0,
-                                label="Repeat last N",
-                                info=(
-                                    "Number of previous tokens the repetition penalty looks at (llama.cpp default 64; "
-                                    "0 disables the window)."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_repeat_last_n",
-                            )
-                            controls["gguf_repeat_last_n"] = ctx.reg(
-                                "gguf_repeat_last_n", gguf_repeat_last_n, 64, section="runtime",
-                                description="Number of previous tokens considered by the llama.cpp repetition penalty.",
-                                kind="int", minimum=0, maximum=4096,
-                            )
-                        with gr.Row():
-                            gguf_presence_penalty = gr.Slider(
-                                minimum=-2.0,
-                                maximum=2.0,
-                                value=0.0,
-                                step=0.05,
-                                label="Presence penalty",
-                                info="llama.cpp presence penalty (positive values discourage tokens that already appeared).",
-                                interactive=False,
-                                elem_id="vc_gguf_presence_penalty",
-                            )
-                            controls["gguf_presence_penalty"] = ctx.reg(
-                                "gguf_presence_penalty", gguf_presence_penalty, 0.0, section="runtime",
-                                description="llama.cpp presence penalty; positive values discourage tokens that already appeared.",
-                                kind="float", minimum=-2.0, maximum=2.0,
-                            )
-                            gguf_frequency_penalty = gr.Slider(
-                                minimum=-2.0,
-                                maximum=2.0,
-                                value=0.0,
-                                step=0.05,
-                                label="Frequency penalty",
-                                info="llama.cpp frequency penalty (scales with how often a token appeared).",
-                                interactive=False,
-                                elem_id="vc_gguf_frequency_penalty",
-                            )
-                            controls["gguf_frequency_penalty"] = ctx.reg(
-                                "gguf_frequency_penalty", gguf_frequency_penalty, 0.0, section="runtime",
-                                description="llama.cpp frequency penalty scaled by how often a token appeared.",
-                                kind="float", minimum=-2.0, maximum=2.0,
-                            )
-                        with gr.Row():
-                            gguf_fit_headroom_mib = gr.Number(
-                                value=1536,
-                                minimum=0,
-                                maximum=8192,
-                                step=64,
-                                precision=0,
-                                label="Fit headroom (MiB)",
-                                info=(
-                                    "Extra MiB kept free on top of VRAM to keep free for the multimodal projector's "
-                                    "encoder buffers when llama.cpp fits the model to the GPU (--fit)."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_fit_headroom_mib",
-                            )
-                            controls["gguf_fit_headroom_mib"] = ctx.reg(
-                                "gguf_fit_headroom_mib", gguf_fit_headroom_mib, 1536, section="runtime",
-                                description="Extra MiB kept free for multimodal projector buffers during llama.cpp GPU fitting.",
-                                kind="int", minimum=0, maximum=8192,
-                            )
-                            gguf_startup_timeout_s = gr.Number(
-                                value=900,
-                                minimum=60,
-                                maximum=3600,
-                                step=30,
-                                precision=0,
-                                label="Startup timeout (s)",
-                                info=(
-                                    "Seconds to wait for llama-server to become healthy after starting; large models "
-                                    "on slow disks need longer."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_startup_timeout_s",
-                            )
-                            controls["gguf_startup_timeout_s"] = ctx.reg(
-                                "gguf_startup_timeout_s", gguf_startup_timeout_s, 900, section="runtime",
-                                description="Seconds to wait for llama-server to become healthy after starting.",
-                                kind="int", minimum=60, maximum=3600,
-                            )
-                            gguf_stream_idle_timeout_s = gr.Number(
-                                value=120,
-                                minimum=0,
-                                maximum=3600,
-                                step=10,
-                                precision=0,
-                                label="Stream idle timeout (s)",
-                                info=(
-                                    "Abort a GGUF generation when no data arrives from llama-server for this many "
-                                    "seconds (0 = wait forever)."
-                                ),
-                                interactive=False,
-                                elem_id="vc_gguf_stream_idle_timeout_s",
-                            )
-                            controls["gguf_stream_idle_timeout_s"] = ctx.reg(
-                                "gguf_stream_idle_timeout_s", gguf_stream_idle_timeout_s, 120, section="runtime",
-                                description="Maximum idle seconds while waiting for streamed llama-server generation data.",
-                                kind="int", minimum=0, maximum=3600,
-                            )
-                        with gr.Row():
-                            gguf_gpu_layers = gr.Number(
-                                value=0, minimum=0, maximum=999, step=1, precision=0,
-                                label="GPU layers (-ngl, 0 = fit automatically)",
-                                info=_CONTROL_INFO["gguf_gpu_layers"],
-                                interactive=False,
-                                elem_id="vc_gguf_gpu_layers",
-                            )
-                            controls["gguf_gpu_layers"] = ctx.reg(
-                                "gguf_gpu_layers", gguf_gpu_layers, 0, section="runtime",
-                                description=_CONTROL_INFO["gguf_gpu_layers"], kind="int", minimum=0, maximum=999,
-                            )
-                            gguf_n_cpu_moe = gr.Number(
-                                value=0, minimum=0, maximum=999, step=1, precision=0,
-                                label="MoE expert layers on CPU (--n-cpu-moe)",
-                                info=_CONTROL_INFO["gguf_n_cpu_moe"],
-                                interactive=False,
-                                elem_id="vc_gguf_n_cpu_moe",
-                            )
-                            controls["gguf_n_cpu_moe"] = ctx.reg(
-                                "gguf_n_cpu_moe", gguf_n_cpu_moe, 0, section="runtime",
-                                description=_CONTROL_INFO["gguf_n_cpu_moe"], kind="int", minimum=0, maximum=999,
-                            )
-                        gguf_extra_args = gr.Textbox(
-                            value="", label="Extra llama-server arguments",
-                            info="Extra llama-server command-line arguments appended verbatim (advanced; shell-split).",
-                            lines=2, interactive=False,
-                            elem_id="vc_gguf_extra_args",
-                        )
-                        controls["gguf_extra_args"] = ctx.reg(
-                            "gguf_extra_args", gguf_extra_args, "", section="runtime",
-                            description="Extra llama-server command-line arguments appended verbatim (advanced; shell-split).",
-                            kind="str",
-                        )
-                    compile_status = gr.Markdown(_probe_compile_in_child(), elem_classes=["vc-status"])
-                    compile_probe_timer = gr.Timer(1.0)
-                    with gr.Row():
-                        download = action_button("📥 Download / Verify model", "sky", scale=3)
-                        refresh_ready = action_button("↻ Refresh", "lime", scale=1)
-                        clear_compile = action_button("⌫ Clear compile caches", "rose", scale=2, min_width=200)
-                        unload_model = action_button(
-                            "⏏ Unload model", "navy", scale=2,
-                            elem_id="vc_unload_model",
-                        )
-                    ready_status = gr.Markdown(_ready_line(_INITIAL_VARIANT), elem_classes=["vc-status"])
-
-            with gr.Column(scale=1, min_width=360):
-                with gr.Accordion("2. Task & Prompt", open=False):
-                    prompt_preset = gr.Dropdown(
-                        choices=_prompt_choices(initial_family, _INITIAL_MODALITY),
-                        value=initial_prompt.id,
-                        allow_custom_value=True,
-                        label="Task / prompt preset",
-                        info="Filtered to the selected model family and first input modality.",
-                    )
-                    controls["prompt_preset_id"] = ctx.reg(
-                        "prompt_preset_id", prompt_preset, initial_prompt.id, section="prompt",
-                        description="Built-in task and prompt preset identifier.", kind="str",
-                    )
-                    valid_prompt_preset_state = gr.State(initial_prompt.id)
-                    picked_prompt = pick_marker(prompt_preset, "prompt_preset")
-                    prompt_description = gr.Markdown(_display(initial_prompt.description), elem_classes=["vc-help"])
-                    system_prompt = gr.Textbox(
-                        value=initial_system or "",
-                        label="System prompt",
-                        info="Optional system instruction sent before the user request.",
-                        lines=4,
-                        max_lines=8,
-                        elem_classes=["vc-mono"],
-                    )
-                    controls["system_prompt"] = ctx.reg(
-                        "system_prompt", system_prompt, "", section="prompt",
-                        description="Rendered or custom system instruction.", kind="str",
-                    )
-                    user_prompt = gr.Textbox(
-                        value=initial_user,
-                        label="User prompt",
-                        info="The complete model request after template variables are rendered.",
-                        lines=10,
-                        max_lines=16,
-                        elem_classes=["vc-mono"],
-                    )
-                    controls["user_prompt"] = ctx.reg(
-                        "user_prompt", user_prompt, initial_user, section="prompt",
-                        description="Rendered or custom user instruction.", kind="str",
-                    )
-                    with gr.Row():
-                        my_prompts = gr.Dropdown(
-                            choices=initial_prompt_names,
-                            value=None,
-                            label="My prompts",
-                            info="Saved system and user prompt pairs from the personal prompt library.",
-                            scale=3,
-                            elem_id="vc_my_prompts",
-                        )
-                        controls["prompt_library_selection"] = ctx.reg(
-                            "prompt_library_selection",
-                            my_prompts,
-                            "",
-                            section="prompt_library",
-                            description="Currently selected personal prompt-library entry.",
-                            kind="str",
-                            in_preset=False,
-                            in_metadata=False,
-                        )
-                        prompt_name = gr.Textbox(
-                            value="",
-                            label="Prompt name",
-                            info="Name used when saving a personal prompt; Unicode names are supported.",
-                            scale=3,
-                            elem_id="vc_prompt_name",
-                        )
-                        controls["prompt_library_name"] = ctx.reg(
-                            "prompt_library_name",
-                            prompt_name,
-                            "",
-                            section="prompt_library",
-                            description="Name used to save or identify a personal prompt entry.",
-                            kind="str",
-                            in_preset=False,
-                            in_metadata=False,
-                        )
-                    with gr.Row():
-                        save_prompt = action_button(
-                            "💾 Save prompt", "green", elem_id="vc_save_prompt"
-                        )
-                        load_prompt = action_button(
-                            "📥 Load prompt", "jade", elem_id="vc_load_prompt"
-                        )
-                        delete_prompt = action_button(
-                            "🗑 Delete prompt", "crimson", elem_id="vc_delete_prompt"
-                        )
-                    prompt_library_status = gr.Markdown(
-                        "<span class='vc-help'>Personal prompt library ready.</span>",
-                        elem_classes=["vc-status"],
-                        elem_id="vc_prompt_library_status",
-                    )
-                    with gr.Accordion("Template variables", open=False):
-                        gr.Markdown(
-                            "Prompt templates may also use `{{TRANSCRIPT}}`; it is filled with clip-local "
-                            "Whisper speech after the ordinary variables are rendered.",
-                            elem_classes=["vc-help"],
-                        )
-                        trigger_word = gr.Textbox(
-                            value="ohwx",
-                            label="Trigger word",
-                            info="Concept token used in prompt templates and optional caption injection.",
-                        )
-                        controls["trigger_word"] = ctx.reg(
-                            "trigger_word", trigger_word, "ohwx", section="prompt",
-                            description="Concept trigger token used by templates and post-processing.", kind="str",
-                        )
-                        with gr.Row():
-                            language = gr.Textbox(value="English", label="Caption language", info="Requested caption language.")
-                            controls["language"] = ctx.reg(
-                                "language", language, "English", section="prompt",
-                                description="Requested caption language.", kind="str",
-                            )
-                            source_language = gr.Textbox(value="English", label="Source language", info="Spoken language in the source audio.")
-                            controls["source_language"] = ctx.reg(
-                                "source_language", source_language, "English", section="prompt",
-                                description="Language spoken in source audio.", kind="str",
-                            )
-                            target_language = gr.Textbox(value="English", label="Target language", info="Translation target language.")
-                            controls["target_language"] = ctx.reg(
-                                "target_language", target_language, "English", section="prompt",
-                                description="Target language for translation tasks.", kind="str",
-                            )
-                        with gr.Row():
-                            caption_length = gr.Dropdown(
-                                choices=list(_CAPTION_LENGTH_CHOICES),
-                                value="detailed",
-                                allow_custom_value=True,
-                                label="Caption length",
-                                info="Natural-language detail target inserted into compatible templates.",
-                            )
-                            controls["caption_length"] = ctx.reg(
-                                "caption_length", caption_length, "detailed", section="prompt",
-                                description="Requested caption length or detail level.", kind="str",
-                            )
-                            valid_caption_length_state = gr.State("detailed")
-                            subject_class = gr.Textbox(value="person", label="Subject class", info="Generic identity class for LoRA captions.")
-                            controls["subject_class"] = ctx.reg(
-                                "subject_class", subject_class, "person", section="prompt",
-                                description="Generic class noun used by character training prompts.", kind="str",
-                            )
-                        avoid_list = gr.Textbox(
-                            value="",
-                            label="Avoid list",
-                            info="Concepts the generated caption should not mention.",
-                            lines=2,
-                        )
-                        controls["avoid_list"] = ctx.reg(
-                            "avoid_list", avoid_list, "", section="prompt",
-                            description="Comma-separated concepts excluded by compatible prompt templates.", kind="str",
-                        )
-                        extra_instructions = gr.Textbox(
-                            value="",
-                            label="Extra instructions",
-                            info="Optional task-specific directions appended by compatible templates.",
-                            lines=3,
-                        )
-                        controls["extra_instructions"] = ctx.reg(
-                            "extra_instructions", extra_instructions, "", section="prompt",
-                            description="Additional task instructions inserted into prompt templates.", kind="str",
-                        )
-                    reset_prompts = action_button("↺ Reset prompts to preset", "purple")
-
-                schema = {item.name: item for item in initial_spec.param_schema}
-            with gr.Column(scale=1, min_width=360):
-                with gr.Accordion("3. Generation", open=False):
-                    temperature = gr.Slider(
-                        0.0, 2.0, value=float(schema["temperature"].default), step=0.01,
-                        label="Temperature", info=schema["temperature"].description, buttons=["reset"],
-                    )
-                    controls["temperature"] = ctx.reg(
-                        "temperature", temperature, float(schema["temperature"].default), section="generation",
-                        description=schema["temperature"].description, kind="float", minimum=0, maximum=2,
-                    )
-                    with gr.Row():
-                        top_p = gr.Slider(0, 1, value=float(schema["top_p"].default), step=0.01, label="Top-p", info=schema["top_p"].description)
-                        controls["top_p"] = ctx.reg(
-                            "top_p", top_p, float(schema["top_p"].default), section="generation",
-                            description=schema["top_p"].description, kind="float", minimum=0, maximum=1,
-                        )
-                        top_k = gr.Slider(0, 200, value=int(schema["top_k"].default), step=1, precision=0, label="Top-k", info=schema["top_k"].description)
-                        controls["top_k"] = ctx.reg(
-                            "top_k", top_k, int(schema["top_k"].default), section="generation",
-                            description=schema["top_k"].description, kind="int", minimum=0, maximum=200,
-                        )
-                    repetition = gr.Slider(
-                        0.5, 2.0, value=float(schema["repetition_penalty"].default), step=0.01,
-                        label="Repetition penalty", info=schema["repetition_penalty"].description,
-                    )
-                    controls["repetition_penalty"] = ctx.reg(
-                        "repetition_penalty", repetition, float(schema["repetition_penalty"].default), section="generation",
-                        description=schema["repetition_penalty"].description, kind="float", minimum=0.5, maximum=2,
-                    )
-                    no_repeat_ngram_size = gr.Number(
-                        value=0,
-                        minimum=0,
-                        maximum=20,
-                        step=1,
-                        precision=0,
-                        label="No-repeat n-gram size",
-                        info=_CONTROL_INFO["no_repeat_ngram_size"],
-                        elem_id="vc_no_repeat_ngram_size",
-                    )
-                    controls["no_repeat_ngram_size"] = ctx.reg(
-                        "no_repeat_ngram_size",
-                        no_repeat_ngram_size,
-                        0,
-                        section="generation",
-                        description=_CONTROL_INFO["no_repeat_ngram_size"],
-                        kind="int",
-                        minimum=0,
-                        maximum=20,
-                    )
-                    max_new_tokens = gr.Slider(
-                        1,
-                        _GLOBAL_MAX_NEW_TOKENS,
-                        value=int(schema["max_new_tokens"].default),
-                        step=1,
-                        precision=0,
-                        label="Maximum new tokens",
-                        info=schema["max_new_tokens"].description,
-                    )
-                    controls["max_new_tokens"] = ctx.reg(
-                        "max_new_tokens", max_new_tokens, int(schema["max_new_tokens"].default), section="generation",
-                        description=schema["max_new_tokens"].description, kind="int", minimum=1, maximum=32768,
-                    )
-                    context_tokens = gr.Number(
-                        value=int(initial_spec.limits.context_tokens),
-                        minimum=1024,
-                        maximum=_GLOBAL_MAX_CONTEXT,
-                        step=256,
-                        precision=0,
-                        label="Context length (tokens)",
-                        info=_context_info(initial_spec),
-                    )
-                    controls["context_tokens"] = ctx.reg(
-                        "context_tokens", context_tokens, int(initial_spec.limits.context_tokens), section="generation",
-                        description=(
-                            "Requested context window in tokens; capped by the selected model and, for GGUF, "
-                            "by the VRAM tier and llama.cpp's memory fitter."
-                        ),
-                        kind="int", minimum=1024, maximum=_GLOBAL_MAX_CONTEXT,
-                    )
-                    with gr.Row():
-                        do_sample = gr.Checkbox(
-                            value=bool(schema["do_sample"].default),
-                            label="Sample tokens",
-                            info="Prompt presets set this automatically; disable for deterministic greedy decoding.",
-                        )
-                        controls["do_sample"] = ctx.reg(
-                            "do_sample", do_sample, bool(schema["do_sample"].default), section="generation",
-                            description=schema["do_sample"].description, kind="bool",
-                        )
-                        seed = gr.Number(
-                            value=-1,
-                            minimum=-1,
-                            maximum=2147483647,
-                            step=1,
-                            precision=0,
-                            label="Seed",
-                            info=(
-                                "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
-                                "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
-                            ),
-                            elem_id="vc_seed",
-                        )
-                        controls["seed"] = ctx.reg(
-                            "seed", seed, -1, section="generation",
-                            description=(
-                                "Seed for sampled decoding; -1 draws a fresh random seed every run. Greedy decoding "
-                                "(Sample tokens off) is deterministic without it. The seed actually used is written to metadata."
-                            ),
-                            kind="int", minimum=-1, maximum=2147483647,
-                        )
-                        use_cache = gr.Checkbox(
-                            value=True,
-                            label="Use KV cache",
-                            info=_CONTROL_INFO["use_cache"],
-                        )
-                        controls["use_cache"] = ctx.reg(
-                            "use_cache", use_cache, True, section="generation",
-                            description="Use the model key/value cache during generation.", kind="bool",
-                        )
-                        enable_thinking = gr.Checkbox(
-                            value=False,
-                            label="Enable thinking",
-                            info="Available only for the Qwen3-Omni Thinking family.",
-                            interactive=False,
-                        )
-                        controls["enable_thinking"] = ctx.reg(
-                            "enable_thinking", enable_thinking, False, section="generation",
-                            description="Allow the Thinking model to emit a reasoning section.", kind="bool",
-                        )
-                    sample_note = gr.Markdown(
-                        "<span class='vc-help'>Sampling is controlled explicitly and may also be overridden by a task preset.</span>"
-                    )
+        cancel_note = gr.Markdown("", elem_classes=["vc-status"])
+        progress = progress_panel(ctx)
 
         with gr.Accordion(
             "📜 Run history",

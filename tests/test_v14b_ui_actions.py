@@ -120,10 +120,14 @@ def test_caption_and_retry_generators_match_wired_outputs(tmp_path: Path) -> Non
 
     context.pipeline_client.run_job = fake_run_job
     try:
-        values = context.registry.dict_to_values(context.registry.defaults())
-        normal_updates = list(run_caption(*values, ["bad.mp4"], "upload", "video"))
+        failed_upload = tmp_path / "bad.mp4"
+        failed_upload.write_bytes(b"not decoded by this UI test")
+        settings = {**context.registry.defaults(), "input_files": [str(failed_upload)]}
+        values = context.registry.dict_to_values(settings)
+        prompt_auto = context.states["caption_prompt_auto"].value
+        normal_updates = list(run_caption(*values, [str(failed_upload)], "upload", "video", prompt_auto))
         assert all(len(update) == len(dependency["outputs"]) for update in normal_updates)
-        assert normal_updates[-1][12]["failed_paths"] == ["bad.mp4"]
+        assert normal_updates[-1][12]["failed_paths"] == [str(failed_upload.resolve())]
         assert normal_updates[-1][19]["interactive"] is True
 
         uploaded = tmp_path / "file component upload.mp4"
@@ -131,7 +135,7 @@ def test_caption_and_retry_generators_match_wired_outputs(tmp_path: Path) -> Non
         raw_settings = context.registry.defaults()
         raw_settings["input_files"] = [str(uploaded)]
         raw_values = context.registry.dict_to_values(raw_settings)
-        list(run_caption(*raw_values, [], "upload", "video"))
+        list(run_caption(*raw_values, [], "upload", "video", prompt_auto))
         assert [item.path for item in captured[-1].inputs] == [str(uploaded.resolve())]
 
         batch_output = tmp_path / "same batch output"
@@ -146,7 +150,7 @@ def test_caption_and_retry_generators_match_wired_outputs(tmp_path: Path) -> Non
             "input_modality": "video",
         }
         retry_updates = list(
-            run_caption(*values, ["ignored.mp4"], "upload", "video", retry_state)
+            run_caption(*values, ["ignored.mp4"], "upload", "video", prompt_auto, retry_state)
         )
         assert all(len(update) == len(dependency["outputs"]) for update in retry_updates)
         assert "Retrying 2 item(s)" in retry_updates[0][1]

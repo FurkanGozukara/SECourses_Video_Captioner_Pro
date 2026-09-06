@@ -8,8 +8,8 @@ deliberately small: it covers only what a Gradio theme has no way to express.
    and one stop button, and this app has several dozen coloured actions,
 2. the markup this app renders itself -- input tiles, progress and VRAM
    meters, find/replace chips, status words -- which no component styles,
-3. three small pieces of page furniture: the header rule, the preset strip's
-   button alignment, and the inline confirmation bar.
+3. page layout: the header rule, preset strip alignment, inline confirmation
+   bar, and the caption workspace's action row and bounded options panel.
 
 Every colour outside the button gradients resolves to a Gradio theme variable,
 so light and dark stay correct from a single rule instead of a duplicated
@@ -115,6 +115,22 @@ _BASE_CSS = r"""
 }
 .vc-confirm-bar > * { align-self: center; }
 .vc-confirm-bar p { margin: 0 !important; color: var(--error-text-color); font-weight: 600; }
+
+/* Keep the primary actions together above the output at every column width.
+   Only the options scroll, so long prompts and expanded model controls leave
+   the caption and its actions in place. */
+#vc_caption_actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: var(--size-2);
+}
+#vc_caption_actions > button.vc-btn { align-self: stretch; min-width: 0; }
+#vc_caption_settings {
+  max-height: 360px;
+  overflow-y: auto;
+  padding: var(--size-1);
+}
+#vc_caption_settings > * { flex-shrink: 0; }
 
 /* ------------------------------------------------- app-rendered widgets -- */
 .vc-input-list {
