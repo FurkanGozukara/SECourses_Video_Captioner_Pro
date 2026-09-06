@@ -837,3 +837,39 @@ permutations are covered by targeted tests as well as representative UI jobs.
   inside `temp/qa_full/dataset/clip_fitness`; repeating Analyze still returned
   the two source videos. A second plan write produced a distinct filename
   and visible success feedback.
+
+### Universal presets and template-variable fixes
+
+- Selected all 19 shipped universal presets in Chrome, checking their model,
+  task, rendered request and generation controls. The two GGUF Q8 chat presets
+  remained selectable with the explicit above-tier warning. Dataset presets
+  also applied their existing/generated video source and speech/both audio
+  source on the Pipeline tab. Whisper Fast and Quality selected large-v3-turbo
+  and large-v1 respectively on the Transcribe tab, both on GPU 0.
+- Found that loading the shipped ASR preset left `{{SOURCE_LANGUAGE}}` in the
+  visible request despite the English variable. Universal loads now expand an
+  exact canonical prompt template, preserve saved manual wording, and deliver
+  the automatic-prompt baseline in the same response. The baseline is derived
+  UI state, excluded from persisted preset settings and run metadata.
+- Found a second variable-update issue: replacing the source-language value
+  did not render it, while rapid physical typing left the request at `Frenc`
+  after the field reached `French`. Variable controls now use value-change
+  events with the latest pending update retained. Chrome regressions showed
+  pasted French and rapidly typed German in the complete request. Manually
+  edited wording containing a literal `{{SOURCE_LANGUAGE}}` remained unchanged
+  when the variable changed, with the manual-edit notice shown.
+- Empty Save and Load-with-no-selection displayed useful validation. Attempts
+  to overwrite and delete a shipped default were refused; all 19 default-file
+  hashes remained unchanged. Unicode user preset `QA_preset_manual_ü` saved,
+  reloaded its exact manual wording, overwrote correctly, survived Keep preset,
+  and was removed by confirmed deletion. Deletion restored the shipped default.
+- Keyboard selection applied the next preset immediately. A fresh browser
+  reload started with Default; Load Last Values restored ASR with rendered
+  English; Reset cleared the universal selection and restored application
+  defaults. These operations all exercised the new derived-state output path.
+- `0113_qwen3`: the ASR universal preset on JFK audio produced 80 tokens to
+  EOS in 49.5 s total, 12.88 tok/s. TXT/JSON/SRT contained the complete spoken
+  sentence in four cues. Metadata records `asr_timestamped_srt`, source language
+  English and the expanded request, with no unresolved ordinary variable.
+  The worker exited after the job. The QA app now uses port 7862 because other
+  applications occupied 7860 and 7861 after the earlier QA process stopped.

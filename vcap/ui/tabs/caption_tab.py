@@ -4490,6 +4490,41 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
 
     ctx.states["preset_value_adapters"]["prompt_preset_id"] = preset_prompt_preset
 
+    def preset_prompt_fields(settings: dict[str, Any]) -> tuple[str, str, dict[str, str]]:
+        """Render stored canonical templates and retain saved manual wording."""
+
+        system = str(settings.get("system_prompt") or "")
+        user = str(settings.get("user_prompt") or "")
+        try:
+            preset = get_preset(str(settings.get("prompt_preset_id") or ""))
+        except KeyError:
+            return system, user, {"system": system, "user": user}
+        rendered_system, rendered_user = render_prompt(
+            preset,
+            _prompt_variables([
+                settings.get(name) for name in (
+                    "trigger_word", "language", "source_language", "target_language",
+                    "caption_length", "avoid_list", "subject_class", "extra_instructions",
+                )
+            ]),
+        )
+        automatic = {"system": rendered_system or "", "user": rendered_user or ""}
+        # Shipped presets store templates, whereas user presets commonly store
+        # rendered text. Only an exact canonical-template match is expanded;
+        # edited or personal wording remains intact. The canonical rendered
+        # baseline lets subsequent variable edits distinguish those two cases.
+        if system == str(preset.system_prompt or ""):
+            system = automatic["system"]
+        if user == str(preset.user_prompt or ""):
+            user = automatic["user"]
+        return system, user, automatic
+
+    ctx.states["preset_value_adapters"]["system_prompt"] = lambda settings: preset_prompt_fields(settings)[0]
+    ctx.states["preset_value_adapters"]["user_prompt"] = lambda settings: preset_prompt_fields(settings)[1]
+    ctx.states.setdefault("preset_derived_state", {})[prompt_auto_state] = (
+        lambda settings: preset_prompt_fields(settings)[2]
+    )
+
     def preset_model_key(settings: dict[str, Any]) -> Any:
         """Ship the preset's variant together with choices that contain it.
 
@@ -4879,11 +4914,16 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
             return f"<span class='vc-err'>{html.escape(str(exc))}</span>", gr.skip(), gr.skip(), dict(tracked or {})
 
     for component in variable_components:
-        component.input(
+        # ``input`` misses value replacement/paste in Gradio 6. Preserve the
+        # latest edit while a render is in flight instead of dropping the last
+        # keystroke, and let preset-loaded variables refresh against the
+        # automatic prompt baseline delivered with the same preset response.
+        component.change(
             render_variable_change,
             inputs=[prompt_preset, *variable_components, system_prompt, user_prompt, prompt_auto_state],
             outputs=[prompt_description, system_prompt, user_prompt, prompt_auto_state],
             queue=False,
+            trigger_mode="always_last",
             show_progress="hidden",
             api_visibility="private",
         )

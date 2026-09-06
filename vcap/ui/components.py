@@ -307,6 +307,12 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     adapters: dict[str, Callable[[dict[str, Any]], Any]] = dict(
         ctx.states.get("preset_value_adapters") or {}
     )
+    # Derived client state must arrive in the same response as the fields it
+    # describes. It is deliberately excluded from persisted user settings.
+    derived: dict[Any, Callable[[dict[str, Any]], Any]] = dict(
+        ctx.states.get("preset_derived_state") or {}
+    )
+    preset_outputs = [*components, *derived]
     # What the latest load, reset, or startup pushed into the UI: the preset
     # name guards the dropdown's change event against the programmatic updates
     # made after save/delete/startup, and the coerced settings let follow-ups
@@ -319,7 +325,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         return {"name": str(name or ""), "settings": dict(settings or {})}
 
     def skipped() -> list[Any]:
-        return [gr.skip() for _ in components]
+        return [gr.skip() for _ in preset_outputs]
 
     def preset_values(settings: dict[str, Any]) -> list[Any]:
         """Apply presets only to controls that participate in preset storage.
@@ -338,7 +344,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
                 result.append(adapters[entry.key](settings))
             else:
                 result.append(value)
-        return result
+        return [*result, *(adapter(settings) for adapter in derived.values())]
 
     def save_preset(name: str, *values: Any) -> tuple[Any, str, str, Any]:
         try:
@@ -530,7 +536,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     ctx.states["preset_bar_handlers"] = {
         "confirm_delete": confirm_delete_preset,
         "reset": reset_settings,
-        "component_count": len(components),
+        "component_count": len(preset_outputs),
     }
 
     handles.save.click(
@@ -544,7 +550,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     load_event = handles.load.click(
         load_preset,
         inputs=handles.dropdown,
-        outputs=[*components, handles.status, applied_state],
+        outputs=[*preset_outputs, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -555,7 +561,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     select_event = handles.dropdown.change(
         select_preset,
         inputs=[handles.dropdown, applied_state],
-        outputs=[*components, handles.status, applied_state],
+        outputs=[*preset_outputs, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
@@ -572,7 +578,7 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
         confirm_delete_preset,
         inputs=delete_state,
         outputs=[
-            *components,
+            *preset_outputs,
             handles.dropdown,
             handles.save_as,
             handles.status,
@@ -594,21 +600,21 @@ def wire_preset_bar(ctx: "UiContext", demo: gr.Blocks) -> None:
     )
     reset_event = handles.reset.click(
         reset_settings,
-        outputs=[*components, handles.dropdown, handles.status, applied_state],
+        outputs=[*preset_outputs, handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     startup_event = demo.load(
         startup_preset,
-        outputs=[*components, handles.dropdown, handles.status, applied_state],
+        outputs=[*preset_outputs, handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
     )
     load_last_event = handles.load_last.click(
         load_last_values,
-        outputs=[*components, handles.dropdown, handles.status, applied_state],
+        outputs=[*preset_outputs, handles.dropdown, handles.status, applied_state],
         queue=False,
         show_progress="hidden",
         api_visibility="private",
