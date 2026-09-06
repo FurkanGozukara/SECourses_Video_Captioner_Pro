@@ -2248,13 +2248,13 @@ def build(ctx: "UiContext") -> CaptionTabHandles:
                             gguf_cache_reuse = gr.Number(
                                 value=0, minimum=0, maximum=4096, step=1, precision=0,
                                 label="Prompt cache reuse",
-                                info="KV-cache prefix reuse chunk size (--cache-reuse); 0 disables. Speeds up repeated prompt prefixes but shifts cached positions.",
+                                info="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
                                 interactive=False,
                                 elem_id="vc_gguf_cache_reuse",
                             )
                             controls["gguf_cache_reuse"] = ctx.reg(
                                 "gguf_cache_reuse", gguf_cache_reuse, 0, section="runtime",
-                                description="KV-cache prefix reuse chunk size (--cache-reuse); 0 disables. Speeds up repeated prompt prefixes but shifts cached positions.",
+                                description="Requested KV-cache reuse chunk size (--cache-reuse); 0 disables. Current llama.cpp disables this optimization for multimodal models, including text-only chat while a multimodal projector is loaded.",
                                 kind="int", minimum=0, maximum=4096,
                             )
                             gguf_ignore_tier_context = gr.Checkbox(

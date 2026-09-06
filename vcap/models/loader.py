@@ -767,16 +767,37 @@ def load_model(
     free_vram_bytes = 0
     total_vram_bytes = 0
     other_vram_bytes = 0
+    vram_cap_bytes = 0
     if cuda_load:
         torch.cuda.reset_peak_memory_stats(torch_device)
-        if not plan.uses_legacy_offload:
-            free_vram_bytes, total_vram_bytes = (
-                int(value) for value in torch.cuda.mem_get_info(torch_device)
-            )
-            reserved_at_start = int(torch.cuda.memory_reserved(torch_device))
-            other_vram_bytes = max(
-                0,
-                total_vram_bytes - free_vram_bytes - reserved_at_start,
+        free_vram_bytes, total_vram_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(torch_device)
+        )
+        # WDDM may report a CUDA virtual budget that excludes other processes'
+        # dedicated allocations. Plan against the smaller physical free value.
+        snapshot = resource_snapshot(physical_gpu_index)
+        if float(snapshot.get("vram_total_gb", 0.0) or 0.0) > 0:
+            physical_free = int(float(snapshot.get("vram_free_gb", 0.0) or 0.0) * 1024**3)
+            free_vram_bytes = min(free_vram_bytes, max(0, physical_free))
+        reserved_at_start = int(torch.cuda.memory_reserved(torch_device))
+        other_vram_bytes = max(
+            0,
+            total_vram_bytes - free_vram_bytes - reserved_at_start,
+        )
+        # Set the allocator limit before checkpoint tensors reach CUDA, so it
+        # also protects loading and legacy offload, not only generation.
+        vram_cap_bytes = _apply_vram_hard_cap(
+            torch,
+            torch_device,
+            total_vram_bytes=total_vram_bytes,
+            other_vram_bytes=other_vram_bytes,
+            enabled=bool(getattr(runtime, "vram_hard_cap", True)),
+        )
+        if vram_cap_bytes:
+            _emit(
+                progress_cb,
+                f"CUDA allocator capped before weight loading: {vram_cap_bytes / 1024**3:.2f} GiB "
+                f"({free_vram_bytes / 1024**3:.2f} GiB dedicated VRAM free)",
             )
     _emit(progress_cb, f"Loading {spec.label} / {variant.label} from {folder}", 0.0)
 
@@ -966,19 +987,11 @@ def load_model(
         )
         pinned = _pin_cpu_tensors(model, pin_limit)
         _emit(progress_cb, f"Pinned {pinned / 1024**3:.2f} GiB of CPU-resident weights")
-    vram_cap_bytes = 0
     resident_bytes = int(torch.cuda.memory_allocated(torch_device)) if cuda_load else 0
     block_swap_summary = None
     gc.collect()
     _trim_host_working_set()
     if not plan.uses_legacy_offload:
-        vram_cap_bytes = _apply_vram_hard_cap(
-            torch,
-            torch_device,
-            total_vram_bytes=total_vram_bytes,
-            other_vram_bytes=other_vram_bytes,
-            enabled=bool(getattr(runtime, "vram_hard_cap", True)),
-        )
         _install_last_token_logits_hook(model, last_token_logits)
         if budget is not None:
             block_swap_summary = budget.summary()

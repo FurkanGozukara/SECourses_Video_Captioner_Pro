@@ -935,6 +935,8 @@ def wire(ctx: "UiContext") -> None:
         current_status = "Starting chat."
         context_used: Any = None
         context_limit: Any = None
+        token_text = "—"
+        speed_text = "—"
         token_line = _tokens_line("generating")
         reasoning_started: float | None = None
         reasoning_s: float | None = None
@@ -998,15 +1000,20 @@ def wire(ctx: "UiContext") -> None:
                         data = dict(event.get("data") or {})
                         new_tokens = data.get("new_tokens")
                         speed = data.get("tok_per_s", data.get("tokens_per_second"))
-                        token_text = str(new_tokens) if new_tokens is not None else "generating"
-                        try:
-                            speed_text = f"{float(speed):.2f} tok/s" if speed is not None else "—"
-                        except (TypeError, ValueError):
-                            speed_text = "—"
+                        if new_tokens is not None:
+                            token_text = str(new_tokens)
+                        if speed is not None:
+                            try:
+                                speed_text = f"{float(speed):.2f} tok/s"
+                            except (TypeError, ValueError):
+                                speed_text = "—"
                         if data.get("prompt_tokens") is not None:
                             context_used = data.get("prompt_tokens")
                             context_limit = data.get("context_limit", context_limit)
-                        token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
+                        token_line = _tokens_line(
+                            "generating" if token_text == "—" else token_text,
+                            speed_text, context_used, context_limit,
+                        )
                     elif kind == "log" and str(event.get("level") or "").casefold() in {"warning", "error"}:
                         current_status = str(event.get("text") or current_status)
                 now = time.monotonic()
@@ -1092,6 +1099,7 @@ def wire(ctx: "UiContext") -> None:
                 *composer_reset(mode),
             )
         except (CancelledError, KeyboardInterrupt) as exc:
+            token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
             yield (
                 live_display(done=True),
                 "",
@@ -1105,10 +1113,12 @@ def wire(ctx: "UiContext") -> None:
             )
         except BaseException as exc:
             ctx.app_log.exception(f"Chat failed: {exc}", scope="chat")
+            token_line = _tokens_line(token_text, speed_text, context_used, context_limit)
+            error_summary = str(exc).splitlines()[0] if str(exc).strip() else type(exc).__name__
             yield (
                 live_display(done=True),
                 "",
-                f"<span class='vc-err'>{html.escape(str(exc))}</span>",
+                f"<span class='vc-err'>{html.escape(error_summary)}</span>",
                 token_line,
                 current_reasoning,
                 gr.update(visible=bool(current_reasoning)),

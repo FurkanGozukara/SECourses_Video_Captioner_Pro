@@ -994,3 +994,20 @@ permutations are covered by targeted tests as well as representative UI jobs.
   structured native array still retained the model's eight original events.
 - Chrome's Open Output opened `0125_timechat` in native Explorer; its breadcrumb
   and eight visible entries matched the generated result folder.
+
+### Native folder actions and isolated model deletion
+
+- Global Settings opened the actual app `presets` and configured `logs` folders
+  in Explorer; both destination breadcrumbs were inspected. System's Open
+  models folder followed the configured models directory. QA Explorer windows
+  were closed after inspection.
+- Copied the complete TimeChat INT4 directory into
+  `temp/qa_full/models_delete`, saved that isolated Models directory in Chrome,
+  and restarted. System showed only that copy Ready, with 16 files totaling
+  6,467,930,328 bytes. Delete opened its confirmation; Keep files preserved the
+  copy. Reopening and choosing Yes, delete removed those 16 files, reported the
+  same freed byte count, showed zero bytes and disabled Delete. The original
+  external TimeChat directory retained all 16 files and the same byte count.
+- Restored the original Models directory through Global Settings and restarted.
+  Chrome's System table again showed all 21 original variants Ready, with no
+  Not ready rows. No original model was deleted or redownloaded for this test.

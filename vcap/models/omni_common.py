@@ -631,7 +631,9 @@ class OmniCaptionerBase(BaseCaptioner):
             raw_for_post = raw
         processor_name = preset.post_processor if preset and preset.post_processor else "plain"
         processor = POST_PROCESSORS.get(processor_name, plain)
-        post = processor(raw_for_post, {})
+        # Other processors consume only the final answer; this one also builds
+        # the structured reasoning field, so do not strip its input twice.
+        post = processor(raw if processor_name == "strip_reasoning" else raw_for_post, {})
         if self.spec.family == "timechat":
             native = timechat_parse(raw)
             post = PostResult(

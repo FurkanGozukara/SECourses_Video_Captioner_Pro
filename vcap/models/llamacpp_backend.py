@@ -1707,7 +1707,9 @@ class LlamaCppCaptioner(BaseCaptioner):
             reasoning, answer = split_thinking(raw)
         processor_name = preset.post_processor if preset and preset.post_processor else "plain"
         processor = POST_PROCESSORS.get(processor_name, plain)
-        return processor(answer, {}), reasoning
+        # The reasoning processor needs the complete decoded response to keep
+        # its structured reasoning field consistent with the separate sidecar.
+        return processor(raw if processor_name == "strip_reasoning" else answer, {}), reasoning
 
     def chat(
         self,
