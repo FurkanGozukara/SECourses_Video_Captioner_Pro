@@ -1423,10 +1423,7 @@ class LlamaCppCaptioner(BaseCaptioner):
                         }
                         for frame in decoded.frames
                     )
-                    warnings.append(
-                        f"Video used {len(decoded.frames)} chronological still frames plus separate audio; "
-                        "frame/audio tokens are not interleaved by timestamp."
-                    )
+                    warnings.append(_frames_note(len(decoded.frames), include_audio))
                 if include_audio:
                     samples = _slice_audio(read_audio(path), start, end)
                     content.append(
@@ -2097,6 +2094,17 @@ class LlamaCppCaptioner(BaseCaptioner):
             cancelled=stream.cancelled,
             warnings=tuple(prepared.warnings) + tuple(extra_warnings),
         )
+
+
+def _frames_note(frame_count: int, include_audio: bool) -> str:
+    """Describe how a video reached the server: frames with, or without, its audio track."""
+
+    if include_audio:
+        return (
+            f"Video used {frame_count} chronological still frames plus separate audio; "
+            "frame/audio tokens are not interleaved by timestamp."
+        )
+    return f"Video used {frame_count} chronological still frames with no audio input."
 
 
 def _strip_audio_parts(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:

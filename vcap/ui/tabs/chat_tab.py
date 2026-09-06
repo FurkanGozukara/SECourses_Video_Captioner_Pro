@@ -17,6 +17,7 @@ import gradio as gr
 from vcap.core.media import probe_media
 from vcap.core.paths import normalize_path
 from vcap.core.subprocess_runner import CancelToken, CancelledError
+from vcap.models.overrides import describe_override
 from vcap.models.registry import MODEL_SPECS, get_variant, variant_to_family
 from vcap.pipeline.chat import ChatRequest, ChatResponse, save_conversation
 from vcap.prompts.presets import default_preset_for, get_preset, list_presets, render_prompt
@@ -60,27 +61,79 @@ class ChatTabHandles:
     controls: dict[str, Any]
 
 
-def model_chat_support(variant_key: str) -> tuple[str, str]:
-    """Return the backend chat mode and its concise user-facing note."""
+def model_chat_support(
+    variant_key: str,
+    override_path: Any = "",
+    override_mmproj: Any = "",
+) -> tuple[str, str]:
+    """Return the backend chat mode and its concise user-facing note.
+
+    ``override_path`` and ``override_mmproj`` are the Caption tab's main model
+    override fields. A custom checkpoint is named in the note and changes what
+    it promises (a GGUF without mmproj is text-only; a GGUF projector decides
+    the media kinds). A path that cannot be loaded yields the ``blocked`` mode
+    so Send refuses before any model load starts.
+    """
 
     family = variant_to_family(str(variant_key))
     name = html.escape(f"{MODEL_SPECS[family].label} · {get_variant(str(variant_key)).label}")
+    if family not in {"qwen3_omni_instruct", "qwen3_omni_thinking", "timechat", "avocado"}:
+        return (
+            "unsupported",
+            f"<span class='vc-err'><strong>{name}</strong> has no chat mode. Pick Qwen3-Omni Instruct or Thinking "
+            "in the Caption tab, or load a Chat preset.</span>",
+        )
+    override = None
+    if str(override_path or "").strip():
+        info = describe_override("main", override_path, override_mmproj, str(variant_key))
+        if info["state"] == "error":
+            return (
+                "blocked",
+                f"<span class='vc-err'><strong>{name}</strong> — the custom model override cannot be used: "
+                f"{html.escape(str(info['text']))} Fix or clear it under Caption → Model → "
+                "Override model loading (experimental).</span>",
+            )
+        override = info.get("override")
+    suffix = ""
+    if override is not None:
+        suffix = (
+            f" · override <strong>{html.escape(override.name)}</strong> "
+            f"({html.escape(override.kind_label)})"
+        )
     if family in {"qwen3_omni_instruct", "qwen3_omni_thinking"}:
+        if override is not None and override.kind == "gguf":
+            if override.mmproj is None:
+                return (
+                    "multi",
+                    f"<span class='vc-warn'><strong>{name}</strong>{suffix} — text-only multi-turn chat: the "
+                    "custom GGUF has no mmproj, so video, audio, and image attachments cannot be processed.</span>",
+                )
+            return (
+                "multi",
+                f"<span class='vc-ok'><strong>{name}</strong>{suffix} — multi-turn chat with text; video, "
+                "audio, and image support follows the custom model's mmproj. llama-server reports its "
+                "modalities when it loads, and audio is dropped with a logged warning when the projector "
+                "has no audio encoder.</span>",
+            )
         return (
             "multi",
-            f"<span class='vc-ok'><strong>{name}</strong> — multi-turn chat with video, audio, image, and text.</span>",
-        )
-    if family in {"timechat", "avocado"}:
-        return (
-            "single",
-            f"<span class='vc-warn'><strong>{name}</strong> — video-only, single-turn Q&A. "
-            "Each Send starts a fresh exchange with exactly one video.</span>",
+            f"<span class='vc-ok'><strong>{name}</strong>{suffix} — multi-turn chat with video, audio, image, "
+            "and text.</span>",
         )
     return (
-        "unsupported",
-        f"<span class='vc-err'><strong>{name}</strong> has no chat mode. Pick Qwen3-Omni Instruct or Thinking "
-        "in the Caption tab, or load a Chat preset.</span>",
+        "single",
+        f"<span class='vc-warn'><strong>{name}</strong>{suffix} — video-only, single-turn Q&A. "
+        "Each Send starts a fresh exchange with exactly one video.</span>",
     )
+
+
+def chat_override_note_update(variant_key: Any, override_path: Any = "", override_mmproj: Any = "") -> Any:
+    """Refresh the chat model note when the Caption tab's override fields change."""
+
+    try:
+        return model_chat_support(str(variant_key), override_path, override_mmproj)[1]
+    except KeyError:
+        return gr.skip()
 
 
 def _uploaded_paths(value: Any) -> list[str]:
@@ -259,6 +312,8 @@ def _model_family_or_empty(variant_key: Any) -> str:
 def chat_model_change_updates(
     variant_key: str,
     current_state: Mapping[str, Any] | None,
+    override_path: Any = "",
+    override_mmproj: Any = "",
 ) -> tuple[Any, ...]:
     """Update model-specific chat controls, clearing only across model families."""
 
@@ -266,7 +321,7 @@ def chat_model_change_updates(
         get_variant(str(variant_key))
     except KeyError:
         return tuple(gr.skip() for _ in range(9))
-    mode, note = model_chat_support(variant_key)
+    mode, note = model_chat_support(variant_key, override_path, override_mmproj)
     family = variant_to_family(str(variant_key))
     thinking = family == "qwen3_omni_thinking"
     cap = MODEL_SPECS[family].limits.max_new_tokens_cap
@@ -286,7 +341,7 @@ def chat_model_change_updates(
         conversation_outputs = (gr.skip(), gr.skip(), gr.skip(), gr.skip())
         status = (
             note
-            if mode == "unsupported"
+            if mode in {"unsupported", "blocked"}
             else (
                 "<span class='vc-ok'>Model variant updated; conversation kept because the model family is unchanged.</span>"
                 if has_conversation and previous_family == family
@@ -344,7 +399,15 @@ def build(ctx: "UiContext") -> ChatTabHandles:
 
     controls: dict[str, Any] = {}
     initial_variant = str(getattr(ctx.caption_handles.controls["model_key"], "value", "qwen3_omni_instruct_int4"))
-    _, initial_note = model_chat_support(initial_variant)
+    override_controls = [
+        ctx.caption_handles.controls.get(key)
+        for key in ("override_video_model_path", "override_video_mmproj_path")
+    ]
+    override_inputs = [control for control in override_controls if control is not None]
+    _, initial_note = model_chat_support(
+        initial_variant,
+        *[str(getattr(control, "value", "") or "") for control in override_inputs],
+    )
     initial_prompt_choices, initial_prompt_id = chat_prompt_choices(initial_variant, [])
     with gr.Row(equal_height=False):
         with gr.Column(scale=6, min_width=560):
@@ -739,7 +802,7 @@ def build(ctx: "UiContext") -> ChatTabHandles:
 
     caption_model.change(
         chat_model_change_updates,
-        inputs=[caption_model, conversation_state],
+        inputs=[caption_model, conversation_state, *override_inputs],
         outputs=[
             model_note,
             enable_thinking,
@@ -756,6 +819,17 @@ def build(ctx: "UiContext") -> ChatTabHandles:
         show_progress="hidden",
         api_visibility="private",
     )
+    # The Caption tab's main model override changes what the chat model can do,
+    # so its fields refresh the note too (a broken path is reported before Send).
+    for override_control in override_inputs:
+        override_control.change(
+            chat_override_note_update,
+            inputs=[caption_model, *override_inputs],
+            outputs=[model_note],
+            queue=False,
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
     def insert_caption_prompt(
         selection: str,
@@ -837,7 +911,11 @@ def wire(ctx: "UiContext") -> None:
         path_text = str(args[value_count + 2] or "")
         message = str(args[value_count + 3] or "").strip()
         model_key = str(settings.get("model_key") or "qwen3_omni_instruct_int4")
-        mode, model_note = model_chat_support(model_key)
+        mode, model_note = model_chat_support(
+            model_key,
+            settings.get("override_video_model_path", ""),
+            settings.get("override_video_mmproj_path", ""),
+        )
         keep_composer = (gr.skip(), gr.skip(), gr.skip())
 
         def rejected(status_html: str, tokens_html: Any = gr.skip()) -> tuple[Any, ...]:
@@ -853,7 +931,9 @@ def wire(ctx: "UiContext") -> None:
                 *keep_composer,
             )
 
-        if mode == "unsupported":
+        if mode in {"unsupported", "blocked"}:
+            # No chat mode for this family, or a custom override path that cannot
+            # be loaded: refuse before any attachment probing or model load.
             yield rejected(model_note, _tokens_line())
             return
         if not message:
@@ -1278,6 +1358,7 @@ def wire(ctx: "UiContext") -> None:
 __all__ = [
     "ChatTabHandles",
     "build",
+    "chat_override_note_update",
     "model_chat_support",
     "resolve_chat_attachments",
     "wire",

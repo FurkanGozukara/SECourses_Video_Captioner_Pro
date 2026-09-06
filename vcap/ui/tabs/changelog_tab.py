@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.9.1",
+        "2026-09-07",
+        """
+### Override polish after the v1.9.0 Chrome verification
+
+- **Chat knows about the override.** The Chat tab's model line now names the custom checkpoint from Caption → Model → Override model loading and describes what it can do: a GGUF with a projector says that video, audio, and image support follow its mmproj (llama-server reports the modalities when it loads), a GGUF without mmproj is announced as text-only, and a Transformers folder keeps the family's full media support. A path that cannot be loaded turns the line red and Send refuses immediately instead of failing inside the model load. The line refreshes whenever the override fields or the model variant change.
+- **Whisper log names the folder that was loaded.** With a faster-whisper folder set as the audio override, the "Whisper model … loaded" line now reports that folder (and which catalogue alias it replaces) instead of the dropdown alias.
+- **llama.cpp frame note matches reality.** The "chronological still frames" note only mentions separate audio when audio was actually sent; a custom model without an audio encoder (for example Qwen2.5-VL) logs "with no audio input" next to the existing warning.
+""".strip(),
+    ),
+    (
         "v1.9.0",
         "2026-09-06",
         """

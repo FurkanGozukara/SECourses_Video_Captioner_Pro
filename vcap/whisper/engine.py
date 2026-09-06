@@ -501,14 +501,25 @@ class WhisperEngine:
                 "message": message,
             }
         )
+        label = self.loaded_model_label(target)
         self._emit(
             {
                 "stage": "model_loaded",
                 "model": self.params.model,
+                "label": label,
                 "load_s": load_s,
                 "path": str(target),
+                "message": f"Whisper model {label} loaded in {load_s:.1f}s",
             }
         )
+
+    def loaded_model_label(self, target: Path | None = None) -> str:
+        """Name the model that was actually loaded: the alias, or the custom folder replacing it."""
+
+        if str(self.params.model_path or "").strip():
+            folder = Path(target) if target is not None else Path(str(self.params.model_path))
+            return f"{folder.name} (custom folder {folder}, replaces {self.params.model})"
+        return self.params.model
 
     @staticmethod
     def resolve_prompt_safe_params(

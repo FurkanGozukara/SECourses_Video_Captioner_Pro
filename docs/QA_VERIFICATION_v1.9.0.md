@@ -60,3 +60,38 @@ retained for this version.
 - Shipped presets: all 19 now store `caption_txt_only: false` and the four
   empty override paths, so `tests/test_whisper_presets.py` and
   `tests/test_prompts.py` keep their exact-key contracts.
+
+## v1.9.1 follow-up (2026-09-07)
+
+A second pass over the v1.9.0 commit, again through
+`Windows_Run_Video_Captioner_Pro.bat` and installed Google Chrome 152 (GPU 0
+free at start: about 31 GB). Every v1.9.0 check above was repeated on a
+fresh instance and passed: folder-panel mirror and Post-processing switch in
+both directions, a txt-only batch of two clips beside their sources (only the
+two `.txt` files; `metadata.json` records `caption_txt_only: true`), a regular
+run still writing `.txt` + `.json`, override status lines for a valid GGUF, a
+missing path, and a Whisper folder, Start refusing the missing path, a real
+Qwen2.5-VL GGUF override run (`model_info.override` recorded, vision-only
+modalities, audio skipped with a warning), a Chat turn on the resident
+override server, a Transcribe run through the large-v3-turbo folder
+(`model_path` in the run metadata), preset load resetting the override fields
+and the txt-only switch, and Unload model releasing the llama-server.
+Three cosmetic gaps were found and fixed in v1.9.1:
+
+| Fix | Verified in Chrome |
+| --- | --- |
+| Chat model line ignored the override and still promised audio for a vision-only model. | With the Qwen2.5-VL GGUF set, the line reads "… · override Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf (GGUF (llama.cpp)) — multi-turn chat with text; video, audio, and image support follows the custom model's mmproj …". With `D:\nope\missing-model.gguf` it turns red ("the custom model override cannot be used: The override path does not exist …") and Send returns that message immediately with no model load. |
+| Whisper log named the dropdown alias after loading the override folder. | Transcribe with the folder override logs "Whisper model large-v3-turbo (custom folder …\models\whisper\large-v3-turbo, replaces large-v1) loaded in 1.1s". |
+| llama.cpp still-frames note said "plus separate audio" although audio was not sent. | The override run logs "Video used 11 chronological still frames with no audio input." directly after "The loaded model has no audio encoder; the video's audio track was not sent." |
+
+Automated: three tests added to `tests/test_v19_txt_only_and_overrides.py`
+(frames note, Whisper label and client fallback, chat note/mode with GGUF,
+text-only GGUF, missing path, wrong family, and Transformers overrides).
+`pytest tests -q`: **611 passed, 9 skipped, 8 failed** (110 s); the 8
+failures are the same pre-existing ones and reproduce with identical
+assertions on the untouched v1.8.1 tree.
+
+Environment note: the user's own Chrome profile refused every loopback
+connection during this session (`ERR_CONNECTION_REFUSED` for this app and for
+an unrelated local Gradio server, while `curl` reached both), so the checks
+ran in a second instance of the same installed Chrome executable.

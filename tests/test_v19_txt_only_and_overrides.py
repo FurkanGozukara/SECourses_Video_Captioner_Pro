@@ -710,3 +710,83 @@ def test_build_app_registers_txt_only_and_override_controls(tmp_path: Path) -> N
     assert note["visible"] is True and "Custom Whisper model folder" in note["value"]
     assert whisper_override_note_html("")["visible"] is False
     assert "is not a faster-whisper folder" in whisper_override_note_html(str(gguf))["value"]
+
+
+# --------------------------------------------------------------------------- v1.9.1 follow-ups
+
+
+def test_frames_note_mentions_audio_only_when_it_was_sent() -> None:
+    with_audio = llamacpp_backend._frames_note(11, True)
+    without_audio = llamacpp_backend._frames_note(11, False)
+    assert "11 chronological still frames plus separate audio" in with_audio
+    assert "not interleaved" in with_audio
+    assert "11 chronological still frames" in without_audio
+    assert "no audio input" in without_audio and "plus separate audio" not in without_audio
+
+
+def test_whisper_loaded_label_names_the_custom_folder(tmp_path: Path) -> None:
+    from vcap.whisper import client as client_module
+    from vcap.whisper import engine as engine_module
+
+    ct2 = _ct2_folder(tmp_path)
+    custom = engine_module.WhisperEngine(
+        WhisperParams(model="large-v1", model_path=str(ct2)),
+        models_dir=tmp_path / "models",
+    )
+    label = custom.loaded_model_label(ct2)
+    assert label.startswith("whisper_ct2 (custom folder ") and "replaces large-v1" in label
+    assert custom.loaded_model_label() == label
+    regular = engine_module.WhisperEngine(WhisperParams(model="large-v1"), models_dir=tmp_path / "models")
+    assert regular.loaded_model_label(tmp_path / "models" / "large-v1") == "large-v1"
+
+    logged: list[tuple[str, str]] = []
+
+    class _Sink:
+        def on_log(self, message: str, level: str = "info") -> None:
+            logged.append((message, level))
+
+    client_module._handle_event(
+        {"event": "model_loaded", "model": "large-v1", "label": label, "load_s": 2.5},
+        _Sink(),
+        [],
+        {},
+    )
+    assert logged and logged[-1][0] == f"Whisper model {label} loaded in 2.5s"
+    client_module._handle_event({"event": "model_loaded", "model": "large-v1", "load_s": 1.0}, _Sink(), [], {})
+    assert logged[-1][0] == "Whisper model large-v1 loaded in 1.0s"
+
+
+def test_chat_model_note_reflects_the_main_override(tmp_path: Path) -> None:
+    from vcap.ui.tabs.chat_tab import (
+        chat_model_change_updates,
+        chat_override_note_update,
+        model_chat_support,
+    )
+
+    mode, base = model_chat_support("qwen3_omni_instruct_int4")
+    assert mode == "multi" and "override" not in base and "video, audio, image, and text" in base
+    gguf = _gguf_folder(tmp_path) / "Custom-Omni-Q3_K_M.gguf"
+    mode, note = model_chat_support("qwen3_omni_instruct_int4", str(gguf), "")
+    assert mode == "multi" and "vc-ok" in note and "Custom-Omni-Q3_K_M.gguf" in note
+    assert "follows the custom model's mmproj" in note
+    assert chat_override_note_update("qwen3_omni_instruct_int4", str(gguf), "") == note
+    assert chat_model_change_updates("qwen3_omni_instruct_int4", None, str(gguf), "")[0] == note
+    assert not isinstance(chat_override_note_update("not-a-variant", str(gguf), ""), str)
+
+    text_only_dir = tmp_path / "text_only"
+    text_only_dir.mkdir()
+    text_only = text_only_dir / "Text-Only-Q4.gguf"
+    text_only.write_bytes(b"g" * 64)
+    mode, note = model_chat_support("qwen3_omni_instruct_int4", str(text_only), "")
+    assert mode == "multi" and "vc-warn" in note and "text-only" in note
+
+    mode, note = model_chat_support("qwen3_omni_instruct_int4", str(tmp_path / "missing.gguf"), "")
+    assert mode == "blocked" and "vc-err" in note and "does not exist" in note
+    status = chat_model_change_updates("qwen3_omni_instruct_int4", None, str(tmp_path / "missing.gguf"), "")[7]
+    assert status == note
+    mode, note = model_chat_support("timechat_int4", str(gguf), "")
+    assert mode == "blocked" and "Qwen3-Omni" in note
+    hf = _transformers_folder(tmp_path)
+    mode, note = model_chat_support("qwen3_omni_instruct_int4", str(hf), "")
+    assert mode == "multi" and "Transformers checkpoint" in note and "video, audio, image, and text" in note
+    assert model_chat_support("qwen3_omni_captioner_int4", str(gguf), "")[0] == "unsupported"

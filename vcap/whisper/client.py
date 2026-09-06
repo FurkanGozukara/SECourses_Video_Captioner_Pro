@@ -187,7 +187,7 @@ def _handle_event(
         message = str(payload.get("message") or "")
         if not message and kind == "model_loaded":
             message = (
-                f"Whisper model {payload.get('model', '')} loaded in "
+                f"Whisper model {payload.get('label') or payload.get('model', '')} loaded in "
                 f"{float(payload.get('load_s') or 0.0):.1f}s"
             )
         if message:
