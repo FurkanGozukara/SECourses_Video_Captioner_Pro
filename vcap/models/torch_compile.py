@@ -12,7 +12,6 @@ import platform
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 from typing import Any, Callable, Literal
 
@@ -550,6 +549,7 @@ def prepare_compile_env(
     cache_dir = (TEMP_DIR / "torchinductor").resolve(strict=False)
     env_updates = {
         "TORCHINDUCTOR_CACHE_DIR": str(cache_dir),
+        "TRITON_CACHE_DIR": str((TEMP_DIR / "triton").resolve(strict=False)),
         "TORCHINDUCTOR_COMPILE_THREADS": str(max(1, min(32, int(compile_threads)))),
     }
     if os.name == "nt":
@@ -1027,12 +1027,10 @@ def apply_compile(
 def clear_inductor_caches() -> dict[str, Any]:
     """Remove app-owned Triton/Inductor caches and cached vcvars discovery."""
 
-    username = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
-    temp_root = Path(tempfile.gettempdir())
+    temp_root = TEMP_DIR.resolve(strict=False)
     candidates = {
-        Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache")),
-        Path(os.environ.get("TORCHINDUCTOR_CACHE_DIR", TEMP_DIR / "torchinductor")),
-        temp_root / f"torchinductor_{username}",
+        temp_root / "triton",
+        temp_root / "torchinductor",
         _VCVARS_CACHE,
         _PROBE_CACHE,
     }
@@ -1041,6 +1039,12 @@ def clear_inductor_caches() -> dict[str, Any]:
     for path in candidates:
         try:
             if path.is_dir():
+                # Do not follow a cache-directory junction out of the app's
+                # temporary directory, or clear another app's shared caches.
+                resolved = path.resolve(strict=False)
+                if resolved != path or resolved.parent != temp_root:
+                    errors.append(f"{path}: refusing to clear a redirected or non-app cache directory")
+                    continue
                 shutil.rmtree(path)
                 removed.append(str(path))
             elif path.is_file():

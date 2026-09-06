@@ -24,6 +24,7 @@ from vcap.core.captions_post import (
     clamp_segments_to_window,
     dedupe_repeated_sentences,
     finalize_caption,
+    to_srt,
     write_caption_outputs,
 )
 from vcap.core.dataset_captions import (
@@ -53,6 +54,7 @@ from vcap.core.progress import ProgressEvent, ProgressSink, ProgressTracker, UiT
 from vcap.core.scene_split import SceneDetectParams, SceneRange, plan_segments, split_video
 from vcap.core.subprocess_runner import CancelToken, CancelledError
 from vcap.models.registry import MODEL_SPECS, ModelSpec, variant_to_family
+from vcap.prompts.presets import get_preset
 
 from .job import InputItem, ItemResult, JobResult, JobSpec, ModelChoice, TranscriptSpec
 
@@ -2702,6 +2704,12 @@ def _process_item(
             emitter=emitter,
             item_label=entry.stem,
         )
+        try:
+            subtitle_text = get_preset(item_prompt.preset_id).post_processor in {
+                "timechat_srt", "srt_from_bracketed",
+            }
+        except KeyError:
+            subtitle_text = False
         previous_final_text = ""
         context_enabled = (
             spec.context_carry_over
@@ -2867,9 +2875,9 @@ def _process_item(
             )
             raw_caption_text = str(caption_result.text)
             removed_repetitions = 0
-            if spec.post.dedupe_repeated_sentences:
+            if spec.post.dedupe_repeated_sentences and not subtitle_text:
                 _, removed_repetitions = dedupe_repeated_sentences(raw_caption_text)
-            final_text = _finalize_text(spec, raw_caption_text)
+            final_text = raw_caption_text if subtitle_text else _finalize_text(spec, raw_caption_text)
             if removed_repetitions > 0:
                 emitter.log(
                     f"Removed {removed_repetitions} repeated sentence(s)",
@@ -2914,6 +2922,12 @@ def _process_item(
                 )
             else:
                 local_cues = []
+            local_cues = [cue for cue in local_cues if cue.text.strip()]
+            if subtitle_text:
+                # Clean cue bodies independently, then serialize valid timing.
+                # Cleaning the serialized SRT as prose damages its structure and
+                # can remove repeated text from later, otherwise valid cues.
+                final_text = to_srt(local_cues, max_line_chars=spec.post.subtitle_max_line_chars)
             cue_offset = trim_offset + segment.start_s
             combined_cues.extend(
                 Segment(cue_offset + cue.start_s, cue_offset + cue.end_s, cue.text)
@@ -3037,6 +3051,8 @@ def _process_item(
             else:
                 combined_structured = {"segments": combined_structured, "summary": summary}
         combined_structured = _structured_with_transcript(combined_structured, transcript_data)
+        if subtitle_text:
+            combined_text = to_srt(combined_cues, max_line_chars=spec.post.subtitle_max_line_chars)
         emitter.progress(entry.tracker_index, entry.result_index, "Writing combined outputs", 0.94, step_index=7)
         formats = list(spec.post.formats)
         if spec.post.save_reasoning and combined_reasoning and "reasoning" not in formats:

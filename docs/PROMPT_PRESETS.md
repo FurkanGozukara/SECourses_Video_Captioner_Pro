@@ -23,6 +23,10 @@ Model abbreviations in the table are **TC** (TimeChat), **AVo** (AVoCaDO), **Q3-
 | Training captions | `image_short_caption` | Image — short caption | Q3-I, Q3-T | image | text |
 | Model-native | `timechat_6d_raw` | TimeChat — 6D raw JSON | TC | video+audio | timestamped JSON |
 | Model-native | `timechat_flatten_wan` | TimeChat — Wan motion paragraph | TC | video+audio | text |
+| Model-native | `timechat_flatten_motion_camera` | TimeChat → motion + camera | TC | video+audio | lines |
+| Model-native | `timechat_flatten_av` | TimeChat → audiovisual | TC | video+audio | lines |
+| Model-native | `timechat_speech_only` | TimeChat → speech transcript (SRT) | TC | video+audio | transcript and SRT segments |
+| Model-native | `timechat_chapters` | TimeChat → chapters | TC | video+audio | chapter lines |
 | Model-native | `timechat_to_srt` | TimeChat — detailed events to SRT | TC | video+audio | SRT segments |
 | Model-native | `avocado_av_aligned` | AVoCaDO — aligned audiovisual | AVo | video+audio | text |
 | Model-native | `avocado_visual_only` | AVoCaDO — visual only | AVo | video | text |
@@ -42,6 +46,7 @@ Model abbreviations in the table are **TC** (TimeChat), **AVo** (AVoCaDO), **Q3-
 | Audio | `music_analysis` | Music — technical analysis | Q3-I, Q3-T | audio | text |
 | Audio | `music_appreciation` | Music — appreciation | Q3-I, Q3-T | audio | text |
 | Audio | `mixed_audio_instruments` | Audio — effects and instruments | Q3-I, Q3-T | audio | text |
+| Transcription | `whisper_guided_dialogue_caption` | Transcription · Whisper-guided dialogue caption | Q3-I, Q3-T | audio, video+audio | text |
 | Transcription | `asr_clean` | ASR — clean transcript | Q3-I, Q3-T | audio, video+audio | text |
 | Transcription | `asr_clean_punctuated` | ASR — clean and punctuated | Q3-I, Q3-T | audio, video+audio | text |
 | Transcription | `asr_timestamped_srt` | ASR — timestamped SRT | Q3-I, Q3-T | audio, video+audio | SRT segments |
@@ -70,7 +75,15 @@ Rendering is deliberately Jinja-free. `render_prompt()` replaces `{{NAME}}` toke
 | `{{AVOID}}` | empty | Concepts the model must not mention. |
 | `{{SUBJECT_CLASS}}` | `person` | Identity-neutral class noun used with a trigger. |
 | `{{EXTRA_INSTRUCTIONS}}` | empty | Optional task-specific override appended to the prompt. |
+| `{{TRANSCRIPT}}` | clip-local speech | Preserved by the UI renderer, then filled with the current clip's Whisper speech by the pipeline. |
+
+Changing an input refreshes the task menu for its modality. A task supported by
+the selected model family remains selected, with an explanation when the runner
+will need a different task for that input. The retained task keeps manually
+edited and personally loaded prompts. Template-variable changes update automatic
+prompt fields while preserving manual wording; **Reset prompts to preset**
+explicitly restores the built-in template.
 
 ## Post-Processors
 
-The registry may select `timechat_parse`, `timechat_flatten_wan`, `timechat_flatten_full`, `timechat_srt`, `strip_reasoning`, `srt_from_bracketed`, `lyrics_lines`, `tags_normalize`, `json_extract`, or `plain`. Every processor returns a `PostResult` containing display text, an optional structured value, and zero or more `(start_s, end_s, text)` segments. Timestamp segments can be serialized with the shared `to_srt()` and `to_vtt()` helpers.
+The registry may select `timechat_parse`, `timechat_flatten_wan`, `timechat_flatten_motion_camera`, `timechat_flatten_av`, `timechat_speech_only`, `timechat_chapters`, `timechat_srt`, `strip_reasoning`, `srt_from_bracketed`, `lyrics_lines`, `tags_normalize`, `json_extract`, or `plain`. The module also provides `timechat_flatten_full` for callers that need every native field. Every processor returns a `PostResult` containing display text, an optional structured value, and zero or more `(start_s, end_s, text)` segments. Timestamp segments can be serialized with the shared `to_srt()` and `to_vtt()` helpers. Subtitle export clamps cues to the source clip; raw structured model output retains its original timestamps. Tasks that render SRT also use these bounded cues for display and TXT, applying cleanup within each cue without inserting caption prefixes or removing repeated text across cues. JSON parsing does not enforce a task-specific schema or establish that the generated content is accurate.

@@ -934,3 +934,63 @@ permutations are covered by targeted tests as well as representative UI jobs.
   horizontal overflow (300-pixel document width). System report/table content
   scrolled within its own widgets. Reviewed screenshots of each tab and
   restored the original desktop viewport afterward.
+
+### TimeChat output variants and Dataset clip playback
+
+- All seven TimeChat task variants were exposed for the audiovisual fixture.
+  Each selected the unchanged native request, greedy decoding, and a 9,216
+  token default. The checks used a 2,048-token budget, whole-clip mode and
+  16 frames on GPU 0, with TXT/JSON/SRT/VTT/JSONL enabled.
+- `0118_timechat` produced four complete native objects: 870 tokens to EOS,
+  59.4 s total, 25.64 tok/s. Both TXT and JSON parsed as the same native array.
+  Quality failed for later timestamps and speech: the 11-second source received
+  ranges ending at 12 and 18 seconds, including an invented final utterance.
+  SRT/VTT correctly clamped the third cue to 11 seconds and omitted the fourth
+  cue whose start was beyond the source. Raw structured output retained the
+  original model timestamps.
+- The same native generation converted correctly in subsequent warm runs:
+  `0119` Wan joined visual detail/camera into one paragraph (38.2 s);
+  `0120` motion/camera used separate lines (37.9 s); `0121` audiovisual added
+  speech and acoustics (37.9 s); `0122` speech-only extracted dialogue and
+  produced three bounded subtitle cues (38.2 s); `0123` chapters extracted
+  timestamped storyline lines (37.8 s). All reached EOS at 870 tokens and about
+  25.6 tok/s. Text/chapter conversions retained the model's invented late
+  content; subtitle timing constraints do not establish transcript accuracy.
+  With SRT selected for the chapter task, export used one full-clip cue holding
+  the chapter text because the chapter processor does not return subtitle cues.
+- Loaded the Dataset sub-split outputs into Caption Editor. The four clips
+  appeared as four media items with empty captions. Chrome played the first
+  clip to 6.006009 s and the final clip to 3.5035 s; both ended normally with
+  no media error. No editor caption or approval data was changed.
+
+### App-owned compilation caches
+
+- Before exercising Clear compile caches, source review found that it also
+  deleted shared user-level Triton and default TorchInductor directories.
+  Limited clearing to this app's temporary Triton/Inductor directories and
+  compiler-discovery files, rejecting redirected cache directories. Compile
+  plans now also place Triton kernels in the app's temporary directory.
+- After restarting, Chrome's Clear compile caches removed two app cache
+  locations. The prior app Inductor cache (1,010 files) disappeared. Both
+  shared directories remained at 3,667 and 2,095 files, and SHA-256 checks of
+  24 sampled files from each directory were unchanged. No shared cache was
+  deleted to reproduce the original defect.
+- `0124_timechat` exercised Max autotune (no CUDA graphs): kernels were
+  benchmarked and populated the app's Triton/Inductor directories. It completed
+  in 207.4 s with 2,048 tokens, reaching the requested token cap. A decoder frame
+  hit Dynamo's 64-recompile limit and fell back to eager execution; this was not
+  an entirely compiled decode. `0125` reused the resident model, completed in
+  76.5 s at 28.06 tok/s, and produced identical text. Both repeated invented
+  later events, so these are execution checks, not output-quality passes.
+- These runs exposed malformed TXT for the detailed-events-to-SRT task:
+  prose-level repetition cleanup left empty numbered cues, while the separate
+  SRT/VTT exports already had three correctly bounded cues. Changed SRT-task
+  display/TXT generation to serialize the same cleaned, bounded cues as subtitle
+  export, preserving repeated text in distinct cues and renumbering combined
+  segments. Empty cleaned cues are omitted. After restart, Chrome regression
+  `0126` generated the same 2,048-token capped output using saved kernel caches
+  (131.1 s total, 22.28 tok/s). Caption and SRT preview showed the same three
+  nonempty cues ending at 11 seconds; TXT and SRT matched byte for byte. The
+  structured native array still retained the model's eight original events.
+- Chrome's Open Output opened `0125_timechat` in native Explorer; its breadcrumb
+  and eight visible entries matched the generated result folder.
