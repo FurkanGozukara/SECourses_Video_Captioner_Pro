@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.9.2",
+        "2026-09-12",
+        """
+### Model loading repaired for transformers 5.17
+
+- **Fixed `Checkpoint load left meta tensors: ['visual.rotary_pos_emb.inv_freq', 'visual.rotary_pos_emb.original_inv_freq']`**, which stopped every Transformers-backed checkpoint (Qwen3-Omni Instruct, Thinking, and Captioner as well as TimeChat and Avocado, in INT4, INT8, and BF16) from loading on a fresh install. transformers 5.17 rebuilt the vision towers' rotary embedding around the vision config, with an axial rope recipe and a second `original_inv_freq` buffer, and the streaming loader, which assembles the model without weights and then fills it from the single-file checkpoint, only knew how to recreate the older layouts. On GPUs that stage the vision and audio towers on the CPU between prefills the same gap surfaced earlier as `Cannot copy out of meta tensor; no data!`.
+- The loader now recreates rotary buffers from whatever recipe the installed Transformers exposes (the module's own `compute_<rope type>_rope_parameters`, the scaled-rope registry, the default recipe, or the classic `dim`/`theta` formula) and always derives `original_inv_freq` from the rebuilt `inv_freq`, so the next refactor of these modules should not need an app update. If a build still leaves a tensor behind, the error names the owning module class and the Transformers version.
+- Installations are expected to run transformers 5.17.0 or newer, which the updated installer requirements now request, so a fresh install and an update through `Windows_Install_and_Update.bat` converge on the build the fix was verified against (a real INT4 load followed by an image caption through the vision tower).
+""".strip(),
+    ),
+    (
         "v1.9.1",
         "2026-09-07",
         """

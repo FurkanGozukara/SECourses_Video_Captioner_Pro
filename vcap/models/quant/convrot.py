@@ -1471,6 +1471,69 @@ def _move_non_meta_buffers(
                 module._buffers[name] = value.to(module_device)
 
 
+def _rope_init_function(module: nn.Module) -> Callable[..., object] | None:
+    """Return the callable Transformers used to build ``module.inv_freq`` from ``module.config``.
+
+    Transformers keeps moving that recipe around: text rotary modules expose
+    ``compute_default_rope_parameters`` and defer scaled variants to
+    ``ROPE_INIT_FUNCTIONS``; since 5.17 the Qwen vision towers are config driven and
+    ship ``compute_axial_rope_parameters`` instead; 4.x stored the resolved
+    ``rope_init_fn`` on the instance. Mirror the constructor's resolution order so the
+    rebuilt buffer matches what ``__init__`` would have produced off the meta device.
+    """
+    if getattr(module, "config", None) is None:
+        return None
+    rope_type = getattr(module, "rope_type", None)
+    if isinstance(rope_type, str):
+        specific = getattr(module, f"compute_{rope_type}_rope_parameters", None)
+        if callable(specific):
+            return specific
+        if rope_type != "default":
+            try:
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            except ImportError:  # pragma: no cover - transformers always ships this module
+                ROPE_INIT_FUNCTIONS = {}
+            registered = ROPE_INIT_FUNCTIONS.get(rope_type)
+            if callable(registered):
+                return registered
+    for attribute in ("compute_default_rope_parameters", "rope_init_fn"):
+        candidate = getattr(module, attribute, None)
+        if callable(candidate):
+            return candidate
+    for attribute in sorted(dir(type(module))):
+        if attribute.startswith("compute_") and attribute.endswith("_rope_parameters"):
+            candidate = getattr(module, attribute, None)
+            if callable(candidate):
+                return candidate
+    return None
+
+
+def _rebuild_inv_freq(module: nn.Module, device: torch.device) -> torch.Tensor | None:
+    """Recompute a rotary module's ``inv_freq`` buffer; ``None`` when no recipe is known."""
+    init_fn = _rope_init_function(module)
+    if init_fn is not None:
+        try:
+            result = init_fn(module.config)
+        except Exception as exc:
+            init_name = getattr(init_fn, "__name__", repr(init_fn))
+            raise RuntimeError(
+                f"Could not rebuild rotary inv_freq for {type(module).__name__} "
+                f"via {init_name}: {exc}"
+            ) from exc
+        if isinstance(result, tuple):
+            inv_freq, attention_scaling = result[0], result[1]
+            module.attention_scaling = attention_scaling
+            return inv_freq
+        return result
+    dim = getattr(module, "dim", None)
+    theta = getattr(module, "theta", None)
+    if isinstance(dim, int) and isinstance(theta, (int, float)):
+        return 1.0 / (
+            theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+    return None
+
+
 def _materialize_meta_buffers(
     model: nn.Module,
     device: torch.device,
@@ -1479,7 +1542,13 @@ def _materialize_meta_buffers(
     """Rebuild deterministic non-persistent buffers lost under ``torch.device('meta')``."""
     for module_name, module in model.named_modules():
         module_device = _placement_device(module_name, device, layer_device)
-        for name, value in list(module._buffers.items()):
+        buffers = module._buffers
+        inv_freq = buffers.get("inv_freq")
+        if inv_freq is not None and inv_freq.device.type == "meta":
+            rebuilt = _rebuild_inv_freq(module, module_device)
+            if rebuilt is not None:
+                buffers["inv_freq"] = rebuilt.to(device=module_device, dtype=inv_freq.dtype)
+        for name, value in list(buffers.items()):
             if value is None or value.device.type != "meta":
                 continue
             rebuilt = None
@@ -1487,31 +1556,30 @@ def _materialize_meta_buffers(
                 module, "compute_default_singular_positional_embedding"
             ):
                 rebuilt = module.compute_default_singular_positional_embedding()
-            elif name == "inv_freq" and hasattr(module, "compute_default_rope_parameters"):
-                rebuilt, attention_scaling = module.compute_default_rope_parameters(
-                    module.config
-                )
-                module.attention_scaling = attention_scaling
-            elif name == "inv_freq" and hasattr(module, "dim") and hasattr(module, "theta"):
-                rebuilt = 1.0 / (
-                    module.theta
-                    ** (
-                        torch.arange(
-                            0,
-                            module.dim,
-                            2,
-                            dtype=torch.float32,
-                            device=module_device,
-                        )
-                        / module.dim
-                    )
-                )
-            elif name == "original_inv_freq" and "inv_freq" in module._buffers:
-                inv_freq = module._buffers["inv_freq"]
-                if inv_freq.device.type != "meta":
-                    rebuilt = inv_freq.clone()
+            elif name == "original_inv_freq":
+                current = buffers.get("inv_freq")
+                if current is not None and current.device.type != "meta":
+                    rebuilt = current.clone()
             if rebuilt is not None:
-                module._buffers[name] = rebuilt.to(device=module_device, dtype=value.dtype)
+                buffers[name] = rebuilt.to(device=module_device, dtype=value.dtype)
+
+
+def _describe_meta_tensors(model: nn.Module, names: list[str]) -> str:
+    """Name the module classes that own leftover meta tensors, plus the Transformers build."""
+    modules = dict(model.named_modules())
+    owners: list[str] = []
+    for name in names:
+        owner = modules.get(name.rpartition(".")[0])
+        label = type(owner).__name__ if owner is not None else "?"
+        if label not in owners:
+            owners.append(label)
+    try:
+        import transformers
+
+        version = str(transformers.__version__)
+    except Exception:
+        version = "unknown"
+    return f"owning modules: {', '.join(owners) or '?'}; transformers {version}"
 
 
 def _cache_hadamard_on_modules(model: nn.Module, matrix: torch.Tensor) -> None:
@@ -1703,7 +1771,10 @@ def apply_quantized_checkpoint(
     remaining_meta_buffers = [name for name, value in model.named_buffers() if value.device.type == "meta"]
     if remaining_meta_parameters or remaining_meta_buffers:
         preview = (remaining_meta_parameters + remaining_meta_buffers)[:8]
-        raise RuntimeError(f"Checkpoint load left meta tensors: {preview}")
+        raise RuntimeError(
+            f"Checkpoint load left meta tensors: {preview} "
+            f"({_describe_meta_tensors(model, preview)})"
+        )
     model.eval()
     if target_device.type == "cuda":
         # Projection fusion briefly owns both the separate and concatenated buffers.

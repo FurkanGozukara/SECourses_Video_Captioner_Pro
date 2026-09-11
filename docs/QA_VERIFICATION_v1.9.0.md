@@ -83,3 +83,58 @@ text-only GGUF, missing path, wrong family, and Transformers overrides).
 `pytest tests -q`: **611 passed, 9 skipped, 8 failed** (110 s); the 8
 failures are the same pre-existing ones and reproduce with identical
 assertions on the untouched v1.8.1 tree.
+
+## v1.9.2 follow-up (2026-09-12)
+
+A user reported every Qwen3-Omni load failing on a fresh install with
+`RuntimeError: Checkpoint load left meta tensors: ['visual.rotary_pos_emb.inv_freq',
+'visual.rotary_pos_emb.original_inv_freq']` (runner → loader →
+`convrot.apply_quantized_checkpoint`). Root cause: transformers 5.17.0 (the
+current release; `transformers` was unpinned in the requirements) rewrote
+`Qwen3OmniMoeVisionRotaryEmbedding` and `Qwen2_5OmniVisionRotaryEmbedding` to be
+config driven (`compute_axial_rope_parameters`, an extra non-persistent
+`original_inv_freq` buffer, no `dim`/`theta` attributes). The streaming loader
+builds the model on the meta device and `_materialize_meta_buffers` only knew
+the older recipes, so both vision buffers stayed on meta after the single-file
+checkpoint was streamed. On GPUs that stage the towers on the CPU between
+prefills the same gap surfaced earlier as `Cannot copy out of meta tensor; no
+data!`.
+
+Fix (`vcap/models/quant/convrot.py`): `_rope_init_function` resolves the recipe
+the way the transformers constructor does (`compute_<rope_type>_rope_parameters`,
+then `ROPE_INIT_FUNCTIONS` for scaled rope types, then
+`compute_default_rope_parameters`, the 4.x `rope_init_fn`, any
+`compute_*_rope_parameters`, and finally the `dim`/`theta` formula);
+`original_inv_freq` is cloned from the rebuilt `inv_freq` regardless of buffer
+order; the leftover-meta error names the owning module classes and the
+transformers version. The installer requirements now request
+`transformers>=5.17.0`.
+
+Automated: `tests/test_rotary_meta_buffers.py` (7 tests: the 5.17 axial vision
+class, the legacy `dim`/`theta` class, default and registry-scaled text rotary,
+end-to-end `apply_quantized_checkpoint`, the diagnostic error, and a tiny real
+Qwen3-Omni thinker built with the installed transformers). Verified on
+transformers 5.16.1 and on a fresh venv (Python 3.12.10, torch 2.13.0+cu130,
+transformers 5.17.0, accelerate 1.15.0). `pytest tests -q` on the fresh venv:
+**618 passed, 9 skipped, 8 failed** (134 s); the 8 failures are the same
+pre-existing UI/pipeline tests listed under v1.9.0 and fail identically with the
+original `convrot.py` and with transformers 5.16.1.
+
+Model matrix (`tools/smoke/caption_once.py --attention auto --max-new-tokens 48`,
+RTX 5090 32 GB, a synthetic 6 s `testsrc2` clip with a tone track, tone WAV for
+the Captioner family), every variant through the application's caption path with
+load → caption → unload:
+
+| Variant | Load | Result |
+| --- | --- | --- |
+| avocado_int4 / int8 / bf16 | 19.4 s / 20.6 s / 23.7 s | video caption OK |
+| timechat_int4 / int8 / bf16 | 17.9 s / 19.1 s / 16.4 s | timestamped JSON caption OK |
+| qwen3_omni_captioner_int4 / int8 / bf16 | 13.1 s / 21.7 s / 47.9 s | audio caption OK (counts the beeps) |
+| qwen3_omni_instruct_int4 / int8 | 18.7 s / 37.2 s | colour-bar description OK |
+| qwen3_omni_thinking_int4 / int8 | 25.4 s / 37.1 s | colour-bar description OK |
+
+All 13 ran with FlashAttention 2 and released their VRAM on unload. The
+`qwen3_omni_instruct_bf16` and `qwen3_omni_thinking_bf16` runs were stopped for
+time: the 60 GB BF16 checkpoints page on this 94 GiB machine (the Captioner BF16
+generated at 0.27 tok/s) and they share the architecture and size of the
+Captioner BF16 that passed.
