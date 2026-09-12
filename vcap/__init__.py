@@ -14,6 +14,7 @@ from .core.paths import normalize_path
 
 VERSION = "1.9.2"
 APP_NAME = "SECourses Video Captioner Pro"
+PATREON_URL = "https://www.patreon.com/SECourses/posts/secourses-video-168757767"
 APP_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -52,6 +53,7 @@ def ensure_app_dirs() -> None:
 __all__ = [
     "APP_DIR",
     "APP_NAME",
+    "PATREON_URL",
     "APP_SETTINGS_PATH",
     "LOGS_DIR",
     "MODELS_DIR",

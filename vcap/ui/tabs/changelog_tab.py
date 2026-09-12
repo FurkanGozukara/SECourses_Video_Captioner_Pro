@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import gradio as gr
 
+from vcap import PATREON_URL
+
 if TYPE_CHECKING:
     from vcap.ui.app import UiContext
 
@@ -299,12 +301,12 @@ def build(ctx: "UiContext") -> None:
             gr.Markdown(markdown)
 
     gr.Markdown(
-        """
+        f"""
 ### About SECourses Video Captioner Pro
 
 Built by **SECourses** for local, dataset-focused audiovisual captioning and media preparation.
 
-[Support SECourses on Patreon](https://www.patreon.com/SECourses) · [GitHub repository](https://github.com/FurkanGozukara/SECourses_Video_Captioner_Pro)
+[Support SECourses on Patreon]({PATREON_URL}) · [GitHub repository](https://github.com/FurkanGozukara/SECourses_Video_Captioner_Pro)
 """.strip(),
     )
 

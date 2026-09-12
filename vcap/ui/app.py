@@ -15,6 +15,7 @@ from vcap import (
     LOGS_DIR,
     MODELS_DIR,
     OUTPUTS_DIR,
+    PATREON_URL,
     PRESETS_DEFAULT_DIR,
     PRESETS_DIR,
     TEMP_DIR,
@@ -211,7 +212,7 @@ def build_app() -> gr.Blocks:
             gr.Markdown(
                 f"# {APP_NAME}\n"
                 f"Version {html.escape(VERSION)} · {_gpu_summary()} · "
-                "[Support SECourses on Patreon](https://www.patreon.com/SECourses)"
+                f"[Support SECourses on Patreon]({PATREON_URL})"
             )
             theme_button = action_button(
                 "🌗 Light / dark theme",
