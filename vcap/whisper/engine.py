@@ -644,7 +644,7 @@ class WhisperEngine:
         assert self.model is not None
         self._check_cancel()
         import numpy as np
-        from faster_whisper import decode_audio
+        from .audio import decode_audio
 
         source = normalize_path(media_path, must_exist=True)
         sampling_rate = int(

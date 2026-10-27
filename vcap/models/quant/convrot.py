@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from torch import nn
 from safetensors import safe_open
 
+from ..layout import thinker_layout
+
 
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -1114,10 +1116,12 @@ def _offload_prefill_towers_if_needed(
             "_vcap_device_anchor",
             nn.Parameter(torch.empty(0, device=target_device), requires_grad=False),
         )
-    for name in ("audio_tower", "visual"):
-        module = getattr(model, name, None)
+    for name in thinker_layout(model).tower_names:
+        parent_name, _, leaf = name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        module = getattr(parent, leaf, None)
         if isinstance(module, nn.Module) and not isinstance(module, _OnDemandCudaModule):
-            setattr(model, name, _OnDemandCudaModule(module, target_device))
+            setattr(parent, leaf, _OnDemandCudaModule(module, target_device))
             names.append(name)
     return tuple(names)
 
@@ -1386,7 +1390,7 @@ def _assign_tensor(model: nn.Module, name: str, value: torch.Tensor) -> None:
 _EXPERT_TENSOR = re.compile(
     r"^((?:.*\.)?experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight(_scale)?$"
 )
-_DECODER_LAYER = re.compile(r"^model\.layers\.(\d+)(?:\.|$)")
+_DECODER_LAYER = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)(?:\.|$)")
 
 
 def _placement_device(
@@ -1645,13 +1649,14 @@ def apply_quantized_checkpoint(
     if quantized and meta.scale_layout != "row":
         raise NotImplementedError(f"Unsupported scale layout: {meta.scale_layout}")
 
+    layout = thinker_layout(model)
     modules = dict(model.named_modules())
     quant_expert_parents: set[str] = set()
     if meta is not None:
         linear_class = ConvRotInt8Linear if meta.scheme == "int8_convrot" else ConvRotInt4W4A8Linear
         experts_class = ConvRotInt8Experts if meta.scheme == "int8_convrot" else ConvRotInt4Experts
         for checkpoint_layer, layer_meta in meta.layers.items():
-            target_layer = _strip(checkpoint_layer, strip_prefix)
+            target_layer = layout.checkpoint_name(_strip(checkpoint_layer, strip_prefix))
             expert_match = re.match(
                 r"^((?:.*\.)?experts)\.\d+\.(?:gate_proj|up_proj|down_proj)$",
                 target_layer,
@@ -1704,7 +1709,7 @@ def apply_quantized_checkpoint(
         for name in names:
             value = handle.get_tensor(name)
             loaded_bytes += value.numel() * value.element_size()
-            target_name = _strip(name, strip_prefix)
+            target_name = layout.checkpoint_name(_strip(name, strip_prefix))
             tensor_device = _placement_device(target_name, target_device, layer_device)
             expert_match = _EXPERT_TENSOR.match(target_name)
             if expert_match:

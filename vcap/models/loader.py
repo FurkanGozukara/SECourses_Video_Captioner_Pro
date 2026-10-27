@@ -211,10 +211,11 @@ def _remove_model_runtime(model: Any) -> tuple[str, ...]:
 
 
 def _block_swap_layers(model: Any, family: str, expected_count: int) -> Any:
-    language_model = getattr(model, "model", None)
-    layers = getattr(language_model, "layers", None)
+    from .layout import language_model
+
+    layers = getattr(language_model(model), "layers", None)
     if layers is None:
-        raise RuntimeError("Block swap requires decoder layers at model.model.layers")
+        raise RuntimeError("Block swap could not find the thinker's text decoder layers")
     if len(layers) != int(expected_count):
         raise RuntimeError(
             f"Block-swap layout expected {expected_count} decoder layers, found {len(layers)}"
@@ -704,11 +705,14 @@ def _dispatch_after_cpu_load(
     device_index: int,
 ) -> dict[str, Any]:
     from accelerate import dispatch_model, infer_auto_device_map
+    from .layout import thinker_layout
 
-    if plan.gpu_layers == "all" and plan.offload_experts:
-        device_map = placement.explicit_device_map
-    elif plan.gpu_layers != "all":
-        device_map = placement.explicit_device_map
+    if plan.gpu_layers != "all" or plan.offload_experts:
+        layout = thinker_layout(model)
+        device_map = {
+            layout.checkpoint_name(name): target
+            for name, target in placement.explicit_device_map.items()
+        }
     else:
         device_map = infer_auto_device_map(
             model,

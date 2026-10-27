@@ -222,7 +222,7 @@ def _trimmed_media(
         return source, 0.0, 0.0, lambda: None
     import numpy as np
     import soundfile as sf
-    from faster_whisper import decode_audio
+    from .audio import decode_audio
 
     sampling_rate = 16_000
     audio = np.ascontiguousarray(

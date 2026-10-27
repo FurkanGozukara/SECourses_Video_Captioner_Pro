@@ -517,8 +517,8 @@ def checkpoint_layout(
         "U64": 8,
         "F64": 8,
     }
-    layer_pattern = re.compile(r"^model\.layers\.(\d+)\.")
-    tower_pattern = re.compile(r"^(audio_tower|visual)\.")
+    layer_pattern = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)\.")
+    tower_pattern = re.compile(r"^(?:model\.)?(audio_tower|visual)\.")
     bytes_by_layer: dict[int, int] = {}
     non_layer_bytes = 0
     tower_bytes = 0

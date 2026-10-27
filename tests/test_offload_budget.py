@@ -79,6 +79,28 @@ def test_checkpoint_layout_reads_only_the_safetensors_header(tmp_path: Path) -> 
     assert layout.total_bytes == 57
 
 
+@pytest.mark.parametrize("prefix", ["", "thinker."])
+def test_checkpoint_layout_counts_current_transformers_decoder_and_towers(tmp_path: Path, prefix: str) -> None:
+    checkpoint = tmp_path / "current.safetensors"
+    shapes = {
+        "model.language_model.layers.0.weight": [2, 3],
+        "model.language_model.layers.1.weight": [2, 2],
+        "model.language_model.embed_tokens.weight": [5, 2],
+        "model.audio_tower.weight": [2, 2],
+        "model.visual.weight": [2, 3],
+    }
+    _write_safetensors_header(checkpoint, {
+        prefix + name: {"dtype": "BF16", "shape": shape}
+        for name, shape in shapes.items()
+    })
+    layout = checkpoint_layout(checkpoint)
+    assert layout.layer_count == 2
+    assert layout.layer_bytes == (12, 8)
+    assert layout.tower_bytes == 20
+    assert layout.non_layer_bytes == 40
+    assert layout.total_bytes == 60
+
+
 def test_activation_estimates_follow_both_family_formulas() -> None:
     qwen_config = SimpleNamespace(
         text_config=SimpleNamespace(

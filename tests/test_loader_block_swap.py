@@ -244,6 +244,11 @@ def test_loader_wires_block_swap_budget_and_report(
     total = 10 * 2**30
     free = 8 * 2**30
     reserved = 1 * 2**30
+    # The planner reconciles both CUDA and physical-memory telemetry. Keep
+    # both probes synthetic so another real GPU job cannot change this test.
+    monkeypatch.setattr(loader, "resource_snapshot", lambda _index: {
+        "vram_total_gb": total / 2**30, "vram_free_gb": free / 2**30,
+    })
     fractions: list[tuple[float, object]] = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)

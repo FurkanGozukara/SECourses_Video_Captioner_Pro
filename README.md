@@ -48,6 +48,7 @@ Use **Dataset clips - video + audio captions (Qwen3-Omni + Whisper)** for genera
 
 - Windows or Linux on x86-64.
 - 64-bit Python 3.12.
+- Transformers 5.21.0 or newer, installed by the supplied requirements.
 - Windows checkpoint loading reads the safetensors header and streams individual tensors without mapping the entire checkpoint, avoiding a full-checkpoint memory commit reservation. Swapped decoder layers still require available system RAM.
 - An NVIDIA RTX 3000-series GPU or newer. Supported presets span 6 GB through 80 GB VRAM; available models and speed vary sharply by tier.
 - An NVIDIA driver and CUDA 13 environment compatible with the supplied PyTorch 2.13.0+cu130 wheels. The Windows installer also expects cuDNN 9.17 or newer.

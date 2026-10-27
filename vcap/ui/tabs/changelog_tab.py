@@ -14,6 +14,18 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.9.3",
+        "2026-10-27",
+        """
+### Model loading with Transformers 5.21
+
+- Fixed `Module path not found: model.embed_tokens` and related checkpoint-loading errors after installing current Transformers, including fresh RunPod installations. Qwen3-Omni and Qwen2.5-Omni now load the existing model downloads into the updated model layout.
+- Updated INT4/INT8 quantized loading, decoder block swapping, CPU offload maps, vision/audio tower staging, and the text decoder selected for compilation to use the actual model layout.
+- The installer now requires `transformers>=5.21.0`, allowing newer releases.
+- Fixed Whisper decoding with PyAV 19, which removed the `metadata_errors` argument still passed by released faster-whisper. The application uses its FFmpeg decoder for that compatibility failure.
+""".strip(),
+    ),
+    (
         "v1.9.2",
         "2026-09-12",
         """

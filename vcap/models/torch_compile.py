@@ -641,10 +641,9 @@ def _offloaded(model: Any) -> bool:
 
 
 def _language_target(model: Any) -> Any:
-    thinker = getattr(model, "thinker", None)
-    if thinker is not None:
-        model = thinker
-    return getattr(model, "model", model)
+    from .layout import language_model
+
+    return language_model(model)
 
 
 def _toolchain_error(exc: BaseException) -> bool:

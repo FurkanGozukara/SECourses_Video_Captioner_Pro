@@ -17,6 +17,7 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 
 from vcap.models.quant import convrot  # noqa: E402
+from vcap.models.layout import language_model, thinker_layout  # noqa: E402
 
 
 def _vision_config() -> SimpleNamespace:
@@ -258,18 +259,19 @@ def test_qwen3_omni_thinker_meta_buffers_are_all_rebuilt() -> None:
     config = Qwen3OmniMoeThinkerConfig(audio_config=audio, vision_config=vision, text_config=text)
     with torch.device("meta"):
         model = Qwen3OmniMoeThinkerForConditionalGeneration(config)
-    assert "visual.rotary_pos_emb.inv_freq" in _meta_buffers(model)
+    visual_path = thinker_layout(model).checkpoint_name("visual")
+    assert f"{visual_path}.rotary_pos_emb.inv_freq" in _meta_buffers(model)
 
     convrot._materialize_meta_buffers(model, torch.device("cpu"))
 
     assert _meta_buffers(model) == [], f"transformers {transformers.__version__} left meta buffers"
-    rotary = model.visual.rotary_pos_emb
+    rotary = model.get_submodule(visual_path).rotary_pos_emb
     if hasattr(rotary, "config"):
         fresh = type(rotary)(rotary.config)
     else:
         fresh = type(rotary)(rotary.dim, rotary.theta)
     assert torch.equal(rotary.inv_freq, fresh.inv_freq)
-    text_rotary = model.model.rotary_emb
+    text_rotary = language_model(model).rotary_emb
     fresh_text = type(text_rotary)(text_rotary.config)
     assert torch.equal(text_rotary.inv_freq, fresh_text.inv_freq)
     assert torch.equal(text_rotary.original_inv_freq, fresh_text.inv_freq)
