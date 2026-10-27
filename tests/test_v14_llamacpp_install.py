@@ -4,10 +4,50 @@ import io
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 
 import pytest
 
 from vcap.models import llamacpp_install
+
+
+@pytest.mark.parametrize("version", [
+    "version: 0.3.0-dev (build 1, commit c1d0e7a)",
+    "version: 0.3.0-dev (build 1, commit c1d0e7a004015f23bc0233470b747b596f29b264)",
+    "version: 0.3.0 (build 15691, commit c1d0e7a)",
+    "version: b10621 (c1d0e7a)",
+    "version: 10621 (c1d0e7a)",
+])
+def test_pinned_version_formats_are_recognized(version, monkeypatch, tmp_path):
+    monkeypatch.setattr(llamacpp_install.subprocess, "run", lambda *_a, **_kw:
+                        SimpleNamespace(returncode=0, stdout="", stderr=version + "\nbuilt with GNU 13.3.0 for Linux x86_64"))
+    build, output = llamacpp_install._version_build(tmp_path / "llama-server")
+    assert build == llamacpp_install.LLAMACPP_BUILD
+    assert version in output
+
+
+def test_unknown_shallow_source_cannot_pass_release_verification(monkeypatch, tmp_path):
+    monkeypatch.setattr(llamacpp_install.subprocess, "run", lambda *_a, **_kw:
+                        SimpleNamespace(returncode=0, stdout="version: 0.3.0-dev (build 1, commit deadbee)", stderr=""))
+    with pytest.raises(RuntimeError, match="Cannot verify llama.cpp source commit deadbee"):
+        llamacpp_install._version_build(tmp_path / "llama-server")
+
+
+def test_failed_version_command_cannot_pass_verification(monkeypatch, tmp_path):
+    monkeypatch.setattr(llamacpp_install.subprocess, "run", lambda *_a, **_kw:
+                        SimpleNamespace(returncode=1, stdout="version: b10621", stderr="missing library"))
+    with pytest.raises(RuntimeError, match="failed with exit code 1"):
+        llamacpp_install._version_build(tmp_path / "llama-server")
+
+
+def test_old_release_is_still_rejected(monkeypatch, tmp_path):
+    for name in ("llama-server", "llama-mtmd-cli"):
+        (tmp_path / name).write_bytes(b"binary")
+    monkeypatch.setattr(llamacpp_install, "_find_binary", lambda folder, name: folder / name)
+    monkeypatch.setattr(llamacpp_install.subprocess, "run", lambda *_a, **_kw:
+                        SimpleNamespace(returncode=0, stdout="version: b8000", stderr=""))
+    with pytest.raises(RuntimeError, match="too old for Qwen3-Omni audio"):
+        llamacpp_install._validate_install(tmp_path)
 
 
 def test_linux_without_cuda_release_asset_chooses_source_build(

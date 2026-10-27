@@ -36,6 +36,7 @@ ProgressCallback = Callable[..., None]
 
 LLAMACPP_BUILD = 10_621
 LLAMACPP_TAG = f"b{LLAMACPP_BUILD}"
+LLAMACPP_COMMIT = "c1d0e7a004015f23bc0233470b747b596f29b264"
 MIN_QWEN3_OMNI_BUILD = 8_775
 RELEASE_API = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMACPP_TAG}"
 RELEASE_ROOT = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMACPP_TAG}"
@@ -546,6 +547,28 @@ def _version_build(server: Path) -> tuple[int, str]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"Could not execute {server.name} --version: {exc}") from exc
     output = "\n".join(value.strip() for value in (completed.stdout, completed.stderr) if value.strip())
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{server.name} --version failed with exit code {completed.returncode}:\n{output[-3000:]}"
+        )
+    # New llama.cpp versions print a semantic version and a Git commit count.
+    # Our --depth 1 checkout therefore reports "build 1", not the nightly tag.
+    # Only a matching pinned source commit can establish that release identity.
+    modern = re.search(
+        r"^\s*version:\s*\d+\.\d+\.\d+[^\r\n]*?"
+        r"\(build\s+(\d+),\s*commit\s+([0-9a-f]{7,40})\)",
+        output, flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if modern:
+        commit = modern.group(2).lower()
+        if LLAMACPP_COMMIT.startswith(commit):
+            return LLAMACPP_BUILD, output
+        if int(modern.group(1)) < MIN_QWEN3_OMNI_BUILD:
+            raise RuntimeError(
+                f"Cannot verify llama.cpp source commit {commit} as {LLAMACPP_TAG}. "
+                "A shallow checkout's Git commit count is not a release build number. "
+                "Use the application's pinned llama.cpp installation.\n" + output[-3000:]
+            )
     candidates = [int(value) for value in re.findall(r"\bb(\d{4,})\b", output, flags=re.IGNORECASE)]
     candidates.extend(
         int(value)

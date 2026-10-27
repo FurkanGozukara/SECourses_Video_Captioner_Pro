@@ -1,5 +1,29 @@
 # v2.0 downloader verification (2026-10-28)
 
+## GGUF version verification follow-up
+
+The RunPod Qwen3-Omni Instruct Q8 report completed model SHA verification and
+both CUDA build targets, then failed while parsing llama.cpp's version output.
+The pinned b10621 source is commit
+`c1d0e7a004015f23bc0233470b747b596f29b264`. Its current version string is semantic,
+and a depth-one source clone reports Git commit count 1:
+`version: 0.3.0-dev (build 1, commit c1d0e7a)`.
+[Upstream build-info code](https://github.com/ggml-org/llama.cpp/blob/c1d0e7a004015f23bc0233470b747b596f29b264/cmake/build-info.cmake)
+derives that count with `git rev-list --count HEAD`.
+
+The version check now maps the verified pinned commit to b10621. Older numeric
+and nightly formats remain supported; unknown shallow source commits and
+nonzero version-command exits are rejected. Older releases still fail the
+Qwen3-Omni minimum check. This is shared by every GGUF preset and requires no
+model-file or installer-archive change.
+
+**40 focused llama.cpp checks passed on Windows; 20 installer/architecture
+checks passed on real Linux.** They cover the exact reported version, full and
+abbreviated pinned hashes, legacy output, unknown source commits, failed
+commands, and outdated builds. The actual installed Windows server also passed
+validation with `version: 0.3.0-dev (build 10621, commit c1d0e7a00)`. The reporting
+RunPod container's post-fix model inference has not been directly run here.
+
 ## CUDA 13 follow-up in the final v2.0 package
 
 The final v2.0 also fixes the conflicting cuDNN runtime and replaces the stock

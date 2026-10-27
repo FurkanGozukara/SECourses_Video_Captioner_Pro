@@ -22,6 +22,7 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Whisper and captioning now share the venv's CUDA 13 runtime. CTranslate2 is built against CUDA 13 for Linux and Windows; the conflicting CUDA 12 runtime dependencies are removed.
 - Fixed `CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` caused by mixed cuDNN library sets. Startup and installers repair older environments, restore PyTorch's exact cuDNN dependency, and select the venv's libraries before workers start.
 - Installer sources and requirements now live in Git, and rebuilding the v2.0 ZIP synchronizes their distribution copies.
+- Fixed Linux GGUF installation rejecting successfully compiled llama.cpp binaries reporting `0.3.0-dev (build 1, commit ...)`. The pinned source commit identifies the release when a shallow clone reports a one-commit build count.
 - Fixed first-use model downloads failing with `ModuleNotFoundError: No module named 'huggingface_hub'` on Linux, RunPod, and Massed Compute. The downloader now preserves the venv's Python path instead of following its symlink to the underlying interpreter.
 - The Whisper worker and explicit worker-Python overrides use the same environment-preserving selection.
 - The app now ships its downloader in the Git checkout, so application updates also update the downloader. The standalone distribution copy remains available and shares its existing download cache.
