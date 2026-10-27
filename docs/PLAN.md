@@ -1,5 +1,10 @@
 # SECourses Video Captioner Pro — Master Plan (v1)
 
+Historical v1 plan. Its external-only downloader layout and dependency snapshot
+are superseded by the v2.0 implementation described in [DOWNLOADER.md](DOWNLOADER.md)
+and the current [README](../README.md). The original research and task breakdown
+are retained below; use the current documents for release operations.
+
 Internal engineering plan. Implementation was split into tasks with strict file ownership; every task builds on the reference-app analyses and model research gathered up front and copies proven code from the referenced sources.
 
 ## 0. Environment facts (do not re-derive)

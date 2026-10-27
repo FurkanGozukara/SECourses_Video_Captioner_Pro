@@ -9,7 +9,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def downloader_module():
-    path = Path(__file__).resolve().parents[2] / "Models_Downloader.py"
+    path = Path(__file__).resolve().parents[1] / "Models_Downloader.py"
     spec = importlib.util.spec_from_file_location("whisper_models_downloader", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

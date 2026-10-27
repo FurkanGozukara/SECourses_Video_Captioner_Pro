@@ -1,12 +1,23 @@
 # Model Downloader Contract
 
-The canonical downloader is the distribution-level `Models_Downloader.py`.
-The app should invoke it with the same Python interpreter as the app and stream
-merged stdout/stderr as UTF-8:
+The canonical downloader is `Models_Downloader.py` in the Git checkout, so
+`git pull` updates it along with the app. The release ZIP exports the same file
+as a standalone distribution-level copy. Both placements retain the existing
+distribution-level `download_cache/` and the same models directory.
+
+The app prefers `SECOURSES_VCAP_DOWNLOADER` when explicitly set, then the
+Git-managed copy, then an older distribution-level copy. It launches the
+selected script with the project venv's Python and streams merged stdout/stderr
+as UTF-8. The executable path must retain Linux venv symlinks:
 
 ```text
-python -u ../Models_Downloader.py --ensure <catalog-key>
+venv/bin/python -u Models_Downloader.py --ensure <catalog-key>
 ```
+
+On Windows the executable is `venv/Scripts/python.exe`. Never resolve the
+executable symlink to the base Python interpreter: doing so bypasses the venv
+and can hide installed packages such as `huggingface_hub`. The shared selector
+in `vcap/core/python_runtime.py` also serves the Whisper worker.
 
 ## Catalog and layout
 

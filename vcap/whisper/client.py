@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import sys
 import tempfile
 import threading
 import time
@@ -17,6 +16,7 @@ from vcap import APP_DIR, MODELS_DIR, TEMP_DIR
 from vcap.core import console_progress
 from vcap.core.logs import get_log
 from vcap.core.paths import normalize_path
+from vcap.core.python_runtime import project_python
 from vcap.core.subprocess_runner import (
     CancelToken,
     WorkerProcess,
@@ -89,10 +89,7 @@ def build_request(
 
 
 def _python_executable(value: str | None) -> str:
-    if value:
-        return str(normalize_path(value))
-    venv_python = APP_DIR / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    return str(venv_python.resolve(strict=False) if venv_python.is_file() else Path(sys.executable))
+    return str(project_python(APP_DIR, override=value))
 
 
 def _kill_worker_tree(worker: WorkerProcess, grace: float = 0.2) -> None:

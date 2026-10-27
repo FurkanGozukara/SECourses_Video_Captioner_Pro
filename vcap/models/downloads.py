@@ -8,13 +8,13 @@ from pathlib import Path
 import queue
 import re
 import subprocess
-import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from vcap import APP_DIR
 from vcap.core.logs import get_log
+from vcap.core.python_runtime import project_python
 from vcap.core.subprocess_runner import build_child_env, kill_process_tree
 
 from .registry import MODELS_DIR, get_variant, resolve_model_dir, variant_is_ready
@@ -271,18 +271,14 @@ def _find_downloader() -> Path | None:
     override = os.environ.get("SECOURSES_VCAP_DOWNLOADER", "").strip().strip('"').strip("'")
     candidates = [
         Path(override).expanduser() if override else None,
-        APP_DIR.parent / "Models_Downloader.py",
         APP_DIR / "Models_Downloader.py",
+        APP_DIR.parent / "Models_Downloader.py",
     ]
     return next((path.resolve(strict=False) for path in candidates if path is not None and path.is_file()), None)
 
 
 def _venv_python() -> Path:
-    candidates = [
-        APP_DIR / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"),
-        Path(sys.executable),
-    ]
-    return next((path.resolve(strict=False) for path in candidates if path.is_file()), Path(sys.executable))
+    return project_python(APP_DIR)
 
 
 def ensure_model(

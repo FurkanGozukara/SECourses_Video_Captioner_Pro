@@ -92,6 +92,14 @@ Whisper runs in a separate CTranslate2 process and discovers the CUDA 12 cuBLAS/
 
 The release distribution places the installer scripts and `video_caption_requirements.txt` one directory above this repository folder.
 
+The application uses the Git-managed `Models_Downloader.py` in this checkout;
+the distribution also includes a standalone copy. Both use the same download
+cache, and application updates therefore update the automatic downloader.
+To rebuild the distribution ZIP after a release change, run
+`venv/Scripts/python.exe tools/package_release.py` on Windows or
+`venv/bin/python tools/package_release.py` on Linux. The builder takes the
+downloader from this checkout and verifies every archive member.
+
 ### Windows
 
 From the extracted distribution folder, run:

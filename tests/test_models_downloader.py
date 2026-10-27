@@ -11,7 +11,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def downloader_module():
-    downloader_path = Path(__file__).resolve().parents[2] / "Models_Downloader.py"
+    downloader_path = Path(__file__).resolve().parents[1] / "Models_Downloader.py"
     spec = importlib.util.spec_from_file_location("vcap_test_models_downloader_paths", downloader_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

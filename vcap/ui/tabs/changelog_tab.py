@@ -14,6 +14,18 @@ if TYPE_CHECKING:
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v2.0",
+        "2026-10-28",
+        """
+### Model downloads use the application environment on Linux
+
+- Fixed first-use model downloads failing with `ModuleNotFoundError: No module named 'huggingface_hub'` on Linux, RunPod, and Massed Compute. The downloader now preserves the venv's Python path instead of following its symlink to the underlying interpreter.
+- The Whisper worker and explicit worker-Python overrides use the same environment-preserving selection.
+- The app now ships its downloader in the Git checkout, so application updates also update the downloader. The standalone distribution copy remains available and shares its existing download cache.
+- The standalone downloader now honors Hugging Face's `Retry-After` header even when the HTTP client treats an error response as false.
+""".strip(),
+    ),
+    (
         "v1.9.3",
         "2026-10-27",
         """

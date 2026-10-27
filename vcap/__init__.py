@@ -12,7 +12,7 @@ from pathlib import Path
 from .core.app_settings import APP_SETTINGS_PATH, load_app_settings
 from .core.paths import normalize_path
 
-VERSION = "1.9.3"
+VERSION = "2.0"
 APP_NAME = "SECourses Video Captioner Pro"
 PATREON_URL = "https://www.patreon.com/SECourses/posts/secourses-video-168757767"
 APP_DIR = Path(__file__).resolve().parent.parent
