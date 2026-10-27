@@ -46,12 +46,12 @@ Use **Dataset clips - video + audio captions (Qwen3-Omni + Whisper)** for genera
 
 ## Requirements
 
-- Windows or Linux on x86-64.
+- Windows or Linux on x86-64 (Linux glibc 2.35 or newer, such as Ubuntu 22.04+).
 - 64-bit Python 3.12.
 - Transformers 5.21.0 or newer, installed by the supplied requirements.
 - Windows checkpoint loading reads the safetensors header and streams individual tensors without mapping the entire checkpoint, avoiding a full-checkpoint memory commit reservation. Swapped decoder layers still require available system RAM.
 - An NVIDIA RTX 3000-series GPU or newer. Supported presets span 6 GB through 80 GB VRAM; available models and speed vary sharply by tier.
-- An NVIDIA driver and CUDA 13 environment compatible with the supplied PyTorch 2.13.0+cu130 wheels. The Windows installer also expects cuDNN 9.17 or newer.
+- An NVIDIA driver compatible with CUDA 13.0 and the supplied PyTorch 2.13.0+cu130 wheels. The venv supplies the matching CUDA and cuDNN libraries for captioning and Whisper.
 - Git plus `ffmpeg` and `ffprobe` available on `PATH`.
 - Windows: Visual Studio Community/Build Tools with the MSVC C++ workload for full TorchInductor compilation. The app can fall back to Triton-only, CUDA graphs, or eager execution.
 - Linux GGUF users: the CUDA toolkit with `nvcc`, CMake, and a C++ toolchain are required. The pinned llama.cpp release has no prebuilt Ubuntu CUDA archive, so the cloud installers build it automatically.
@@ -86,19 +86,21 @@ The shipped **Whisper Quality (large-v1)** preset (read-only; its values are als
 | `tiny` | `Systran/faster-whisper-tiny` | 78.2 MB | Smallest multilingual model |
 | `tiny.en` | `Systran/faster-whisper-tiny.en` | 78.1 MB | Smallest English-only model |
 
-Whisper runs in a separate CTranslate2 process and discovers the CUDA 12 cuBLAS/cuDNN libraries installed in the active environment. `Device: auto` tries CUDA and falls back to CPU/int8 when the runtime is unavailable; forcing `cuda` surfaces the runtime error instead. This CUDA runtime is independent of the PyTorch CUDA 13 runtime used by caption models.
+Whisper runs in a separate process in the same venv. Our CTranslate2 4.8.4 build uses CUDA 13.0 and shares PyTorch's matching cuBLAS/cuDNN libraries. `Device: auto` tries CUDA and falls back to CPU/int8 when the runtime is unavailable; forcing `cuda` surfaces the runtime error instead. The integration and build script live in this repo; the backend source is the pinned upstream OpenNMT/CTranslate2 release.
+
+Do not install `nvidia-cudnn-cu12` beside PyTorch's `nvidia-cudnn-cu13`: the packages overwrite the same library paths. Startup and the installers migrate older environments to the CUDA 13 backend and restore the cuDNN version required by the installed PyTorch. Worker processes select the venv's libraries before loading native code. To inspect or explicitly repair an existing environment, run `python -m vcap.core.cuda_runtime --repair` from the activated project venv. See [runtime verification and build provenance](docs/CUDA_RUNTIME.md).
 
 ## Installation
 
-The release distribution places the installer scripts and `video_caption_requirements.txt` one directory above this repository folder.
+The release distribution places the installer scripts and `video_caption_requirements.txt` one directory above this repository folder. Their canonical sources are in `installers/`; the dependency list is the Git-managed `requirements.txt`.
 
 The application uses the Git-managed `Models_Downloader.py` in this checkout;
 the distribution also includes a standalone copy. Both use the same download
 cache, and application updates therefore update the automatic downloader.
 To rebuild the distribution ZIP after a release change, run
-`venv/Scripts/python.exe tools/package_release.py` on Windows or
-`venv/bin/python tools/package_release.py` on Linux. The builder takes the
-downloader from this checkout and verifies every archive member.
+`venv/Scripts/python.exe tools/package_release.py --replace --sync-distribution` on Windows or
+`venv/bin/python tools/package_release.py --replace --sync-distribution` on Linux. The builder takes every installer and the
+downloader from this checkout, preserves the previous ZIP, synchronizes the loose distribution files, and verifies every archive member.
 
 ### Windows
 
@@ -127,7 +129,10 @@ Start it later with:
 ```bash
 export HF_HOME="/workspace"
 cd /workspace
-cd SECourses_Video_Captioner_Pro && git pull && source venv/bin/activate && unset LD_LIBRARY_PATH && python secourses_app.py --share
+cd SECourses_Video_Captioner_Pro
+git pull
+source venv/bin/activate
+python secourses_app.py --share
 ```
 
 ### Massed Compute or local Linux
@@ -142,7 +147,10 @@ chmod +x Massed_Compute_Install.sh
 Then launch from the repository:
 
 ```bash
-cd SECourses_Video_Captioner_Pro && git pull && source venv/bin/activate && unset LD_LIBRARY_PATH && python secourses_app.py --share
+cd SECourses_Video_Captioner_Pro
+git pull
+source venv/bin/activate
+python secourses_app.py --share
 ```
 
 Both shell installers use `apt-get` for Git, FFmpeg, CMake, build-essential, and libcurl development files when needed. RunPod/SimplePod provisions a uv-managed Python 3.12; Massed Compute uses stable Python 3.12.13 or newer from deadsnakes when available and falls back to uv-managed 3.12.13. Both create `SECourses_Video_Captioner_Pro/venv`, install `video_caption_requirements.txt`, and attempt the pinned llama.cpp CUDA build without auto-starting the app. Set `HF_HOME` in the terminal as shown above or in the distribution instruction file.

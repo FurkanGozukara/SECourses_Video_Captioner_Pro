@@ -1,0 +1,50 @@
+
+Example tutorial for learn how to install and use Massed Compute
+(Starts at 12:58) : https://youtu.be/KW-MHmoNcqo?si=G1WbG-Qw4ujWvOtG&t=778
+
+Register for Massed Compute using the following link I appreicate that a lot:
+https://vm.massedcompute.com/signup?linkId=lp_034338&sourceId=secourses&tenantId=massed-compute
+
+We have a special coupon for all GPUs : SECourses
+
+If you want to learn more about GPUs and prices read this link : https://www.patreon.com/posts/126671823
+
+Recommended GPU is RTX PRO 6000 - best F/P and for best performance select H200
+
+But app works with any GPU, the more VRAM it is better
+
+Use thinclient or login patreon on Massed Compute to download files on to your Massed Compute
+
+Put everything into a folder in like desktop or downloads
+
+Don't run scripts from inside of synchronization folder
+
+Move zip file into downloads folder and extract there
+
+Open a terminal in the folder where you did put the files
+
+To install run below command
+
+chmod +x Massed_Compute_Install.sh
+./Massed_Compute_Install.sh
+
+HF_HOME keeps Hugging Face cache files on this storage. You can point it at another persistent folder with enough free space before running the installer.
+
+The installer prepares Python 3.12 and builds the pinned CUDA llama.cpp runtime used by GGUF model variants. If that best-effort build reports a warning, open the System & Models tab after launch and click Install / repair llama.cpp to retry it.
+
+To use after install
+
+Open a new terminal in the folder where you downloaded files and executed
+
+cd SECourses_Video_Captioner_Pro
+git pull
+source venv/bin/activate
+python secourses_app.py --share
+
+The app selects the venv's CUDA 13 libraries and repairs older CUDA 12 Whisper/cuDNN dependencies automatically. To run the repair explicitly: python -m vcap.core.cuda_runtime --repair
+
+Models download automatically on first use in the app.
+
+To open the downloader menu manually from the distribution folder:
+
+SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py

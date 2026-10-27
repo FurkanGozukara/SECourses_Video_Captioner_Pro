@@ -1,0 +1,2 @@
+# The Git checkout owns the current dependency list.
+-r ./SECourses_Video_Captioner_Pro/requirements.txt

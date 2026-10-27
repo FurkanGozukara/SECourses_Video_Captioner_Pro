@@ -11,6 +11,13 @@ from typing import Sequence
 
 from vcap import APP_DIR, APP_NAME, TEMP_DIR, VERSION, ensure_app_dirs
 
+# Linux's dynamic loader reads its search path at process start. Do this
+# before Gradio or model dependencies can import a native GPU library.
+if __name__ == "__main__":
+    from vcap.core.cuda_runtime import prepare_cuda_runtime
+
+    prepare_cuda_runtime()
+
 # Gradio reads its cache location during import, so this must stay above every
 # import from vcap.ui or gradio itself.
 os.environ.setdefault("GRADIO_TEMP_DIR", str(TEMP_DIR / "gradio"))

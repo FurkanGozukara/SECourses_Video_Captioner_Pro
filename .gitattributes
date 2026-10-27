@@ -1,0 +1,4 @@
+installers/*.sh text eol=lf
+installers/*.bat text eol=crlf
+installers/*.txt text eol=lf
+requirements.txt text eol=lf

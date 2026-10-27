@@ -64,6 +64,8 @@ def test_windows_child_env_removes_expandable_segments_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(subprocess_runner.os, "name", "nt")
+    # This test simulates allocator policy, not the host filesystem's path type.
+    monkeypatch.setattr(subprocess_runner, "cuda_runtime_env", lambda env: env)
     monkeypatch.setenv(
         "PYTORCH_CUDA_ALLOC_CONF",
         "expandable_segments:True,garbage_collection_threshold:0.8",

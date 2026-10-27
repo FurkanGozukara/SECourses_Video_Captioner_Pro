@@ -1,5 +1,27 @@
 # v2.0 downloader verification (2026-10-28)
 
+## CUDA 13 follow-up in the final v2.0 package
+
+The final v2.0 also fixes the conflicting cuDNN runtime and replaces the stock
+CUDA 12 CTranslate2 binary with CUDA 13 builds for both platforms. Full build
+provenance, wheel hashes, the exact reproduced error, and the repair procedure
+are recorded in [CUDA_RUNTIME.md](CUDA_RUNTIME.md).
+
+Real Whisper tiny.en encoder/generation operations passed on Windows/RTX 5090
+and Linux/Massed Compute/RTX A6000: GPU FP16, GPU INT8/FP16, and CPU INT8. Both
+Whisper-first and PyTorch-first load orders passed, alongside BF16 vision
+Conv3d. Process library maps confirmed the venv's CUDA 13 libraries. An isolated
+Linux mixed-cuDNN installation reproduced the exact reported error; the repair
+restored matching wheel hashes and the same convolution passed. Migration from
+the stock backend fetched the published, hash-pinned Linux wheel automatically.
+The published Windows wheel was also installed and hash-verified through pip.
+
+The normal Windows BAT launched v2.0 and its real UI completed a Qwen3-Omni
+Instruct INT4 image caption: **177 new tokens, EOS, done=1, failed=0**. The caption
+correctly described the blue-circle test image. Output and the screenshot
+`output/playwright/cuda13_v2_completed.png` were inspected. Earlier test outputs
+were preserved. The **10 focused runtime/subprocess checks passed on both OSes**.
+
 ## Confirmed cause
 
 The application launched the downloader with
@@ -76,11 +98,12 @@ The normal `Windows_Run_Video_Captioner_Pro.bat` launched v2.0, and the real
 browser UI displayed version 2.0. Restarting the owned local test app preserved
 the earlier caption outputs. No task assets were lost.
 
-The full suite reported **660 passed, 9 skipped, 8 failed**. The eight failures
+The final full suite reported **664 passed, 9 skipped, 8 failed**. The eight failures
 are the same UI/protocol failures already reproduced on the unchanged baseline
 and listed in [v1.9.3 verification](QA_VERIFICATION_v1.9.3.md#broader-suite-and-existing-failures).
 The prior [15-variant model-generation checks](QA_VERIFICATION_v1.9.3.md#launcher-and-real-checkpoints)
-remain relevant; v2.0 does not alter model inference.
+remain relevant; this follow-up changes runtime selection rather than model
+loading algorithms. The additional real Qwen INT4 UI run is described above.
 
 Local evidence is retained in `temp/downloader_reliability_20261028/`, including
 the baseline failure, native network receipts, full-model checks, missing-config
@@ -90,14 +113,17 @@ recovery, and the Windows suite output. The UI screenshot is
 ## Release artifact
 
 `tools/package_release.py` builds the existing nine-file installer distribution
-from the versioned downloader and the distribution's existing installer files,
-then verifies every member byte-for-byte and checks ZIP CRCs.
+from the Git-managed downloader and `installers/` sources. The distribution's
+requirements wrapper selects the current Git-managed `requirements.txt`.
+The builder preserves the previous ZIP, synchronizes loose distribution files,
+verifies every member byte-for-byte, and checks ZIP CRCs.
 
-`SECourses_Video_Captioner_Pro_v2_0.zip` is **45,408 bytes**, SHA-256:
+`SECourses_Video_Captioner_Pro_v2_0.zip` is **45,050 bytes**, SHA-256:
 
-`eff2069aa46c034b3e01a8a6726ee9d510f33d9e890d4202e282f8df4d34cdfd`
+`10f209ae0fa466840f80e9270638930254d3562329486e9850dc9c050725a269`
 
-Only `Models_Downloader.py` differs from the v1.9.3 ZIP. All installer scripts,
-including both Linux installers' FFmpeg steps, instructions, and requirements
-are byte-identical. The current minimum library versions remain in the shipped
-requirements file.
+The final package includes the runtime repair in all installers and updated
+Linux startup instructions. Both Linux FFmpeg blocks were checked byte-for-byte
+against the initial v2.0 ZIP and are unchanged. The earlier 45,408-byte v2.0 ZIP
+is preserved under `temp/release_builds/previous/`, identified by its original
+SHA-256 `eff2069aa46c034b3e01a8a6726ee9d510f33d9e890d4202e282f8df4d34cdfd`.

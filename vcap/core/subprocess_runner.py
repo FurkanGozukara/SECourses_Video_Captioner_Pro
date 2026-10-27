@@ -12,6 +12,7 @@ from contextlib import suppress
 from typing import Any, Iterable, Iterator, Mapping, Sequence, TextIO
 
 from .gpu import cuda_visible_devices_env
+from .cuda_runtime import cuda_runtime_env
 
 
 class CancelledError(RuntimeError):
@@ -108,7 +109,7 @@ def build_child_env(
             env["PYTORCH_ALLOC_CONF"] = (
                 f"{existing},garbage_collection_threshold:0.6" if existing else "garbage_collection_threshold:0.6"
             )
-    return env
+    return cuda_runtime_env(env)
 
 
 def _as_text_line(raw: object) -> str:

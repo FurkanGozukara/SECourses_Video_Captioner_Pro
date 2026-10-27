@@ -466,6 +466,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run one request while reserving stdout exclusively for JSON records."""
 
+    from vcap.core.cuda_runtime import bootstrap_cuda_runtime
+
+    bootstrap_cuda_runtime()
     args = _parse_args(argv)
     cancelled = threading.Event()
     listener = threading.Thread(

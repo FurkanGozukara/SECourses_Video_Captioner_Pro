@@ -440,6 +440,9 @@ def _poll_stdin(timeout_s: float = 0.1) -> str | None | object:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from vcap.core.cuda_runtime import bootstrap_cuda_runtime
+
+    bootstrap_cuda_runtime()
     args = _parse_args(argv)
     os.environ["PYTHONUTF8"] = "1"
     os.environ["PYTHONIOENCODING"] = "utf-8"

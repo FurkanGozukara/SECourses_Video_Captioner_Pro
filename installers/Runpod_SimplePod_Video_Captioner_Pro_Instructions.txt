@@ -1,0 +1,65 @@
+
+SIMPLEPOD CHEAPER AND FASTER THAN RUNPOD
+
+Now we fully support SimplePod as well please use this link to register : https://simplepod.ai/ref?user=secourses
+
+SimplePod is faster and cheaper than RunPod and works exactly same
+
+Please use this template on SimplePod : https://dash.simplepod.ai/account/explore/100/ref-secourses/
+
+For permanent storage, generate it from Storage tab with any name and size you want and when selecting template with above link, click Edit and Use, select Persistence Volume and change mount point to /workspace
+
+Up-to-date SimplePod tutorial starting from 21:51 : https://youtu.be/yOj9PYq3XYM?si=Z86wZZLBeYzWo1Qo&t=1311
+
+RUNPOD
+
+Please register for RunPod at: https://get.runpod.io/955rkuppqv4h
+
+Example tutorial for learn how to install and use RunPod is below
+
+(starts at 22:03) : https://youtu.be/KW-MHmoNcqo?si=QN8X8Sjn13ZYu-EU&t=1323
+
+RunPod permanent network storage tutorial : https://youtu.be/8Qf4x3-DFf4
+
+Select this template mandatory (based on official Runpod Pytorch template) : https://get.runpod.io/SECourses_CU13
+
+Recommended GPU is RTX PRO 6000, but you can use any GPU. The more VRAM it is better
+
+You can edit template and change Volume Disk size. it is by default 200 GB and should be sufficient without any changes
+
+You can also use permanent storage. Choose a host with an NVIDIA 580-series or newer driver compatible with CUDA 13.0.
+
+Upload all files into workspace extract all from zip file or directly upload extracted files
+
+Start a new terminal
+
+To install run below command
+
+export UV_THREADPOOL_SIZE=8
+cd /workspace
+export HF_HOME="/workspace"
+chmod +x RunPod_Install_SECourses_Video_Captioner_Pro.sh
+./RunPod_Install_SECourses_Video_Captioner_Pro.sh
+
+Keep HF_HOME on /workspace (or another persistent mounted volume with enough free space) in every new terminal so cache files survive pod restarts.
+
+The installer prepares Python 3.12 and builds the pinned CUDA llama.cpp runtime used by GGUF model variants. If that best-effort build reports a warning, open the System & Models tab after launch and click Install / repair llama.cpp to retry it.
+
+Models download automatically on first use in SECourses Video Captioner Pro.
+To open the downloader menu manually:
+
+cd /workspace
+SECourses_Video_Captioner_Pro/venv/bin/python Models_Downloader.py
+
+The menu includes Qwen3-Omni Instruct, Thinking, and Captioner GGUF Q4_K_M and Q8_0 entries. GGUF also needs the pinned CUDA llama.cpp build that the installer performs automatically; the System & Models tab is the retry path if the first build did not complete.
+
+To run the app again after installation later run below command
+
+export HF_HOME="/workspace"
+cd /workspace
+cd SECourses_Video_Captioner_Pro
+git pull
+source venv/bin/activate
+python secourses_app.py --share
+
+The app selects the venv's CUDA 13 libraries and repairs older CUDA 12 Whisper/cuDNN dependencies automatically. To run the repair explicitly: python -m vcap.core.cuda_runtime --repair
